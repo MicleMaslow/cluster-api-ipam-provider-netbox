@@ -1,0 +1,8 @@
+.git
+.superpowers
+docs
+out
+hack/tools/bin
+hack/bin
+hack/dev/.env
+hack/dev/kubeconfig

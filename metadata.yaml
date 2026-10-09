@@ -1,0 +1,7 @@
+# Maps each release series (major.minor) to the Cluster API contract; add one before tagging a new minor.
+apiVersion: clusterctl.cluster.x-k8s.io/v1alpha3
+kind: Metadata
+releaseSeries:
+- major: 0
+  minor: 1
+  contract: v1beta2

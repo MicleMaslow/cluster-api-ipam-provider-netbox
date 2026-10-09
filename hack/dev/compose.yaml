@@ -1,0 +1,39 @@
+name: capi-netbox-dev
+services:
+  netbox:
+    image: docker.io/netboxcommunity/netbox:v4.6.7-5.0.2
+    depends_on: [postgres, valkey]
+    ports: ["127.0.0.1:18000:8080"]
+    environment:
+      DB_HOST: postgres
+      DB_NAME: netbox
+      DB_USER: netbox
+      DB_PASSWORD: netbox
+      REDIS_HOST: valkey
+      REDIS_PASSWORD: ""
+      REDIS_DATABASE: "0"
+      REDIS_CACHE_HOST: valkey
+      REDIS_CACHE_PASSWORD: ""
+      REDIS_CACHE_DATABASE: "1"
+      SECRET_KEY: dev-only-secret-key-dev-only-secret-key-dev-only-secret-key-0123456789
+      API_TOKEN_PEPPER_1: dev-only-pepper-dev-only-pepper-dev-only-pepper-dev-only-0123456789
+      SKIP_SUPERUSER: "false"
+      SUPERUSER_NAME: admin
+      SUPERUSER_PASSWORD: admin
+      SUPERUSER_API_KEY: devadmin0001
+      SUPERUSER_API_TOKEN: 0123456789abcdef0123456789abcdef01234567
+    healthcheck:
+      test: curl -f http://localhost:8080/login/ || exit 1
+      start_period: 300s
+      interval: 5s
+  postgres:
+    image: docker.io/postgres:18-alpine
+    environment:
+      POSTGRES_DB: netbox
+      POSTGRES_USER: netbox
+      POSTGRES_PASSWORD: netbox
+    volumes: [postgres:/var/lib/postgresql]
+  valkey:
+    image: docker.io/valkey/valkey:9.1-alpine
+volumes:
+  postgres: {}

@@ -1,0 +1,51 @@
+name: release
+
+on:
+  push:
+    tags:
+    - 'v[0-9]+.[0-9]+.[0-9]+*'
+
+permissions:
+  contents: write # create the release
+  packages: write # push the image to ghcr.io
+
+jobs:
+  release:
+    name: release
+    runs-on: ubuntu-latest
+    env:
+      RELEASE_TAG: ${{ github.ref_name }}
+    steps:
+    - name: Checkout
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        persist-credentials: false
+    - name: Set up Go
+      uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      with:
+        go-version-file: go.mod
+    # ghcr.io needs a lowercase path.
+    - name: Set the registry
+      run: echo "REGISTRY=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_ENV"
+    - name: Build the release manifests
+      run: make release
+    - name: Set up buildx
+      uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+    - name: Log in to ghcr.io
+      uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+      with:
+        registry: ghcr.io
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    - name: Push the image
+      run: make docker-push-all TAG="$RELEASE_TAG" GIT_VERSION="$RELEASE_TAG"
+    - name: Create the draft release
+      uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+      with:
+        draft: true
+        prerelease: ${{ contains(github.ref_name, '-') }}
+        generate_release_notes: true
+        fail_on_unmatched_files: true
+        files: |
+          out/ipam-components.yaml
+          out/metadata.yaml

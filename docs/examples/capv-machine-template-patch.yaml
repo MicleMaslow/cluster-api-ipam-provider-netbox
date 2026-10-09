@@ -1,0 +1,21 @@
+# Fragment: the fields of a CAPV VSphereMachineTemplate that take the machine address from a NetBoxIPPool.
+# The other required fields of the template (server, datacenter, template, ...) are left out.
+# CAPV creates one IPAddressClaim per pool reference; the provider answers it with an address,
+# the mask of the parent network and its gateway, so gateway4 is not set here.
+apiVersion: infrastructure.cluster.x-k8s.io/v1beta2
+kind: VSphereMachineTemplate
+metadata:
+  name: demo-workers
+spec:
+  template:
+    spec:
+      network:
+        devices:
+        - networkName: demo-portgroup
+          dhcp4: false
+          addressesFromPools:
+          - apiGroup: ipam.cluster.x-k8s.io
+            kind: NetBoxIPPool
+            name: demo-workers
+          nameservers:
+          - 10.10.0.53

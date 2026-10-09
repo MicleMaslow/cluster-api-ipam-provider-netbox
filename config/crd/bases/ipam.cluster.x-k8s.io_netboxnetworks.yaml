@@ -1,0 +1,268 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.22.0
+  name: netboxnetworks.ipam.cluster.x-k8s.io
+spec:
+  group: ipam.cluster.x-k8s.io
+  names:
+    categories:
+    - cluster-api
+    kind: NetBoxNetwork
+    listKind: NetBoxNetworkList
+    plural: netboxnetworks
+    singular: netboxnetwork
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - description: Cluster the network belongs to
+      jsonPath: .spec.clusterName
+      name: Cluster
+      type: string
+    - description: CIDR held in NetBox
+      jsonPath: .status.prefix
+      name: Prefix
+      type: string
+    - description: Whether the network is reflected in NetBox
+      jsonPath: .status.conditions[?(@.type=='Ready')].status
+      name: Ready
+      type: string
+    - description: Reason of the Ready condition
+      jsonPath: .status.conditions[?(@.type=='Ready')].reason
+      name: Reason
+      type: string
+    - description: Time duration since creation of NetBoxNetwork
+      jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: NetBoxNetwork is a cluster subnet held in NetBox.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: spec is the desired state of NetBoxNetwork.
+            properties:
+              clusterName:
+                description: clusterName is the CAPI Cluster the network belongs to.
+                maxLength: 63
+                minLength: 1
+                type: string
+                x-kubernetes-validations:
+                - message: clusterName is immutable
+                  rule: self == oldSelf
+              customFields:
+                additionalProperties:
+                  x-kubernetes-preserve-unknown-fields: true
+                description: |-
+                  customFields are set on the NetBox prefix. A JSON-object value is merged key by key into the
+                  field's current object: keys given here are written, keys written before but no longer given
+                  are removed, other keys are left alone. Any other value replaces the field.
+                  capi_ref and capi_cluster are managed by the provider; setting them fails the MetadataSynced condition with reason InvalidSpec.
+                maxProperties: 32
+                type: object
+              deletionPolicy:
+                default: Retain
+                description: deletionPolicy for the NetBox prefix and the pool ranges
+                  inside it.
+                enum:
+                - Retain
+                - Delete
+                type: string
+              gateway:
+                description: gateway of the parent network.
+                maxLength: 39
+                minLength: 1
+                type: string
+                x-kubernetes-validations:
+                - message: must be an IP address
+                  rule: isIP(self)
+                - message: only IPv4 is supported
+                  rule: '!isIP(self) || ip(self).family() == 4'
+                - message: gateway is immutable
+                  rule: self == oldSelf
+              parentPrefix:
+                description: parentPrefix is the L2 network the prefix lives in; addresses
+                  get its mask.
+                maxLength: 43
+                minLength: 1
+                type: string
+                x-kubernetes-validations:
+                - message: must be a CIDR
+                  rule: isCIDR(self)
+                - message: only IPv4 is supported
+                  rule: '!isCIDR(self) || cidr(self).ip().family() == 4'
+                - message: parentPrefix is immutable
+                  rule: self == oldSelf
+              prefix:
+                description: prefix adopts an existing prefix inside parentPrefix
+                  instead of carving one.
+                maxLength: 43
+                minLength: 1
+                type: string
+                x-kubernetes-validations:
+                - message: must be a CIDR
+                  rule: isCIDR(self)
+                - message: prefix is immutable
+                  rule: self == oldSelf
+              prefixLength:
+                description: prefixLength of the prefix to carve from parentPrefix.
+                format: int32
+                maximum: 32
+                minimum: 1
+                type: integer
+                x-kubernetes-validations:
+                - message: prefixLength is immutable
+                  rule: self == oldSelf
+              tags:
+                description: tags are slugs of existing NetBox tags set on the prefix.
+                  Tags added by others are kept.
+                items:
+                  maxLength: 100
+                  pattern: ^[-a-zA-Z0-9_]+$
+                  type: string
+                maxItems: 32
+                type: array
+                x-kubernetes-list-type: set
+            required:
+            - clusterName
+            - gateway
+            - parentPrefix
+            type: object
+            x-kubernetes-validations:
+            - message: exactly one of prefix or prefixLength must be set
+              rule: has(self.prefix) != has(self.prefixLength)
+            - message: cannot switch between prefix and prefixLength
+              rule: has(self.prefix) == has(oldSelf.prefix)
+            - message: gateway must be inside parentPrefix
+              rule: '!isCIDR(self.parentPrefix) || !isIP(self.gateway) || cidr(self.parentPrefix).containsIP(self.gateway)'
+            - message: prefix must be inside parentPrefix
+              rule: '!has(self.prefix) || !isCIDR(self.parentPrefix) || !isCIDR(self.prefix)
+                || cidr(self.parentPrefix).containsCIDR(self.prefix)'
+            - message: prefixLength must be longer than the parentPrefix mask
+              rule: '!has(self.prefixLength) || !isCIDR(self.parentPrefix) || self.prefixLength
+                > cidr(self.parentPrefix).prefixLength()'
+            - message: an adopted prefix cannot use deletionPolicy Delete
+              rule: '!has(self.prefix) || !has(self.deletionPolicy) || self.deletionPolicy
+                != ''Delete'''
+          status:
+            description: status is the observed state of NetBoxNetwork.
+            minProperties: 1
+            properties:
+              conditions:
+                description: |-
+                  conditions represents the observations of a NetBoxNetwork's current state.
+                  Known condition types are Ready and MetadataSynced.
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                maxItems: 32
+                type: array
+                x-kubernetes-list-map-keys:
+                - type
+                x-kubernetes-list-type: map
+              customFieldKeys:
+                additionalProperties:
+                  items:
+                    type: string
+                  type: array
+                description: customFieldKeys are, per JSON-object custom field, the
+                  keys the provider has written.
+                type: object
+              prefix:
+                description: prefix is the CIDR held in NetBox.
+                maxLength: 43
+                minLength: 1
+                type: string
+              prefixID:
+                description: prefixID is the NetBox ID of the prefix.
+                format: int64
+                minimum: 1
+                type: integer
+              tags:
+                description: tags are the slugs of the tags the provider has set on
+                  the prefix.
+                items:
+                  maxLength: 100
+                  type: string
+                maxItems: 32
+                type: array
+                x-kubernetes-list-type: set
+            type: object
+        required:
+        - spec
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}
