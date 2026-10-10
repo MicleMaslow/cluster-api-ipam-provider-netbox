@@ -22,6 +22,11 @@ const ReadyCondition = "Ready"
 // MetadataSyncedCondition is true once spec.customFields and spec.tags are applied to the NetBox prefix.
 const MetadataSyncedCondition = "MetadataSynced"
 
+// ControlPlaneEndpointReadyCondition is true once the VIP is reserved in NetBox and Cluster.spec.controlPlaneEndpoint is the VIP.
+// False with WaitingForCluster until the Cluster exists, EndpointConflict when the Cluster has another endpoint or the address
+// cannot be the VIP, Exhausted when no address is left for it. It never changes Ready.
+const ControlPlaneEndpointReadyCondition = "ControlPlaneEndpointReady"
+
 // RangesReadyCondition is true when every range of a NetBoxIPPool is in NetBox as the spec asks.
 const RangesReadyCondition = "RangesReady"
 
@@ -47,6 +52,8 @@ const (
 	ReasonWaitingForPools     = "WaitingForPools"
 	ReasonWaitingForAddresses = "WaitingForAddresses"
 	ReasonWaitingForPrefix    = "WaitingForPrefix"
+	ReasonWaitingForCluster   = "WaitingForCluster"
+	ReasonEndpointConflict    = "EndpointConflict"
 	ReasonForbidden           = "Forbidden"
 	ReasonOwnedByOtherOwner   = "OwnedByOtherOwner"
 	ReasonInternalError       = "InternalError"

@@ -17,6 +17,7 @@
 # CAPV against vcsim (a simulated vCenter) on the dev kind cluster; machines take their addresses from NetBoxIPPools.
 #   vcsim.sh up              install CAPV and the vcsim controller of CAPV's test infrastructure
 #   vcsim.sh cluster NAME    create the workload cluster NAME in the namespace NAME
+#                            (CONTROL_PLANE_ENDPOINT=1: its VIP comes from the NetBoxNetwork)
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 export KUBECONFIG=$PWD/hack/dev/kubeconfig
@@ -27,6 +28,8 @@ CLUSTERCTL=${CLUSTERCTL:-hack/tools/bin/clusterctl-v1.14.3}
 KUSTOMIZE=${KUSTOMIZE:-hack/tools/bin/kustomize-v5.7.0}
 KIND_CLUSTER=${KIND_CLUSTER:-capi-netbox-dev}
 VCSIM_IMAGE=capv-vcsim-controller:$CAPV_VERSION
+NETWORK_PATCH=${NETWORK_PATCH:-hack/dev/vcsim-network.local.yaml}
+[ -f "$NETWORK_PATCH" ] || NETWORK_PATCH=hack/dev/vcsim-network.example.yaml
 
 up() {
   [ -d "$CAPV_SRC" ] || git clone -q --depth 1 --branch "$CAPV_VERSION" https://github.com/kubernetes-sigs/cluster-api-provider-vsphere.git "$CAPV_SRC"
@@ -49,24 +52,34 @@ up() {
 }
 
 cluster() {
-  local name=$1
+  local name=$1 fields="" endpoint="" template_fix="."
+  # NODE_DOMAIN makes the NetBox dns_name of a node its FQDN.
+  [ -z "${NODE_DOMAIN:-}" ] || fields=", ipAddress: {dnsName: \"{{ .Owner }}.$NODE_DOMAIN\"}"
+  # CONTROL_PLANE_ENDPOINT=1: the network reserves the VIP and sets the endpoint of the Cluster, so the VSphereCluster has none.
+  if [ "${CONTROL_PLANE_ENDPOINT:-}" = 1 ]; then
+    endpoint=", controlPlaneEndpoint: {dnsName: $name-api${NODE_DOMAIN:+.$NODE_DOMAIN}}"
+    template_fix='(select(.kind == "VSphereCluster") | .spec) |= del(.controlPlaneEndpoint)'
+  fi
   kubectl create namespace "$name" --dry-run=client -o yaml | kubectl apply -f -
   kubectl apply -f - <<EOF
 apiVersion: ipam.cluster.x-k8s.io/v1alpha1
 kind: NetBoxNetwork
 metadata: {name: $name, namespace: $name}
-spec: {clusterName: $name, parentPrefix: ${PARENT_PREFIX:-10.10.0.0/22}, gateway: ${GATEWAY:-10.10.0.1}, prefixLength: ${PREFIX_LENGTH:-26}}
+spec: {clusterName: $name, parentPrefix: ${PARENT_PREFIX:-10.10.0.0/22}, gateway: ${GATEWAY:-10.10.0.1}, prefixLength: ${PREFIX_LENGTH:-26}$endpoint}
 ---
 apiVersion: ipam.cluster.x-k8s.io/v1alpha1
 kind: NetBoxIPPool
 metadata: {name: $name-cp, namespace: $name, labels: {cluster.x-k8s.io/cluster-name: $name}}
-spec: {ranges: [{networkName: $name, start: 2, end: 7}]}
+spec: {ranges: [{networkName: $name, start: 2, end: 7}]$fields}
 ---
 apiVersion: ipam.cluster.x-k8s.io/v1alpha1
 kind: NetBoxIPPool
 metadata: {name: $name-workers, namespace: $name, labels: {cluster.x-k8s.io/cluster-name: $name}}
-spec: {ranges: [{networkName: $name, start: 16, end: -3}]}
+spec: {ranges: [{networkName: $name, start: 16, end: -3}]$fields}
 EOF
+
+  # Tags and custom fields of the cluster prefix.
+  kubectl -n "$name" patch netboxnetwork "$name" --type merge --patch "$(sed "s/\${CLUSTER_NAME}/$name/g" "$NETWORK_PATCH")"
 
   # One vcsim instance serves every cluster; each cluster gets its own fake API server endpoint.
   # The endpoint of a deleted cluster keeps serving its certificates, so a new cluster gets a new one.
@@ -101,7 +114,8 @@ EOF
   "$CLUSTERCTL" generate yaml --config hack/dev/clusterctl.yaml --from "$CAPV_SRC/templates/cluster-template-node-ipam.yaml" |
     yq 'select(.kind != "ClusterResourceSet" and .kind != "ConfigMap" and (.kind != "Secret" or .metadata.name == strenv(CLUSTER_NAME)))
       | (select(.kind == "VSphereMachineTemplate" and .metadata.name == strenv(CLUSTER_NAME))
-         | .spec.template.spec.network.devices[0].addressesFromPools[0].name) = strenv(CLUSTER_NAME) + "-cp"' |
+         | .spec.template.spec.network.devices[0].addressesFromPools[0].name) = strenv(CLUSTER_NAME) + "-cp"
+      | '"$template_fix" |
     kubectl apply -f -
 }
 

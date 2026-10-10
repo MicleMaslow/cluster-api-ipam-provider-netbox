@@ -129,24 +129,44 @@ Both kinds are namespaced, in `ipam.cluster.x-k8s.io/v1alpha1`. `kubectl explain
 
 ### NetBoxNetwork
 
-A subnet of one cluster inside a parent L2 network (IPv4, global VRF). See `config/samples/sample.yaml`.
+A subnet of one cluster inside an L2 network (IPv4, global VRF). See `config/samples/sample.yaml`.
 
-- `clusterName`, `parentPrefix` (an existing NetBox prefix) and `gateway` of the parent network. Addresses handed out get the mask of `parentPrefix` and this gateway.
-- The CRD rejects: a `gateway` or `prefix` outside `parentPrefix`, a `prefixLength` not longer than the `parentPrefix` mask, an IPv6 `parentPrefix` or `gateway`, a changed `gateway`, and an adopted `prefix` with `deletionPolicy: Delete`.
+- `clusterName`, `parentPrefix` (an existing NetBox prefix the cluster prefix is carved from or adopted in) and `gateway` of the L2 network. `parentPrefix` may be the prefix of the whole VLAN or a logical pool for CAPI inside it; the gateway may lie outside a logical parent.
+- `addressPrefixLength` is the mask of the nodes' subnet. The L2 network is `gateway/addressPrefixLength` with the host bits cleared; without the field it is `parentPrefix`. Addresses handed out get this mask and the gateway (`status.addressPrefixLength`). The network and broadcast address of the L2 network and the gateway are reserved: a pool range or the VIP never covers them. Pools take ranges of networks in one L2 network only (`MixedNetworks` compares gateway and mask), so networks of different logical parents of one VLAN can share a pool.
+- The CRD rejects: an L2 network that does not contain `parentPrefix`, an `addressPrefixLength` longer than the `parentPrefix` mask, a `prefix` outside `parentPrefix`, a `prefixLength` not longer than the `parentPrefix` mask, an IPv6 `parentPrefix` or `gateway`, a changed `gateway` or `addressPrefixLength`, `isPool` without `prefixLength`, and an adopted `prefix` with `deletionPolicy: Delete`.
 - `prefixLength` carves a free prefix of that length out of `parentPrefix`; `prefix` instead takes a given CIDR inside it: an existing prefix that carries the provider's Owner is adopted, a missing one is created. Exactly one of the two, immutable. Adoption writes only `capi_ref` and `capi_cluster`; status, description and the rest stay as the NetBox admin set them. A deprecated prefix another NetBoxNetwork left is adopted, and made active again, only from the same namespace.
+- `isPool: true` sets `is_pool` on the prefix the provider carves, so NetBox counts all its addresses as usable hosts, and keeps it in sync; the default is false. It needs `prefixLength`: an adopted prefix is never changed.
 - `deletionPolicy`: `Retain` (default) marks the prefix `deprecated` when the object is deleted and reclaims it when it is created again; `Delete` removes it from NetBox. Pool ranges in the network follow the same policy when their pool releases them, because the range was removed or the pool deleted: they are deprecated or removed. The network itself is deleted only after those pools (`WaitingForPools`). With `prefix` the NetBox prefix is only released on deletion: `capi_ref` and `capi_cluster` are cleared, everything else, tags and custom fields included, stays; its pool ranges are deprecated. That holds for a prefix the provider created because none existed: it stays active with its description and needs manual cleanup in NetBox. The prefix is found in NetBox by the provider's key, not by the status.
+- `controlPlaneEndpoint` (`port`, default 6443; `dnsName`, kept in lower case as NetBox does) reserves the cluster's VIP right after the prefix and writes it to `Cluster.spec.controlPlaneEndpoint`; see [Control-plane endpoint and kube-vip](#control-plane-endpoint-and-kube-vip). Without the field no VIP is reserved. Set it on one network of a cluster only: a second one reserves a VIP of its own that the Cluster never gets and reports `EndpointConflict`.
+  - The VIP is the host of the Cluster's endpoint if that is an address inside the prefix (the migration of a running cluster), else the highest address of the prefix that is not the network, broadcast or gateway of the L2 network, holds no NetBox address and lies in no IP range. It is created in NetBox with role `vip` and shows in `status.controlPlaneEndpoint`, whose port is the effective one. It is found again by its key and never moves; one deleted in NetBox is created again at the same address, or the network reports `EndpointConflict` if the address was taken. A VIP moved to another address in NetBox is `EndpointConflict` too, and the status keeps the old address.
+  - The Cluster gets `{host: VIP, port}` once, by a merge patch of that field only, while its endpoint has no host or no port (a port alone is what CAPI copies from an infrastructure cluster that sets only the port). A paused Cluster is skipped. Another endpoint is never overwritten.
+  - `ControlPlaneEndpointReady` is True when the VIP is reserved and the Cluster has it. Otherwise it is False with `WaitingForCluster` (the Cluster does not exist yet; a new VIP is picked only once it does, as its endpoint may be the VIP; the provider watches Clusters, so the order of applying the manifests does not matter), `EndpointConflict` (the Cluster has another endpoint), or the reason of the VIP error (`Exhausted`, `EndpointConflict`, ...). It never changes `Ready`, so adding a VIP to a live network stops no pool.
+  - A pool range that is not in NetBox yet waits (`NetworkNotReady`) until the network has its VIP; one that covers the VIP is `InvalidRange`.
+  - The VIP follows `deletionPolicy`: deleted, or `deprecated` and taken back when the network is created again. Removing the field from the spec releases neither the VIP nor the Cluster endpoint: `status.controlPlaneEndpoint` stays, so pool ranges still keep off the VIP, and only the `ControlPlaneEndpointReady` condition goes.
 - `customFields` are set on the NetBox prefix. A JSON-object value is merged key by key: keys given here are written, keys the provider wrote earlier and that are no longer given are removed, other keys stay. Any other value replaces the field. `capi_ref` and `capi_cluster` are reserved. A failure shows in the `MetadataSynced` condition and never blocks `Ready`.
 - `tags` are slugs of existing NetBox tags set on the prefix; a missing tag fails `MetadataSynced`. Tags added by others stay, tags the provider set (`status.tags`) and that are no longer given are removed. Tags and custom fields are written in one update.
 
-A network being deleted waits while a NetBoxIPPool still has a range in it (`WaitingForPools`). A retained prefix still takes its space in the parent: deprecated prefixes of deleted clusters need cleanup in NetBox, or parents fill up.
+A network being deleted waits while a NetBoxIPPool still has a range in it (`WaitingForPools`).
+
+### Retained objects
+
+`deletionPolicy: Retain` leaves the prefix the provider created, the pool IP ranges and the VIP of a deleted cluster in NetBox as `deprecated`. A prefix taken with `spec.prefix` is only released and stays active; its ranges and the VIP become deprecated. Deprecated objects still take their space in the parent; creating the same network again takes them back. To remove them, run `hack/netbox-cleanup-retained.sh` (bash, curl 7.76+ and jq). It needs its own admin token with view on `ipam.prefix`, `ipam.iprange`, `ipam.ipaddress` and `users.owner` and delete on the three IPAM types; the provider's production token has no delete on prefixes and ranges (see [Permissions](#permissions)).
+
+```bash
+export NETBOX_URL=https://netbox.example.com NETBOX_TOKEN=<token> NETBOX_OWNER=<owner>
+hack/netbox-cleanup-retained.sh <cluster> --namespace <ns>          # lists what would be deleted, with their capi_ref
+hack/netbox-cleanup-retained.sh <cluster> --namespace <ns> --yes    # deletes it
+```
+
+Only `deprecated` objects of that cluster and owner are touched: the VIP (role `vip`), ranges and prefix; active objects and other clusters stay. Clusters of the same name in different namespaces share `capi_cluster`: give `--namespace`, which matches the namespace in `capi_ref`, or check the refs in the listing before `--yes`. For clusters where space matters more than protection, use `deletionPolicy: Delete`.
 
 ### NetBoxIPPool
 
-`ranges` is a list of `{networkName, start, end}`: a span of a NetBoxNetwork given as offsets from its first address; a negative offset counts back from the last one (`-1`). Ranges are used in order, one per network, and all networks of a pool share the `parentPrefix` and `gateway` of the first range's network; until that network exists no range serves. Each range becomes a NetBox IP range; a claim gets an address from it, and the address is deleted from NetBox with the claim. Label the pool with `cluster.x-k8s.io/cluster-name` so that pausing the Cluster pauses the pool.
+`ranges` is a list of `{networkName, start, end}`: a span of a NetBoxNetwork given as offsets from its first address; a negative offset counts back from the last one (`-1`). Ranges are used in order, one per network, and all networks of a pool share the L2 network (gateway and mask) of the first range's network; until that network exists no range serves. Each range becomes a NetBox IP range; a claim gets an address from it, and the address is deleted from NetBox with the claim. Label the pool with `cluster.x-k8s.io/cluster-name` so that pausing the Cluster pauses the pool.
 
 Every range is reconciled on its own and reported in `status.ranges[]` (`ready`, `reason`, `message`). Claims get addresses only from ready ranges; the pool is `Ready` while at least one range is, and `RangesReady` lists the ranges that are not as the spec asks:
 
-- A range that covers the network, broadcast or gateway address of the parent, or lies outside its network, is `InvalidRange`; one in a network of another L2 is `MixedNetworks`.
+- A range that covers the network, broadcast or gateway address of the L2 network or the VIP, or lies outside its network, is `InvalidRange`; one in a network of another L2 is `MixedNetworks`.
 - A range can be changed. The NetBox range is resized in place; a change that would leave allocated addresses outside it waits (`RangeInUse`, the addresses are in the message). A change that waits, overlaps another range (`RangeOverlap`) or is invalid leaves an active range serving with its old bounds, as long as they are still valid.
 - A range can be removed. Its NetBox range is deleted or deprecated as the network's `deletionPolicy` says; while addresses are still allocated in it, it stays in `status.ranges`, not ready (`RangeInUse`). Removed ranges are found in NetBox by the pool's key, not by the status.
 - Once no allocated address is in the way of a shrink, deletion or deprecation, NetBox stops handing out the range's addresses (`mark_populated`) and the allocated addresses are checked again before the change. A removed range that still holds addresses is not closed: claims stop using it once it is not ready, but NetBox would still hand out its free addresses to a direct request. A deprecated range stays closed; NetBox also refuses addresses created by hand inside it.
@@ -166,17 +186,22 @@ The fields are written when an address is created in NetBox and compared with th
 
 ### Claims
 
-Claims point at the pool with `poolRef: {apiGroup: ipam.cluster.x-k8s.io, kind: NetBoxIPPool, name: <pool>}`. The `IPAddress` gets the address, the mask of the parent network as `prefix` and the gateway. An address deleted in NetBox by hand is created again with the same address; if NetBox has given that address to another object, the claim reports `AddressConflict`.
+Claims point at the pool with `poolRef: {apiGroup: ipam.cluster.x-k8s.io, kind: NetBoxIPPool, name: <pool>}`. The `IPAddress` gets the address, the mask of the L2 network as `prefix` and the gateway. An address deleted in NetBox by hand is created again with the same address; if NetBox has given that address to another object, the claim reports `AddressConflict`.
 
 ## Example: network scheme
 
-One /26 per cluster split into control plane (6), ingress (8), workers (the rest) and the kube-vip address.
+One /26 per cluster split into control plane (6), ingress (8) and workers (the rest); the kube-vip address is the VIP the network reserves itself.
 
 ```yaml
 apiVersion: ipam.cluster.x-k8s.io/v1alpha1
 kind: NetBoxNetwork
 metadata: {name: demo, namespace: demo}
-spec: {clusterName: demo, parentPrefix: 10.10.0.0/22, gateway: 10.10.0.1, prefixLength: 26}
+spec:
+  clusterName: demo
+  parentPrefix: 10.10.0.0/22
+  gateway: 10.10.0.1
+  prefixLength: 26
+  controlPlaneEndpoint: {dnsName: demo-api.example}   # the VIP: the highest free address of the /26
 ---
 apiVersion: ipam.cluster.x-k8s.io/v1alpha1
 kind: NetBoxIPPool
@@ -192,11 +217,6 @@ apiVersion: ipam.cluster.x-k8s.io/v1alpha1
 kind: NetBoxIPPool
 metadata: {name: demo-workers, namespace: demo, labels: {cluster.x-k8s.io/cluster-name: demo}}
 spec: {ranges: [{networkName: demo, start: 16, end: -3}]}
----
-apiVersion: ipam.cluster.x-k8s.io/v1alpha1
-kind: NetBoxIPPool
-metadata: {name: demo-vip, namespace: demo, labels: {cluster.x-k8s.io/cluster-name: demo}}
-spec: {ranges: [{networkName: demo, start: -2, end: -2}]}
 ```
 
 Later the cluster needs addresses for MetalLB. Shrink the workers and add the new pool in one `kubectl apply`:
@@ -215,7 +235,7 @@ spec: {ranges: [{networkName: demo, start: -10, end: -3}]}
 
 `demo-metallb` is `RangeOverlap` until the workers range is shrunk, then `Ready`. If a worker still holds an address in the last eight, the workers range shows `RangeInUse` with that address and `demo-metallb` waits until the machine is gone. MetalLB itself is configured with the addresses of `demo-metallb`'s `status.ranges`; the pool only reserves them in NetBox.
 
-[`docs/examples/network-scheme.yaml`](docs/examples/network-scheme.yaml) holds the resulting scheme with all five pools.
+[`docs/examples/network-scheme.yaml`](docs/examples/network-scheme.yaml) holds the resulting scheme with all four pools.
 
 ## Example: CAPV
 
@@ -235,9 +255,30 @@ spec:
           - {apiGroup: ipam.cluster.x-k8s.io, kind: NetBoxIPPool, name: demo-workers}
 ```
 
+## Control-plane endpoint and kube-vip
+
+KubeadmControlPlane creates no machine and no kubeconfig until `Cluster.spec.controlPlaneEndpoint` is set. A `NetBoxNetwork` with `controlPlaneEndpoint` reserves the VIP in NetBox and writes it there before that, so CAPI renders the kubeconfig and cloud-init with the VIP, and CAPV leaves an endpoint that the Cluster already has as it is. Omit `VSphereCluster.spec.controlPlaneEndpoint` entirely rather than leaving it empty.
+
+kube-vip needs the address in its static pod manifest, but the template is applied before the VIP exists. CAPI puts the endpoint into the kubeadm config on the node (`/run/kubeadm/kubeadm.yaml`, `controlPlaneEndpoint`, on the first control plane machine; `/run/kubeadm/kubeadm-join-config.yaml`, `apiServerEndpoint`, on the others). Put a placeholder into the manifest (`address: __CONTROL_PLANE_ENDPOINT__`) and replace it from there:
+
+```yaml
+preKubeadmCommands:
+- >-
+  f=/run/kubeadm/kubeadm.yaml; [ -f "$f" ] || f=/run/kubeadm/kubeadm-join-config.yaml;
+  ep=$(sed -nE 's/^ *(controlPlaneEndpoint|apiServerEndpoint): *"?([^:"]+):[0-9]+"?$/\2/p' "$f" | head -1);
+  [ -n "$ep" ] || { echo "no control plane endpoint in $f" >&2; exit 1; };
+  sed -i "s/__CONTROL_PLANE_ENDPOINT__/$ep/" /etc/kubernetes/manifests/kube-vip.yaml
+```
+
+[`docs/examples/kube-vip-kcp-patch.yaml`](docs/examples/kube-vip-kcp-patch.yaml) holds the fragment of the KubeadmControlPlane with the manifest.
+
+To move a running cluster, add `controlPlaneEndpoint` to its network, with the `port` the Cluster uses. The VIP is then the address the Cluster has, if it is inside the prefix of the network. It must be free in NetBox: not the network, broadcast or gateway of the L2 network, no IP address object, in no IP range; otherwise the network reports `EndpointConflict` on `ControlPlaneEndpointReady` and nothing changes. An endpoint outside the prefix, or a DNS name, is `EndpointConflict` as well: the Cluster is never changed, and the provider reserves the highest free address meanwhile.
+
+A cluster that took its VIP from a pool of its own (a NetBoxIPPool with one range on the VIP) must lose that pool first, and its range must be gone from NetBox: under `deletionPolicy: Retain` the range stays `deprecated` and still holds the address, so the network reports `EndpointConflict`. Delete it with `hack/netbox-cleanup-retained.sh` or in NetBox, then add `controlPlaneEndpoint`.
+
 ## clusterctl move and pivot
 
-`clusterctl move` leaves the NetBox objects alone. The target cluster finds the prefix, ranges and addresses by their `capi_ref`, so the status is rebuilt there, including removed ranges that still hold addresses. This works only between providers with the same `--netbox-owner`: if an object with the same `capi_ref` belongs to another owner, nothing is created and the object reports `OwnedByOtherOwner` (a claim: `AllocationFailed` with that message; an allocated address: `AddressConflict`).
+`clusterctl move` leaves the NetBox objects alone. The target cluster finds the prefix, VIP, ranges and addresses by their `capi_ref`, so the status is rebuilt there, including removed ranges that still hold addresses; the endpoint of the moved Cluster already is the VIP. This works only between providers with the same `--netbox-owner`: if an object with the same `capi_ref` belongs to another owner, nothing is created and the object reports `OwnedByOtherOwner` (a claim: `AllocationFailed` with that message; an allocated address: `AddressConflict`).
 
 ## Troubleshooting
 
@@ -245,6 +286,7 @@ spec:
 kubectl get netboxnetworks,netboxippools -A
 kubectl get ipaddressclaims.ipam.cluster.x-k8s.io,ipaddresses.ipam.cluster.x-k8s.io -A
 kubectl -n <ns> get netboxippool <pool> -o jsonpath='{.status.ranges}'
+kubectl -n <ns> get netboxnetwork <network> -o jsonpath='{.status.controlPlaneEndpoint} {.status.conditions}'
 ```
 
 Use the full resource names: in Kubernetes ≥ 1.33 the plain resource name `ipaddresses` resolves to `networking.k8s.io`. Every change the provider makes in NetBox carries a changelog message that starts with `capi:`. States that only a change in NetBox can clear are checked again every minute.
@@ -252,17 +294,19 @@ Use the full resource names: in Kubernetes ≥ 1.33 the plain resource name `ipa
 | Reason | Where | Meaning |
 |---|---|---|
 | `ParentNotFound` | network `Ready` | NetBox has not exactly one `parentPrefix` in the global VRF |
-| `Exhausted` | network `Ready` | no free prefix of `prefixLength` left in the parent |
-| `PrefixMismatch` | network `Ready` | the NetBox prefix is outside the parent or not the length or CIDR of the spec |
+| `Exhausted` | network `Ready`, `ControlPlaneEndpointReady` | no free prefix of `prefixLength` left in the parent (`Ready`), or no free address for the VIP in the prefix |
+| `EndpointConflict` | network `ControlPlaneEndpointReady` | the Cluster has another endpoint than the VIP (it is not changed), or the address meant for the VIP (the Cluster's endpoint, or the VIP's old address) is taken, reserved or inside an IP range |
+| `WaitingForCluster` | network `ControlPlaneEndpointReady` | the Cluster of the network does not exist yet; a new VIP is reserved and written when it appears |
+| `PrefixMismatch` | network `Ready`, `ControlPlaneEndpointReady` | the NetBox prefix is outside the parent or not the length or CIDR of the spec; the NetBox address of the VIP is outside the prefix |
 | `PrefixNotFound` | network `Ready` | the prefix in the status is gone from NetBox; it is not carved again, restore it |
-| `NotOwned` | network `Ready`, pool | the object exists in NetBox without the provider's Owner; to adopt a prefix, set its owner in NetBox |
-| `OwnedByOtherOwner` | network `Ready`, pool | a NetBox object with the same `capi_ref` belongs to another owner (see move and pivot) |
-| `Duplicate` | network `Ready`, pool | more than one NetBox object carries the key, or the CIDR to adopt exists more than once or is held by another network |
+| `NotOwned` | network `Ready`, `ControlPlaneEndpointReady`, pool | the object (for `ControlPlaneEndpointReady`, the VIP) exists in NetBox without the provider's Owner; to adopt a prefix, set its owner in NetBox |
+| `OwnedByOtherOwner` | network `Ready`, `ControlPlaneEndpointReady`, pool | a NetBox object (for `ControlPlaneEndpointReady`, the VIP) with the same `capi_ref` belongs to another owner (see move and pivot) |
+| `Duplicate` | network `Ready`, `ControlPlaneEndpointReady`, pool | more than one NetBox object carries the key (for `ControlPlaneEndpointReady`, the VIP's), or the CIDR to adopt exists more than once or is held by another network |
 | `InvalidSpec` | network `MetadataSynced`, pool `Ready` | `customFields` sets `capi_ref` or `capi_cluster`; the `ipAddress` template of a pool does not render or gives an invalid DNS name |
-| `WaitingForPrefix` | network `MetadataSynced` | metadata waits for the prefix to be `Ready` |
+| `WaitingForPrefix` | network `MetadataSynced`, `ControlPlaneEndpointReady` | metadata and the VIP wait for the prefix to be `Ready` |
 | `Deleting` | network, pool `Ready` | deletion in progress |
 | `WaitingForPools` | network `Ready` while deleting | a NetBoxIPPool still has a range in the network |
-| `NetworkNotReady` | pool, range | the network of the range is missing or not `Ready` |
+| `NetworkNotReady` | pool, range | the network of the range is missing or not `Ready`, or a new range waits for the VIP of its network |
 | `MixedNetworks`, `InvalidRange`, `RangeInUse`, `RangeOverlap` | range | see [NetBoxIPPool](#netboxippool) |
 | `WaitingForAddresses` | pool `Ready` while deleting | `IPAddress` objects of the pool still exist |
 | `Forbidden` | network, pool, range | the token lacks a NetBox permission (HTTP 403) |
@@ -340,7 +384,9 @@ make vcsim-up                # CAPV and the vcsim controller of CAPV's test infr
 make vcsim-cluster NAME=vc   # NetBoxNetwork vc, pools vc-cp and vc-workers, and a cluster from CAPV's node-ipam template
 ```
 
-`vcsim-up` builds the vcsim controller image from the CAPV sources (`CAPV_VERSION`, default v1.17.0, cloned into `~/.cache/capi-ipam-netbox`) and installs CAPV with clusterctl. The machines get their addresses through `addressesFromPools`, control plane from `<NAME>-cp`, workers from `<NAME>-workers`, and CAPV writes them into the VM metadata in vcsim. The workload cluster itself is fake: the vcsim controller simulates the machine bootstrap and the API server behind the control plane endpoint, and without cloud-init the VMs report the address 192.0.2.100. `CP_MACHINES`, `WORKER_MACHINES`, `K8S_VERSION`, `PARENT_PREFIX`, `GATEWAY` and `PREFIX_LENGTH` tune the cluster. Deleting the Cluster releases its addresses; the network and the pools stay.
+`vcsim-up` builds the vcsim controller image from the CAPV sources (`CAPV_VERSION`, default v1.17.0, cloned into `~/.cache/capi-ipam-netbox`) and installs CAPV with clusterctl. The machines get their addresses through `addressesFromPools`, control plane from `<NAME>-cp`, workers from `<NAME>-workers`, and CAPV writes them into the VM metadata in vcsim. The workload cluster itself is fake: the vcsim controller simulates the machine bootstrap and the API server behind the control plane endpoint, and without cloud-init the VMs report the address 192.0.2.100. `CP_MACHINES`, `WORKER_MACHINES`, `K8S_VERSION`, `PARENT_PREFIX`, `GATEWAY` and `PREFIX_LENGTH` tune the cluster; `NODE_DOMAIN` makes the `dns_name` of the node addresses `<node>.<NODE_DOMAIN>`. Tags and custom fields of the cluster prefix come from `hack/dev/vcsim-network.local.yaml`, else from [`hack/dev/vcsim-network.example.yaml`](hack/dev/vcsim-network.example.yaml), a merge patch of the NetBoxNetwork with `${CLUSTER_NAME}` substituted; the custom fields it needs beyond the seeded ones go into `hack/dev/custom-fields.local.json`, created by `make netbox-up`. Both local files are git-ignored. Deleting the Cluster releases its addresses; the network and the pools stay.
+
+`CONTROL_PLANE_ENDPOINT=1` gives the network a `controlPlaneEndpoint` (`dnsName` `<NAME>-api[.<NODE_DOMAIN>]`) and takes the endpoint out of the VSphereCluster. The cluster then does not reach `Available`, because the fake API server of vcsim lives on its own address, but the VIP in NetBox, `Cluster.spec.controlPlaneEndpoint` and the endpoint in the bootstrap data of the control plane can be checked. For the same reason the vcsim controller does not release the VMs on deletion: remove the `vcsim.fake.infrastructure.cluster.x-k8s.io` finalizer of the VSphereVMs.
 
 ### Develop with Tilt
 

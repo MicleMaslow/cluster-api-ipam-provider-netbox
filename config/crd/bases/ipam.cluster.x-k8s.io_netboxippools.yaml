@@ -133,8 +133,8 @@ spec:
             minProperties: 1
             properties:
               addressPrefixLength:
-                description: addressPrefixLength is the mask length (that of the parent
-                  prefix) handed to every address of the pool.
+                description: addressPrefixLength is the mask length (that of the L2
+                  network) handed to every address of the pool.
                 format: int32
                 maximum: 128
                 minimum: 1

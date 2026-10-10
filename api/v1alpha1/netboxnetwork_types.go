@@ -32,10 +32,13 @@ const (
 	DeletionPolicyDelete DeletionPolicy = "Delete"
 )
 
-// NetBoxNetworkSpec is one subnet of a cluster: a prefix carved from, or adopted in, a parent L2 network.
+// NetBoxNetworkSpec is one subnet of a cluster: a prefix carved from, or adopted in, parentPrefix.
 // +kubebuilder:validation:XValidation:rule="has(self.prefix) != has(self.prefixLength)",message="exactly one of prefix or prefixLength must be set"
 // +kubebuilder:validation:XValidation:rule="has(self.prefix) == has(oldSelf.prefix)",message="cannot switch between prefix and prefixLength"
-// +kubebuilder:validation:XValidation:rule="!isCIDR(self.parentPrefix) || !isIP(self.gateway) || cidr(self.parentPrefix).containsIP(self.gateway)",message="gateway must be inside parentPrefix"
+// +kubebuilder:validation:XValidation:rule="!isCIDR(self.parentPrefix) || !isIP(self.gateway) || (has(self.addressPrefixLength) ? cidr(self.gateway + ['/1', '/2', '/3', '/4', '/5', '/6', '/7', '/8', '/9', '/10', '/11', '/12', '/13', '/14', '/15', '/16', '/17', '/18', '/19', '/20', '/21', '/22', '/23', '/24', '/25', '/26', '/27', '/28', '/29', '/30', '/31', '/32'][self.addressPrefixLength - 1]).masked().containsCIDR(self.parentPrefix) : cidr(self.parentPrefix).containsIP(self.gateway))",message="gateway/addressPrefixLength must contain parentPrefix"
+// +kubebuilder:validation:XValidation:rule="!has(self.addressPrefixLength) || !isCIDR(self.parentPrefix) || self.addressPrefixLength <= cidr(self.parentPrefix).prefixLength()",message="addressPrefixLength must not be longer than the parentPrefix mask"
+// +kubebuilder:validation:XValidation:rule="has(self.addressPrefixLength) == has(oldSelf.addressPrefixLength)",message="addressPrefixLength cannot be added or removed"
+// +kubebuilder:validation:XValidation:rule="!has(self.isPool) || !self.isPool || has(self.prefixLength)",message="isPool needs prefixLength"
 // +kubebuilder:validation:XValidation:rule="!has(self.prefix) || !isCIDR(self.parentPrefix) || !isCIDR(self.prefix) || cidr(self.parentPrefix).containsCIDR(self.prefix)",message="prefix must be inside parentPrefix"
 // +kubebuilder:validation:XValidation:rule="!has(self.prefixLength) || !isCIDR(self.parentPrefix) || self.prefixLength > cidr(self.parentPrefix).prefixLength()",message="prefixLength must be longer than the parentPrefix mask"
 // +kubebuilder:validation:XValidation:rule="!has(self.prefix) || !has(self.deletionPolicy) || self.deletionPolicy != 'Delete'",message="an adopted prefix cannot use deletionPolicy Delete"
@@ -47,7 +50,8 @@ type NetBoxNetworkSpec struct {
 	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="clusterName is immutable"
 	ClusterName string `json:"clusterName,omitempty"`
 
-	// parentPrefix is the L2 network the prefix lives in; addresses get its mask.
+	// parentPrefix is the NetBox prefix the cluster prefix is carved from, or adopted in.
+	// It lies inside the L2 network (see addressPrefixLength) and may be a logical pool in it.
 	// +required
 	// +kubebuilder:validation:MinLength=1
 	// +kubebuilder:validation:MaxLength=43
@@ -56,7 +60,7 @@ type NetBoxNetworkSpec struct {
 	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="parentPrefix is immutable"
 	ParentPrefix string `json:"parentPrefix,omitempty"`
 
-	// gateway of the parent network.
+	// gateway of the L2 network; with addressPrefixLength it gives that network.
 	// +required
 	// +kubebuilder:validation:MinLength=1
 	// +kubebuilder:validation:MaxLength=39
@@ -71,6 +75,27 @@ type NetBoxNetworkSpec struct {
 	// +kubebuilder:validation:Maximum=32
 	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="prefixLength is immutable"
 	PrefixLength int32 `json:"prefixLength,omitempty"`
+
+	// addressPrefixLength is the mask of the nodes' subnet; with gateway it gives that subnet (the L2 network).
+	// Defaults to the mask of parentPrefix. Addresses get this mask.
+	// +optional
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=32
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="addressPrefixLength is immutable"
+	AddressPrefixLength int32 `json:"addressPrefixLength,omitempty"`
+
+	// isPool marks the carved prefix as a pool in NetBox: all its addresses are usable hosts.
+	// It needs prefixLength; false is the same as unset.
+	// +optional
+	IsPool *bool `json:"isPool,omitempty"`
+
+	// controlPlaneEndpoint reserves the cluster's VIP in the prefix: the address of the Cluster's endpoint if that is
+	// inside the prefix, else the highest free address. The VIP is written to Cluster.spec.controlPlaneEndpoint
+	// while that has no host or no port; another endpoint is reported, not changed.
+	// Without it no VIP is reserved; removing it later leaves the VIP in NetBox and in the status.
+	// A VIP that cannot be reserved shows in the ControlPlaneEndpointReady condition and leaves Ready alone.
+	// +optional
+	ControlPlaneEndpoint *ControlPlaneEndpoint `json:"controlPlaneEndpoint,omitempty"`
 
 	// prefix adopts an existing prefix inside parentPrefix instead of carving one.
 	// +optional
@@ -102,11 +127,42 @@ type NetBoxNetworkSpec struct {
 	Tags []string `json:"tags,omitempty"`
 }
 
+// ControlPlaneEndpoint asks for the cluster's VIP in the network's prefix.
+type ControlPlaneEndpoint struct {
+	// port of the API server behind the VIP. Defaults to 6443.
+	// +optional
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=65535
+	Port int32 `json:"port,omitempty"`
+
+	// dnsName of the VIP in NetBox, which stores it in lower case.
+	// +optional
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=255
+	// +kubebuilder:validation:Pattern=`^([0-9A-Za-z_-]+|\*)(\.[0-9A-Za-z_-]+)*\.?$`
+	DNSName string `json:"dnsName,omitempty"`
+}
+
+// APIEndpoint is the host and port the API server is reached at.
+type APIEndpoint struct {
+	// host is the VIP.
+	// +required
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=45
+	Host string `json:"host,omitempty"`
+
+	// port of the API server behind the VIP.
+	// +required
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=65535
+	Port int32 `json:"port,omitempty"`
+}
+
 // NetBoxNetworkStatus is the observed state of a NetBoxNetwork.
 // +kubebuilder:validation:MinProperties=1
 type NetBoxNetworkStatus struct {
 	// conditions represents the observations of a NetBoxNetwork's current state.
-	// Known condition types are Ready and MetadataSynced.
+	// Known condition types are Ready, MetadataSynced and ControlPlaneEndpointReady.
 	// +optional
 	// +listType=map
 	// +listMapKey=type
@@ -119,10 +175,20 @@ type NetBoxNetworkStatus struct {
 	// +kubebuilder:validation:MaxLength=43
 	Prefix string `json:"prefix,omitempty"`
 
+	// addressPrefixLength is the mask handed to addresses: spec.addressPrefixLength or the parentPrefix mask.
+	// +optional
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=32
+	AddressPrefixLength int32 `json:"addressPrefixLength,omitempty"`
+
 	// prefixID is the NetBox ID of the prefix.
 	// +optional
 	// +kubebuilder:validation:Minimum=1
 	PrefixID int64 `json:"prefixID,omitempty"`
+
+	// controlPlaneEndpoint is the reserved VIP and the port of the API server behind it.
+	// +optional
+	ControlPlaneEndpoint APIEndpoint `json:"controlPlaneEndpoint,omitempty,omitzero"`
 
 	// customFieldKeys are, per JSON-object custom field, the keys the provider has written.
 	// +optional

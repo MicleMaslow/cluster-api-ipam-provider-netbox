@@ -151,6 +151,9 @@ func waitReady(g *WithT, obj conditioned) {
 		switch o := obj.(type) {
 		case *v1alpha1.NetBoxNetwork:
 			g.Expect(o.Status.Prefix).NotTo(BeEmpty())
+			if o.Spec.ControlPlaneEndpoint != nil {
+				g.Expect(o.Status.ControlPlaneEndpoint.Host).NotTo(BeEmpty())
+			}
 		case *v1alpha1.NetBoxIPPool:
 			g.Expect(o.Status.Ranges).NotTo(BeEmpty())
 			g.Expect(o.Status.IPAddresses).NotTo(BeNil())

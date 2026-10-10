@@ -101,6 +101,12 @@ linters:
       linters:
         - kubeapilinter
 
+    ## isPool mirrors the is_pool flag of a NetBox prefix.
+    - path: "api/v1alpha1/netboxnetwork_types.go"
+      text: "nobools: field IsPool pointer should not use a bool"
+      linters:
+        - kubeapilinter
+
     ## customFields mirrors NetBox's custom_fields object; customFieldKeys is keyed by the same field names.
     - path: "api/v1alpha1/netboxnetwork_types.go"
       text: "nomaps: NetBoxNetwork(Spec.CustomFields|Status.CustomFieldKeys) should not use a map type"

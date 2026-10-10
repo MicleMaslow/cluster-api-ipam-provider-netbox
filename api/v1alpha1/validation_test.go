@@ -27,6 +27,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
 )
@@ -78,7 +79,23 @@ func TestValidation(t *testing.T) {
 			"bad-parent":  {func(s *NetBoxNetworkSpec) { s.ParentPrefix = "10.10.0.0" }, "must be a CIDR"},
 			"bad-gateway": {func(s *NetBoxNetworkSpec) { s.Gateway = "gw" }, "must be an IP address"},
 
-			"gateway-outside-parent":          {func(s *NetBoxNetworkSpec) { s.Gateway = "10.20.0.1" }, "gateway must be inside parentPrefix"},
+			"gateway-outside-parent": {func(s *NetBoxNetworkSpec) { s.Gateway = "10.20.0.1" }, "gateway/addressPrefixLength must contain parentPrefix"},
+			"gateway-outside-logical-parent": {func(s *NetBoxNetworkSpec) {
+				s.ParentPrefix, s.Gateway, s.PrefixLength = "10.10.1.0/24", "10.10.0.1", 26
+			}, "gateway/addressPrefixLength must contain parentPrefix"},
+			"address-prefix-longer-than-parent": {func(s *NetBoxNetworkSpec) {
+				s.ParentPrefix, s.Gateway, s.AddressPrefixLength, s.PrefixLength = "10.10.1.0/24", "10.10.1.1", 25, 26
+			}, "addressPrefixLength must not be longer than the parentPrefix mask"},
+			"address-prefix-length-too-big": {func(s *NetBoxNetworkSpec) { s.AddressPrefixLength = 33 }, "spec.addressPrefixLength"},
+			"pool-with-prefix": {func(s *NetBoxNetworkSpec) {
+				s.PrefixLength, s.Prefix, s.IsPool = 0, "10.10.1.0/27", ptr.To(true)
+			}, "isPool needs prefixLength"},
+			"endpoint-port-too-big":        {func(s *NetBoxNetworkSpec) { s.ControlPlaneEndpoint = &ControlPlaneEndpoint{Port: 65536} }, "spec.controlPlaneEndpoint.port"},
+			"endpoint-port-negative":       {func(s *NetBoxNetworkSpec) { s.ControlPlaneEndpoint = &ControlPlaneEndpoint{Port: -1} }, "spec.controlPlaneEndpoint.port"},
+			"endpoint-dns-name-with-space": {func(s *NetBoxNetworkSpec) { s.ControlPlaneEndpoint = &ControlPlaneEndpoint{DNSName: "api cluster"} }, "spec.controlPlaneEndpoint.dnsName"},
+			"endpoint-dns-name-too-long": {func(s *NetBoxNetworkSpec) {
+				s.ControlPlaneEndpoint = &ControlPlaneEndpoint{DNSName: strings.Repeat("a", 256)}
+			}, "spec.controlPlaneEndpoint.dnsName"},
 			"prefix-outside-parent":           {func(s *NetBoxNetworkSpec) { s.PrefixLength, s.Prefix = 0, "10.20.1.0/27" }, "prefix must be inside parentPrefix"},
 			"prefix-ipv6-in-ipv4-parent":      {func(s *NetBoxNetworkSpec) { s.PrefixLength, s.Prefix = 0, "fd00::/80" }, "prefix must be inside parentPrefix"},
 			"prefix-length-equals-mask":       {func(s *NetBoxNetworkSpec) { s.PrefixLength = 22 }, "prefixLength must be longer than the parentPrefix mask"},
@@ -110,6 +127,22 @@ func TestValidation(t *testing.T) {
 			"carve-delete": func(s *NetBoxNetworkSpec) { s.DeletionPolicy = DeletionPolicyDelete },
 			"carve-23":     func(s *NetBoxNetworkSpec) { s.PrefixLength = 23 },
 			"adopt-retain": func(s *NetBoxNetworkSpec) { s.PrefixLength, s.Prefix = 0, "10.10.1.0/27" },
+			"logical-parent": func(s *NetBoxNetworkSpec) {
+				s.ParentPrefix, s.AddressPrefixLength, s.PrefixLength = "10.10.1.0/24", 22, 26
+			},
+			"address-prefix-length-equals-mask": func(s *NetBoxNetworkSpec) { s.AddressPrefixLength = 22 },
+			"is-pool":                           func(s *NetBoxNetworkSpec) { s.IsPool = ptr.To(true) },
+			"adopt-is-pool-false": func(s *NetBoxNetworkSpec) {
+				s.PrefixLength, s.Prefix, s.IsPool = 0, "10.10.1.0/27", ptr.To(false)
+			},
+			"endpoint-empty": func(s *NetBoxNetworkSpec) { s.ControlPlaneEndpoint = &ControlPlaneEndpoint{} },
+			"endpoint-port":  func(s *NetBoxNetworkSpec) { s.ControlPlaneEndpoint = &ControlPlaneEndpoint{Port: 65535} },
+			"endpoint-dns-name": func(s *NetBoxNetworkSpec) {
+				s.ControlPlaneEndpoint = &ControlPlaneEndpoint{DNSName: "api-1.cluster_a.example."}
+			},
+			"endpoint-dns-wildcard": func(s *NetBoxNetworkSpec) {
+				s.ControlPlaneEndpoint = &ControlPlaneEndpoint{DNSName: "*.cluster.example"}
+			},
 		} {
 			if err := c.Create(ctx, network("ok-"+name, mutate)); err != nil {
 				t.Errorf("%s: %v", name, err)
@@ -124,6 +157,24 @@ func TestValidation(t *testing.T) {
 		}
 		n.Spec.Gateway = "10.10.0.2"
 		wantErr(t, c.Update(ctx, n), "gateway is immutable")
+	})
+
+	t.Run("network address prefix length is fixed", func(t *testing.T) {
+		n := network("apl-added", nil)
+		if err := c.Create(ctx, n); err != nil {
+			t.Fatal(err)
+		}
+		n.Spec.AddressPrefixLength = 22
+		wantErr(t, c.Update(ctx, n), "addressPrefixLength cannot be added or removed")
+
+		n = network("apl-changed", func(s *NetBoxNetworkSpec) { s.AddressPrefixLength = 22 })
+		if err := c.Create(ctx, n); err != nil {
+			t.Fatal(err)
+		}
+		n.Spec.AddressPrefixLength = 21
+		wantErr(t, c.Update(ctx, n), "addressPrefixLength is immutable")
+		n.Spec.AddressPrefixLength = 0
+		wantErr(t, c.Update(ctx, n), "addressPrefixLength cannot be added or removed")
 	})
 
 	t.Run("network cannot switch mode", func(t *testing.T) {

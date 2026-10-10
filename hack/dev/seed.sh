@@ -44,12 +44,29 @@ containers() {
   done
 }
 
+# Prefix custom fields of each type for the metadata examples, plus those of custom-fields.local.json
+# (a list of POST /api/extras/custom-fields/ bodies); also added to a NetBox seeded before them.
+custom_fields() {
+  local fields='[
+    {"name":"team","label":"Team","type":"text","object_types":["ipam.prefix"],"ui_visible":"if-set"},
+    {"name":"priority","label":"Priority","type":"integer","object_types":["ipam.prefix"],"ui_visible":"if-set"},
+    {"name":"monitored","label":"Monitored","type":"boolean","object_types":["ipam.prefix"],"ui_visible":"if-set"}
+  ]'
+  [ -f custom-fields.local.json ] && fields=$(jq -s add <(echo "$fields") custom-fields.local.json)
+  while read -r f; do
+    if [ "$(api GET "extras/custom-fields/?name=$(jq -r .name <<<"$f")" | jq .count)" = 0 ]; then
+      api POST extras/custom-fields/ "$f" >/dev/null
+    fi
+  done < <(jq -c '.[]' <<<"$fields")
+}
+
 until curl -sf -o /dev/null "$NB/login/"; do sleep 5; done
 
 if [ "$(api GET "users/owners/?name=$OWNER" | jq .count)" != 0 ]; then
   [ -f .env ] || { echo "NetBox is seeded but hack/dev/.env is gone: run make netbox-down netbox-up" >&2; exit 1; }
   other_owner
   containers
+  custom_fields
   echo "NetBox already seeded"
   exit 0
 fi
@@ -57,9 +74,10 @@ fi
 api POST extras/custom-fields/ '[
   {"name":"capi_ref","label":"CAPI ref","type":"text","filter_logic":"exact","object_types":["ipam.prefix","ipam.iprange","ipam.ipaddress"]},
   {"name":"capi_cluster","label":"CAPI cluster","type":"text","filter_logic":"exact","object_types":["ipam.prefix","ipam.iprange","ipam.ipaddress"]},
-  {"name":"labels","label":"Labels","type":"json","object_types":["ipam.prefix"]}
+  {"name":"labels","label":"Labels","type":"json","object_types":["ipam.prefix"],"ui_visible":"if-set"}
 ]' >/dev/null
 
+custom_fields
 api POST extras/tags/ '[{"name":"capi","slug":"capi"},{"name":"k8s","slug":"k8s"}]' >/dev/null
 
 containers

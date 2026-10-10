@@ -57,23 +57,49 @@ func addr(p netip.Prefix, offset int) string {
 	return a.String()
 }
 
+func TestL2Of(t *testing.T) {
+	g := NewWithT(t)
+	nw := &v1alpha1.NetBoxNetwork{Spec: v1alpha1.NetBoxNetworkSpec{ParentPrefix: "10.10.0.0/22", Gateway: "10.10.0.1"}}
+	l2, gw, err := l2Of(nw)
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(l2.String()).To(Equal("10.10.0.0/22"))
+	g.Expect(gw.String()).To(Equal("10.10.0.1"))
+
+	nw.Spec.ParentPrefix, nw.Spec.AddressPrefixLength = "10.10.1.0/24", 22
+	l2, _, err = l2Of(nw)
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(l2.String()).To(Equal("10.10.0.0/22"))
+
+	nw.Spec.Gateway = "gw"
+	_, _, err = l2Of(nw)
+	g.Expect(err).To(HaveOccurred())
+}
+
 func TestRangeAddresses(t *testing.T) {
-	parent := netip.MustParsePrefix("10.10.0.0/22")
+	l2 := netip.MustParsePrefix("10.10.0.0/22")
 	gw := netip.MustParseAddr("10.10.0.1")
 	for name, tc := range map[string]struct {
 		prefix     string
 		start, end int32
+		reserved   []string
 		want       string
 	}{
-		"inside":           {"10.10.1.0/26", 14, 60, "10.10.1.14-10.10.1.60"},
-		"negative":         {"10.10.1.0/26", -1, -1, "10.10.1.63-10.10.1.63"},
-		"parent network":   {"10.10.0.0/26", 0, 5, "error"},
-		"gateway":          {"10.10.0.0/26", 1, 1, "error"},
-		"parent broadcast": {"10.10.3.192/26", -1, -1, "error"},
-		"reversed":         {"10.10.1.0/26", 9, 2, "error"},
-		"outside":          {"10.10.1.0/26", 2, 64, "error"},
+		"inside":                {"10.10.1.0/26", 14, 60, nil, "10.10.1.14-10.10.1.60"},
+		"negative":              {"10.10.1.0/26", -1, -1, nil, "10.10.1.63-10.10.1.63"},
+		"logical parent bounds": {"10.10.1.0/24", 0, -1, nil, "10.10.1.0-10.10.1.255"},
+		"l2 network":            {"10.10.0.0/26", 0, 5, nil, "error"},
+		"gateway":               {"10.10.0.0/26", 1, 1, nil, "error"},
+		"l2 broadcast":          {"10.10.3.192/26", -1, -1, nil, "error"},
+		"reserved":              {"10.10.1.0/26", 60, 62, []string{"10.10.1.62"}, "error"},
+		"beside reserved":       {"10.10.1.0/26", 2, 61, []string{"10.10.1.62"}, "10.10.1.2-10.10.1.61"},
+		"reversed":              {"10.10.1.0/26", 9, 2, nil, "error"},
+		"outside":               {"10.10.1.0/26", 2, 64, nil, "error"},
 	} {
-		s, e, err := rangeAddresses(netip.MustParsePrefix(tc.prefix), v1alpha1.IPPoolRange{NetworkName: "n", Start: tc.start, End: tc.end}, parent, gw)
+		reserved := []netip.Addr{gw}
+		for _, r := range tc.reserved {
+			reserved = append(reserved, netip.MustParseAddr(r))
+		}
+		s, e, err := rangeAddresses(netip.MustParsePrefix(tc.prefix), v1alpha1.IPPoolRange{NetworkName: "n", Start: tc.start, End: tc.end}, l2, reserved...)
 		got := "error"
 		if err == nil {
 			got = s.String() + "-" + e.String()
@@ -204,6 +230,36 @@ func TestPoolRejectsMixedNetworks(t *testing.T) {
 	waitRange(g, pool, "default", addr(p, 2), addr(p, 3))
 	g.Expect(pool.Status.Ranges).To(HaveLen(1))
 	g.Expect(admin.List(ctx, netbox.IPRanges, owner.ByRef("NetBoxIPPool/"+ns+"/worker/other"))).To(BeEmpty())
+}
+
+// TestPoolSpansLogicalParents: networks carved from two logical parents of one VLAN share an L2, so one pool serves both.
+func TestPoolSpansLogicalParents(t *testing.T) {
+	g := newG(t)
+	ns := newEnv(t, nil)
+	var networks []*v1alpha1.NetBoxNetwork
+	pool := newPool(ns, "worker")
+	for i, parent := range []string{"10.10.1.0/24", "10.10.2.0/24"} {
+		name := fmt.Sprintf("n%d", i)
+		byHand(t, g, netbox.Prefixes, map[string]any{"prefix": parent, "status": "active", "description": "logical parent"})
+		nw := newNetwork(ns, name)
+		nw.Spec.ParentPrefix, nw.Spec.AddressPrefixLength = parent, 22
+		g.Expect(k8s.Create(ctx, nw)).To(Succeed())
+		waitReady(g, nw)
+		networks = append(networks, nw)
+		pool.Spec.Ranges = append(pool.Spec.Ranges, v1alpha1.IPPoolRange{NetworkName: name, Start: 0, End: -1})
+	}
+	g.Expect(k8s.Create(ctx, pool)).To(Succeed())
+	waitReady(g, pool)
+	waitTypedCondition(g, pool, v1alpha1.RangesReadyCondition, metav1.ConditionTrue, v1alpha1.ReasonReady)
+	g.Expect(pool.Status.Ranges).To(HaveLen(2))
+	for i, rs := range pool.Status.Ranges {
+		p := netip.MustParsePrefix(networks[i].Status.Prefix)
+		g.Expect(rs.Ready).To(BeTrue(), rs.Message)
+		g.Expect(rs.StartAddress).To(Equal(addr(p, 0)))
+		g.Expect(rs.EndAddress).To(Equal(addr(p, -1)))
+	}
+	g.Expect(pool.Status.AddressPrefixLength).To(Equal(int32(22)))
+	g.Expect(pool.Status.IPAddresses.Total).To(Equal(int32(32)))
 }
 
 func TestPoolRejectsInvalidAddressTemplate(t *testing.T) {
@@ -519,6 +575,78 @@ func TestPoolRemovesRange(t *testing.T) {
 	g.Expect(noAddress(m3)()).To(BeTrue())
 }
 
+func TestPoolRangeCannotCoverVIP(t *testing.T) {
+	g := newG(t)
+	ns := newEnv(t, nil)
+	nw := vipNetwork(ns, "default")
+	pool := newPool(ns, "worker", v1alpha1.IPPoolRange{NetworkName: "default", Start: 2, End: -1})
+	g.Expect(k8s.Create(ctx, nw)).To(Succeed())
+	g.Expect(k8s.Create(ctx, pool)).To(Succeed())
+	waitTypedCondition(g, pool, v1alpha1.RangesReadyCondition, metav1.ConditionFalse, v1alpha1.ReasonInvalidRange)
+	waitReady(g, nw)
+	g.Expect(admin.List(ctx, netbox.IPRanges, owner.ByRef("NetBoxIPPool/"+ns+"/worker/default"))).To(BeEmpty())
+
+	setRanges(g, pool, v1alpha1.IPPoolRange{NetworkName: "default", Start: 2, End: -2})
+	waitReady(g, pool)
+	p := netip.MustParsePrefix(nw.Status.Prefix)
+	waitRange(g, pool, "default", addr(p, 2), addr(p, -2))
+	g.Expect(nw.Status.ControlPlaneEndpoint.Host).To(Equal(addr(p, -1)))
+}
+
+// Removing controlPlaneEndpoint leaves the VIP in NetBox and in the status, so pools keep off it.
+func TestPoolRangeCannotCoverVIPAfterFieldRemoved(t *testing.T) {
+	g := newG(t)
+	ns := newEnv(t, nil)
+	nw := vipNetwork(ns, "default")
+	g.Expect(k8s.Create(ctx, nw)).To(Succeed())
+	waitReady(g, nw)
+	vip := nw.Status.ControlPlaneEndpoint
+
+	g.Eventually(func(g Gomega) {
+		g.Expect(k8s.Get(ctx, client.ObjectKeyFromObject(nw), nw)).To(Succeed())
+		nw.Spec.ControlPlaneEndpoint = nil
+		g.Expect(k8s.Update(ctx, nw)).To(Succeed())
+	}).Should(Succeed())
+	eventually(g, nw, func(g Gomega) {
+		g.Expect(meta.FindStatusCondition(nw.Status.Conditions, v1alpha1.ControlPlaneEndpointReadyCondition)).To(BeNil())
+	})
+	pool := newPool(ns, "worker", v1alpha1.IPPoolRange{NetworkName: "default", Start: 2, End: -1})
+	g.Expect(k8s.Create(ctx, pool)).To(Succeed())
+	waitTypedCondition(g, pool, v1alpha1.RangesReadyCondition, metav1.ConditionFalse, v1alpha1.ReasonInvalidRange)
+	g.Expect(admin.List(ctx, netbox.IPRanges, owner.ByRef("NetBoxIPPool/"+ns+"/worker/default"))).To(BeEmpty())
+	g.Expect(k8s.Get(ctx, client.ObjectKeyFromObject(nw), nw)).To(Succeed())
+	g.Expect(nw.Status.ControlPlaneEndpoint).To(Equal(vip))
+	g.Expect(vipsOf(g, ns, "default")).To(HaveLen(1))
+}
+
+// A VIP added to a live network that has no room for it leaves the network Ready and its pool serving.
+func TestPoolKeepsServingWhenVIPHasNoRoom(t *testing.T) {
+	g := newG(t)
+	ns := newEnv(t, nil)
+	nw, pool := readyPool(g, ns, v1alpha1.IPPoolRange{NetworkName: "default", Start: 0, End: -1})
+	first := newClaim(ns, "m1", "worker")
+	g.Expect(k8s.Create(ctx, first)).To(Succeed())
+	address(g, first)
+
+	g.Eventually(func(g Gomega) {
+		g.Expect(k8s.Get(ctx, client.ObjectKeyFromObject(nw), nw)).To(Succeed())
+		nw.Spec.ControlPlaneEndpoint = &v1alpha1.ControlPlaneEndpoint{}
+		g.Expect(k8s.Update(ctx, nw)).To(Succeed())
+	}).Should(Succeed())
+	waitTypedCondition(g, nw, v1alpha1.ControlPlaneEndpointReadyCondition, metav1.ConditionFalse, v1alpha1.ReasonExhausted)
+	waitCondition(g, nw, metav1.ConditionTrue, v1alpha1.ReasonReady)
+	g.Expect(nw.Status.ControlPlaneEndpoint).To(Equal(v1alpha1.APIEndpoint{}))
+	g.Consistently(func(g Gomega) {
+		g.Expect(k8s.Get(ctx, client.ObjectKeyFromObject(pool), pool)).To(Succeed())
+		g.Expect(meta.IsStatusConditionTrue(pool.Status.Conditions, v1alpha1.ReadyCondition)).To(BeTrue())
+		g.Expect(rangeOf(pool, "default")).To(gstruct.PointTo(gstruct.MatchFields(gstruct.IgnoreExtras, gstruct.Fields{"Ready": BeTrue()})))
+	}).Should(Succeed())
+
+	second := newClaim(ns, "m2", "worker")
+	g.Expect(k8s.Create(ctx, second)).To(Succeed())
+	g.Expect(address(g, second).Spec.Address).NotTo(BeEmpty())
+}
+
 func TestPoolBadRangeDoesNotBlockOthers(t *testing.T) {
 	g := newG(t)
 	ns := newEnv(t, nil)
@@ -743,7 +871,7 @@ func TestPoolsRaceForOverlappingRanges(t *testing.T) {
 func TestFoldErrors(t *testing.T) {
 	wait := waitFor(v1alpha1.ReasonNetworkNotReady, errors.New("a"))
 	retry := retryLater(v1alpha1.ReasonInvalidRange, errors.New("b"))
-	if foldErrors(nil) != nil {
+	if foldErrors(nil) != nil || foldErrors([]error{nil, nil}) != nil {
 		t.Error("no errors: want nil")
 	}
 	for name, tc := range map[string]struct {
@@ -754,6 +882,8 @@ func TestFoldErrors(t *testing.T) {
 		"wait":              {[]error{wait}, v1alpha1.ReasonNetworkNotReady, kindWait},
 		"wait, retry":       {[]error{wait, retry}, v1alpha1.ReasonNetworkNotReady, kindRetry},
 		"retry, unexpected": {[]error{retry, errors.New("c")}, v1alpha1.ReasonInvalidRange, kindError},
+		"nil skipped":       {[]error{nil, retry, nil}, v1alpha1.ReasonInvalidRange, kindRetry},
+		"invalid spec":      {[]error{wait, withReason(v1alpha1.ReasonInvalidSpec, errors.New("d"))}, v1alpha1.ReasonNetworkNotReady, kindWait},
 	} {
 		var re reasonError
 		if err := foldErrors(tc.errs); !errors.As(err, &re) || re.reason != tc.reason || re.kind != tc.kind {

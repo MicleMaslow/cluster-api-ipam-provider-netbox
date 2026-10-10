@@ -100,7 +100,7 @@ type NetBoxIPPoolStatus struct {
 	// +kubebuilder:validation:MaxLength=39
 	Gateway string `json:"gateway,omitempty"`
 
-	// addressPrefixLength is the mask length (that of the parent prefix) handed to every address of the pool.
+	// addressPrefixLength is the mask length (that of the L2 network) handed to every address of the pool.
 	// +optional
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:validation:Maximum=128

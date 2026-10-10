@@ -30,6 +30,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/utils/ptr"
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -37,6 +38,7 @@ import (
 
 	"github.com/MicleMaslow/cluster-api-ipam-provider-netbox/api/v1alpha1"
 	"github.com/MicleMaslow/cluster-api-ipam-provider-netbox/internal/netbox"
+	"github.com/MicleMaslow/cluster-api-ipam-provider-netbox/internal/netmath"
 )
 
 func TestNetworkCarvesPrefixInParent(t *testing.T) {
@@ -56,6 +58,56 @@ func TestNetworkCarvesPrefixInParent(t *testing.T) {
 	g.Expect(obj.Status.Value).To(Equal("active"))
 	g.Expect(cfString(obj, netbox.FieldRef)).To(Equal("NetBoxNetwork/" + ns + "/default"))
 	g.Expect(cfString(obj, netbox.FieldCluster)).To(Equal(ns))
+	g.Expect(obj.IsPool).To(BeFalse())
+	g.Expect(nw.Status.AddressPrefixLength).To(Equal(int32(22)), "the parent mask by default")
+}
+
+// A logical parent 10.10.1.0/24 inside the VLAN 10.10.0.0/22: addresses get mask 22, the /24 bounds are plain hosts.
+func TestNetworkLogicalParent(t *testing.T) {
+	g := newG(t)
+	ns := newEnv(t, nil)
+	byHand(t, g, netbox.Prefixes, map[string]any{"prefix": "10.10.1.0/24", "status": "active", "description": "logical parent"})
+	nw := newNetwork(ns, "default")
+	nw.Spec.ParentPrefix, nw.Spec.AddressPrefixLength, nw.Spec.PrefixLength, nw.Spec.IsPool = "10.10.1.0/24", 22, 28, ptr.To(true)
+	g.Expect(k8s.Create(ctx, nw)).To(Succeed())
+	waitReady(g, nw)
+	g.Expect(nw.Status.Prefix).To(Equal("10.10.1.0/28"))
+	g.Expect(nw.Status.AddressPrefixLength).To(Equal(int32(22)))
+	obj, _, err := admin.Get(ctx, netbox.Prefixes, nw.Status.PrefixID)
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(obj.IsPool).To(BeTrue())
+
+	pool := newPool(ns, "worker", v1alpha1.IPPoolRange{NetworkName: "default", Start: 0, End: -1})
+	g.Expect(k8s.Create(ctx, pool)).To(Succeed())
+	waitReady(g, pool)
+	g.Expect(pool.Status.AddressPrefixLength).To(Equal(int32(22)))
+	g.Expect(pool.Status.IPAddresses.Total).To(Equal(int32(16)))
+}
+
+func TestNetworkIsPoolFollowsSpec(t *testing.T) {
+	g := newG(t)
+	ns := newEnv(t, nil)
+	nw := newNetwork(ns, "default")
+	g.Expect(k8s.Create(ctx, nw)).To(Succeed())
+	waitReady(g, nw)
+	isPool := func() bool {
+		obj, _, err := admin.Get(ctx, netbox.Prefixes, nw.Status.PrefixID)
+		g.Expect(err).NotTo(HaveOccurred())
+		return obj.IsPool
+	}
+	setIsPool := func(v *bool) {
+		g.Eventually(func(g Gomega) {
+			g.Expect(k8s.Get(ctx, client.ObjectKeyFromObject(nw), nw)).To(Succeed())
+			nw.Spec.IsPool = v
+			g.Expect(k8s.Update(ctx, nw)).To(Succeed())
+		}).Should(Succeed())
+	}
+	g.Expect(isPool()).To(BeFalse())
+
+	setIsPool(ptr.To(true))
+	g.Eventually(isPool).Should(BeTrue())
+	setIsPool(ptr.To(false))
+	g.Eventually(isPool).Should(BeFalse())
 }
 
 func TestNetworkRecreatedKeepsPrefix(t *testing.T) {
@@ -511,4 +563,403 @@ func TestNetworkDeleteForbidden(t *testing.T) {
 	g.Expect(cond).NotTo(BeNil())
 	g.Expect(cond.Status).To(Equal(metav1.ConditionFalse))
 	g.Expect(cond.Reason).To(Equal(v1alpha1.ReasonForbidden))
+}
+
+// vipNetwork is newNetwork asking for a VIP.
+func vipNetwork(ns, name string) *v1alpha1.NetBoxNetwork {
+	nw := newNetwork(ns, name)
+	nw.Spec.ControlPlaneEndpoint = &v1alpha1.ControlPlaneEndpoint{}
+	return nw
+}
+
+// vipsOf are the NetBox addresses held as the VIP of network name.
+func vipsOf(g Gomega, ns, name string) []netbox.Object {
+	vips, err := admin.FindByRef(ctx, netbox.IPAddresses, owner, "NetBoxNetwork/"+ns+"/"+name+"/vip")
+	g.Expect(err).NotTo(HaveOccurred())
+	return vips
+}
+
+func TestNetworkReservesVIP(t *testing.T) {
+	g := newG(t)
+	ns := newEnv(t, nil)
+	nw := vipNetwork(ns, "default")
+	nw.Spec.ControlPlaneEndpoint.DNSName = "API.Cluster.Example"
+	g.Expect(k8s.Create(ctx, nw)).To(Succeed())
+	waitReady(g, nw)
+
+	want := netmath.Last(netip.MustParsePrefix(nw.Status.Prefix)).String()
+	g.Expect(nw.Status.ControlPlaneEndpoint).To(Equal(v1alpha1.APIEndpoint{Host: want, Port: 6443}))
+	vips := vipsOf(g, ns, "default")
+	g.Expect(vips).To(HaveLen(1))
+	g.Expect(vips[0].Address).To(Equal(want + "/22"))
+	g.Expect(vips[0].Role.Value).To(Equal("vip"))
+	g.Expect(vips[0].Status.Value).To(Equal("active"))
+	g.Expect(vips[0].DNSName).To(Equal("api.cluster.example"), "NetBox stores dns_name in lower case")
+	g.Expect(vips[0].Description).To(Equal(ns + " control plane endpoint"))
+	g.Expect(cfString(vips[0], netbox.FieldCluster)).To(Equal(ns))
+
+	// Steady state writes nothing: the dns_name comparison must agree with NetBox's lower case.
+	// Every save bumps last_updated, a no-op one too.
+	updated := func() string { return vipsOf(g, ns, "default")[0].LastUpdated }
+	touch(g, nw)
+	g.Consistently(updated, "5s").Should(Equal(vips[0].LastUpdated))
+
+	g.Eventually(func(g Gomega) {
+		g.Expect(k8s.Get(ctx, client.ObjectKeyFromObject(nw), nw)).To(Succeed())
+		nw.Spec.ControlPlaneEndpoint = &v1alpha1.ControlPlaneEndpoint{Port: 8443, DNSName: "api2.cluster.example"}
+		g.Expect(k8s.Update(ctx, nw)).To(Succeed())
+	}).Should(Succeed())
+	eventually(g, nw, func(g Gomega) {
+		g.Expect(nw.Status.ControlPlaneEndpoint).To(Equal(v1alpha1.APIEndpoint{Host: want, Port: 8443}))
+	})
+	// The Cluster keeps the port it was given.
+	waitTypedCondition(g, nw, v1alpha1.ControlPlaneEndpointReadyCondition, metav1.ConditionFalse, v1alpha1.ReasonEndpointConflict)
+	g.Eventually(func() string { return vipsOf(g, ns, "default")[0].DNSName }).Should(Equal("api2.cluster.example"))
+	g.Expect(vipsOf(g, ns, "default")[0].ID).To(Equal(vips[0].ID))
+}
+
+func TestNetworkWithoutEndpointReservesNoVIP(t *testing.T) {
+	g := newG(t)
+	ns := newEnv(t, nil)
+	nw := newNetwork(ns, "default")
+	g.Expect(k8s.Create(ctx, nw)).To(Succeed())
+	waitReady(g, nw)
+	g.Expect(nw.Status.ControlPlaneEndpoint).To(Equal(v1alpha1.APIEndpoint{}))
+	g.Expect(vipsOf(g, ns, "default")).To(BeEmpty())
+}
+
+func TestNetworkVIPSkipsAddressesInUse(t *testing.T) {
+	g := newG(t)
+	ns := newEnv(t, nil)
+	byHand(t, g, netbox.IPAddresses, map[string]any{"address": "10.10.3.111/22", "status": "active"})
+	byHand(t, g, netbox.IPRanges, map[string]any{"start_address": "10.10.3.109/22", "end_address": "10.10.3.120/22", "status": "active"}) // reaches past the prefix
+
+	nw := adoptedNetwork(ns, "10.10.3.96/28")
+	nw.Spec.ControlPlaneEndpoint = &v1alpha1.ControlPlaneEndpoint{}
+	g.Expect(k8s.Create(ctx, nw)).To(Succeed())
+	waitReady(g, nw)
+	g.Expect(nw.Status.ControlPlaneEndpoint.Host).To(Equal("10.10.3.108"))
+}
+
+func TestNetworkVIPExhausted(t *testing.T) {
+	g := newG(t)
+	ns := newEnv(t, nil)
+	byHand(t, g, netbox.IPAddresses, map[string]any{"address": "10.10.3.80/22", "status": "active"})
+
+	nw := adoptedNetwork(ns, "10.10.3.80/32")
+	nw.Spec.ControlPlaneEndpoint = &v1alpha1.ControlPlaneEndpoint{}
+	g.Expect(k8s.Create(ctx, nw)).To(Succeed())
+	waitTypedCondition(g, nw, v1alpha1.ControlPlaneEndpointReadyCondition, metav1.ConditionFalse, v1alpha1.ReasonExhausted)
+	waitCondition(g, nw, metav1.ConditionTrue, v1alpha1.ReasonReady)
+	g.Expect(nw.Status.Prefix).To(Equal("10.10.3.80/32"))
+	g.Expect(nw.Status.ControlPlaneEndpoint).To(Equal(v1alpha1.APIEndpoint{}))
+	g.Expect(vipsOf(g, ns, "default")).To(BeEmpty())
+}
+
+func TestNetworkVIPSurvivesLostStatus(t *testing.T) {
+	g := newG(t)
+	ns := newEnv(t, nil)
+	nw := vipNetwork(ns, "default")
+	g.Expect(k8s.Create(ctx, nw)).To(Succeed())
+	waitReady(g, nw)
+	vip := nw.Status.ControlPlaneEndpoint
+	id := vipsOf(g, ns, "default")[0].ID
+
+	forget(g, nw)
+	g.Expect(vipsOf(g, ns, "default")[0].Status.Value).To(Equal("active"), "a move releases nothing")
+	again := vipNetwork(ns, "default")
+	g.Expect(k8s.Create(ctx, again)).To(Succeed())
+	waitReady(g, again)
+	g.Expect(again.Status.ControlPlaneEndpoint).To(Equal(vip))
+	vips := vipsOf(g, ns, "default")
+	g.Expect(vips).To(HaveLen(1))
+	g.Expect(vips[0].ID).To(Equal(id))
+
+	setPaused(t, ns, true)
+	time.Sleep(time.Second) // let an in-flight reconcile finish before status is cleared
+	g.Eventually(func(g Gomega) {
+		g.Expect(k8s.Get(ctx, client.ObjectKeyFromObject(again), again)).To(Succeed())
+		again.Status = v1alpha1.NetBoxNetworkStatus{}
+		g.Expect(k8s.Status().Update(ctx, again)).To(Succeed())
+	}).Should(Succeed())
+	setPaused(t, ns, false)
+	touch(g, again)
+	waitReady(g, again)
+	g.Expect(again.Status.ControlPlaneEndpoint).To(Equal(vip))
+	vips = vipsOf(g, ns, "default")
+	g.Expect(vips).To(HaveLen(1))
+	g.Expect(vips[0].ID).To(Equal(id))
+}
+
+func TestNetworkVIPRetainDeprecatesAndReclaims(t *testing.T) {
+	g := newG(t)
+	ns := newEnv(t, nil)
+	nw := vipNetwork(ns, "default")
+	g.Expect(k8s.Create(ctx, nw)).To(Succeed())
+	waitReady(g, nw)
+	id := vipsOf(g, ns, "default")[0].ID
+
+	g.Expect(k8s.Delete(ctx, nw)).To(Succeed())
+	g.Eventually(gone(nw)).Should(BeTrue())
+	vips := vipsOf(g, ns, "default")
+	g.Expect(vips).To(HaveLen(1))
+	g.Expect(vips[0].ID).To(Equal(id))
+	g.Expect(vips[0].Status.Value).To(Equal("deprecated"))
+
+	again := vipNetwork(ns, "default")
+	g.Expect(k8s.Create(ctx, again)).To(Succeed())
+	waitReady(g, again)
+	vips = vipsOf(g, ns, "default")
+	g.Expect(vips).To(HaveLen(1))
+	g.Expect(vips[0].ID).To(Equal(id))
+	g.Expect(vips[0].Status.Value).To(Equal("active"))
+}
+
+func TestNetworkVIPDeletedWithNetwork(t *testing.T) {
+	g := newG(t)
+	ns := newEnv(t, nil)
+	nw := vipNetwork(ns, "default")
+	nw.Spec.DeletionPolicy = v1alpha1.DeletionPolicyDelete
+	g.Expect(k8s.Create(ctx, nw)).To(Succeed())
+	waitReady(g, nw)
+	g.Expect(vipsOf(g, ns, "default")).To(HaveLen(1))
+
+	g.Expect(k8s.Delete(ctx, nw)).To(Succeed())
+	g.Eventually(gone(nw)).Should(BeTrue())
+	g.Expect(vipsOf(g, ns, "default")).To(BeEmpty())
+}
+
+func TestNetworkVIPAdoptedPrefixDeprecatesVIP(t *testing.T) {
+	g := newG(t)
+	ns := newEnv(t, nil)
+	manual := manualPrefix(t, g, "10.10.3.64/28", "reserved")
+	nw := adoptedNetwork(ns, "10.10.3.64/28")
+	nw.Spec.ControlPlaneEndpoint = &v1alpha1.ControlPlaneEndpoint{}
+	g.Expect(k8s.Create(ctx, nw)).To(Succeed())
+	waitReady(g, nw)
+	g.Expect(nw.Status.PrefixID).To(Equal(manual.ID))
+	g.Expect(nw.Status.ControlPlaneEndpoint.Host).To(Equal("10.10.3.79"))
+
+	g.Expect(k8s.Delete(ctx, nw)).To(Succeed())
+	g.Eventually(gone(nw)).Should(BeTrue())
+	vips := vipsOf(g, ns, "default")
+	g.Expect(vips).To(HaveLen(1))
+	g.Expect(vips[0].Status.Value).To(Equal("deprecated"))
+}
+
+// A VIP lost from NetBox comes back at its address; if the address was taken meanwhile, the network
+// reports EndpointConflict and stays Ready.
+func TestNetworkVIPLostFromNetBoxKeepsItsAddress(t *testing.T) {
+	g := newG(t)
+	ns := newEnv(t, nil)
+	above := byHand(t, g, netbox.IPAddresses, map[string]any{"address": "10.10.3.111/22", "status": "active"})
+	nw := adoptedNetwork(ns, "10.10.3.96/28")
+	nw.Spec.ControlPlaneEndpoint = &v1alpha1.ControlPlaneEndpoint{}
+	g.Expect(k8s.Create(ctx, nw)).To(Succeed())
+	waitReady(g, nw)
+	g.Expect(nw.Status.ControlPlaneEndpoint.Host).To(Equal("10.10.3.110"))
+
+	// The higher address frees up: a new pick would move the VIP there.
+	g.Expect(admin.Delete(ctx, netbox.IPAddresses, above.ID, "test: freed")).To(Succeed())
+	g.Expect(admin.Delete(ctx, netbox.IPAddresses, vipsOf(g, ns, "default")[0].ID, "test: deleted by hand")).To(Succeed())
+	touch(g, nw)
+	g.Eventually(func(g Gomega) {
+		vips := vipsOf(g, ns, "default")
+		g.Expect(vips).To(HaveLen(1))
+		g.Expect(vips[0].Address).To(Equal("10.10.3.110/22"))
+	}).Should(Succeed())
+	waitTypedCondition(g, nw, v1alpha1.ControlPlaneEndpointReadyCondition, metav1.ConditionTrue, v1alpha1.ReasonReady)
+
+	g.Expect(admin.Delete(ctx, netbox.IPAddresses, vipsOf(g, ns, "default")[0].ID, "test: deleted by hand")).To(Succeed())
+	byHand(t, g, netbox.IPAddresses, map[string]any{"address": "10.10.3.110/22", "status": "active"})
+	touch(g, nw)
+	waitTypedCondition(g, nw, v1alpha1.ControlPlaneEndpointReadyCondition, metav1.ConditionFalse, v1alpha1.ReasonEndpointConflict)
+	waitReady(g, nw)
+	g.Expect(nw.Status.ControlPlaneEndpoint.Host).To(Equal("10.10.3.110"))
+	g.Expect(vipsOf(g, ns, "default")).To(BeEmpty())
+}
+
+// A VIP moved by hand in NetBox is reported, not followed: the status keeps the reserved address.
+func TestNetworkVIPMovedByHand(t *testing.T) {
+	g := newG(t)
+	ns := newEnv(t, nil)
+	nw := adoptedNetwork(ns, "10.10.3.96/28")
+	nw.Spec.ControlPlaneEndpoint = &v1alpha1.ControlPlaneEndpoint{}
+	g.Expect(k8s.Create(ctx, nw)).To(Succeed())
+	waitReady(g, nw)
+	waitTypedCondition(g, nw, v1alpha1.ControlPlaneEndpointReadyCondition, metav1.ConditionTrue, v1alpha1.ReasonReady)
+	g.Expect(nw.Status.ControlPlaneEndpoint.Host).To(Equal("10.10.3.111"))
+
+	_, err := admin.Patch(ctx, netbox.IPAddresses, vipsOf(g, ns, "default")[0].ID, "", map[string]any{"address": "10.10.3.105/22"})
+	g.Expect(err).NotTo(HaveOccurred())
+	touch(g, nw)
+	waitTypedCondition(g, nw, v1alpha1.ControlPlaneEndpointReadyCondition, metav1.ConditionFalse, v1alpha1.ReasonEndpointConflict)
+	msg := meta.FindStatusCondition(nw.Status.Conditions, v1alpha1.ControlPlaneEndpointReadyCondition).Message
+	g.Expect(msg).To(And(ContainSubstring("10.10.3.105"), ContainSubstring("10.10.3.111")))
+	g.Consistently(func(g Gomega) string {
+		g.Expect(k8s.Get(ctx, client.ObjectKeyFromObject(nw), nw)).To(Succeed())
+		return nw.Status.ControlPlaneEndpoint.Host
+	}, "3s").Should(Equal("10.10.3.111"))
+	waitCondition(g, nw, metav1.ConditionTrue, v1alpha1.ReasonReady)
+}
+
+func clusterEndpointOf(g Gomega, ns string) clusterv1.APIEndpoint {
+	c := &clusterv1.Cluster{}
+	g.Expect(k8s.Get(ctx, client.ObjectKey{Namespace: ns, Name: ns}, c)).To(Succeed())
+	return c.Spec.ControlPlaneEndpoint
+}
+
+func setClusterEndpoint(t *testing.T, ns, host string, port int32) {
+	t.Helper()
+	updateCluster(t, ns, func(c *clusterv1.Cluster) {
+		c.Spec.ControlPlaneEndpoint = clusterv1.APIEndpoint{Host: host, Port: port}
+	})
+}
+
+func TestNetworkWritesVIPToCluster(t *testing.T) {
+	g := newG(t)
+	ns := newEnv(t, nil)
+	nw := vipNetwork(ns, "default")
+	nw.Spec.ControlPlaneEndpoint.Port = 8443
+	g.Expect(k8s.Create(ctx, nw)).To(Succeed())
+	waitReady(g, nw)
+	waitTypedCondition(g, nw, v1alpha1.ControlPlaneEndpointReadyCondition, metav1.ConditionTrue, v1alpha1.ReasonReady)
+	g.Expect(clusterEndpointOf(g, ns)).To(Equal(clusterv1.APIEndpoint{Host: nw.Status.ControlPlaneEndpoint.Host, Port: 8443}))
+}
+
+// deleteCluster deletes the Cluster of newEnv and returns a func that creates it again with an endpoint.
+// The cleanup creates it if the test did not, so that newEnv's cleanup can pause it.
+func deleteCluster(t *testing.T, g *WithT, ns string) func(clusterv1.APIEndpoint) error {
+	t.Helper()
+	cluster := &clusterv1.Cluster{}
+	g.Expect(k8s.Get(ctx, client.ObjectKey{Namespace: ns, Name: ns}, cluster)).To(Succeed())
+	g.Expect(k8s.Delete(ctx, cluster)).To(Succeed())
+	g.Eventually(gone(cluster)).Should(BeTrue())
+	recreate := func(ep clusterv1.APIEndpoint) error {
+		return k8s.Create(ctx, &clusterv1.Cluster{
+			ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: ns},
+			Spec:       clusterv1.ClusterSpec{Paused: ptr.To(false), ControlPlaneEndpoint: ep},
+		})
+	}
+	t.Cleanup(func() { _ = recreate(clusterv1.APIEndpoint{}) })
+	return recreate
+}
+
+// No VIP is picked before the Cluster exists: it may bring an endpoint of its own.
+func TestNetworkWaitsForCluster(t *testing.T) {
+	g := newG(t)
+	ns := newEnv(t, nil)
+	recreate := deleteCluster(t, g, ns)
+
+	nw := vipNetwork(ns, "default")
+	g.Expect(k8s.Create(ctx, nw)).To(Succeed())
+	waitTypedCondition(g, nw, v1alpha1.ControlPlaneEndpointReadyCondition, metav1.ConditionFalse, v1alpha1.ReasonWaitingForCluster)
+	waitCondition(g, nw, metav1.ConditionTrue, v1alpha1.ReasonReady)
+	g.Consistently(func() []netbox.Object { return vipsOf(g, ns, "default") }, "3s").Should(BeEmpty())
+	g.Expect(k8s.Get(ctx, client.ObjectKeyFromObject(nw), nw)).To(Succeed())
+	g.Expect(nw.Status.ControlPlaneEndpoint).To(BeZero())
+
+	g.Expect(recreate(clusterv1.APIEndpoint{})).To(Succeed())
+	waitTypedCondition(g, nw, v1alpha1.ControlPlaneEndpointReadyCondition, metav1.ConditionTrue, v1alpha1.ReasonReady)
+	waitReady(g, nw)
+	vip := nw.Status.ControlPlaneEndpoint
+	g.Expect(vip.Host).To(Equal(netmath.Last(netip.MustParsePrefix(nw.Status.Prefix)).String()))
+	g.Expect(vipsOf(g, ns, "default")).To(HaveLen(1))
+	g.Expect(clusterEndpointOf(g, ns)).To(Equal(clusterv1.APIEndpoint{Host: vip.Host, Port: vip.Port}))
+}
+
+// A Cluster created after its network with an endpoint inside the prefix keeps that endpoint as the VIP.
+func TestNetworkTakesEndpointOfLateCluster(t *testing.T) {
+	g := newG(t)
+	ns := newEnv(t, nil)
+	recreate := deleteCluster(t, g, ns)
+	nw := adoptedNetwork(ns, "10.10.3.96/28")
+	nw.Spec.ControlPlaneEndpoint = &v1alpha1.ControlPlaneEndpoint{}
+	g.Expect(k8s.Create(ctx, nw)).To(Succeed())
+	waitTypedCondition(g, nw, v1alpha1.ControlPlaneEndpointReadyCondition, metav1.ConditionFalse, v1alpha1.ReasonWaitingForCluster)
+
+	g.Expect(recreate(clusterv1.APIEndpoint{Host: "10.10.3.100", Port: 6443})).To(Succeed())
+	waitTypedCondition(g, nw, v1alpha1.ControlPlaneEndpointReadyCondition, metav1.ConditionTrue, v1alpha1.ReasonReady)
+	waitReady(g, nw)
+	g.Expect(nw.Status.ControlPlaneEndpoint).To(Equal(v1alpha1.APIEndpoint{Host: "10.10.3.100", Port: 6443}))
+	vips := vipsOf(g, ns, "default")
+	g.Expect(vips).To(HaveLen(1))
+	g.Expect(vips[0].Address).To(Equal("10.10.3.100/22"))
+}
+
+func TestNetworkRespectsPausedCluster(t *testing.T) {
+	g := newG(t)
+	ns := newEnv(t, nil)
+	setPaused(t, ns, true)
+	nw := vipNetwork(ns, "default")
+	g.Expect(k8s.Create(ctx, nw)).To(Succeed())
+	g.Consistently(func() clusterv1.APIEndpoint { return clusterEndpointOf(g, ns) }).Should(BeZero())
+
+	setPaused(t, ns, false)
+	waitReady(g, nw)
+	waitTypedCondition(g, nw, v1alpha1.ControlPlaneEndpointReadyCondition, metav1.ConditionTrue, v1alpha1.ReasonReady)
+	g.Expect(clusterEndpointOf(g, ns).Host).To(Equal(nw.Status.ControlPlaneEndpoint.Host))
+}
+
+// A Cluster that already has an endpoint inside the prefix keeps it: the VIP is that address.
+func TestNetworkTakesEndpointOfCluster(t *testing.T) {
+	g := newG(t)
+	ns := newEnv(t, nil)
+	setClusterEndpoint(t, ns, "10.10.3.100", 6443)
+	nw := adoptedNetwork(ns, "10.10.3.96/28")
+	nw.Spec.ControlPlaneEndpoint = &v1alpha1.ControlPlaneEndpoint{}
+	g.Expect(k8s.Create(ctx, nw)).To(Succeed())
+	waitReady(g, nw)
+	waitTypedCondition(g, nw, v1alpha1.ControlPlaneEndpointReadyCondition, metav1.ConditionTrue, v1alpha1.ReasonReady)
+	g.Expect(nw.Status.ControlPlaneEndpoint).To(Equal(v1alpha1.APIEndpoint{Host: "10.10.3.100", Port: 6443}))
+	vips := vipsOf(g, ns, "default")
+	g.Expect(vips).To(HaveLen(1))
+	g.Expect(vips[0].Address).To(Equal("10.10.3.100/22"))
+	g.Expect(clusterEndpointOf(g, ns)).To(Equal(clusterv1.APIEndpoint{Host: "10.10.3.100", Port: 6443}))
+}
+
+// An endpoint outside the prefix is left as it is; the network and its VIP stay.
+func TestNetworkClusterEndpointOutsidePrefix(t *testing.T) {
+	g := newG(t)
+	ns := newEnv(t, nil)
+	setClusterEndpoint(t, ns, "10.99.0.5", 6443)
+	nw := vipNetwork(ns, "default")
+	g.Expect(k8s.Create(ctx, nw)).To(Succeed())
+	waitReady(g, nw)
+	waitTypedCondition(g, nw, v1alpha1.ControlPlaneEndpointReadyCondition, metav1.ConditionFalse, v1alpha1.ReasonEndpointConflict)
+	g.Expect(vipsOf(g, ns, "default")).To(HaveLen(1))
+	g.Consistently(func() clusterv1.APIEndpoint { return clusterEndpointOf(g, ns) }).Should(Equal(clusterv1.APIEndpoint{Host: "10.99.0.5", Port: 6443}))
+}
+
+// An endpoint inside the prefix on an address NetBox gave to something else cannot be the VIP.
+func TestNetworkClusterEndpointTaken(t *testing.T) {
+	g := newG(t)
+	ns := newEnv(t, nil)
+	byHand(t, g, netbox.IPAddresses, map[string]any{"address": "10.10.3.100/22", "status": "active"})
+	setClusterEndpoint(t, ns, "10.10.3.100", 6443)
+	nw := adoptedNetwork(ns, "10.10.3.96/28")
+	nw.Spec.ControlPlaneEndpoint = &v1alpha1.ControlPlaneEndpoint{}
+	g.Expect(k8s.Create(ctx, nw)).To(Succeed())
+	waitTypedCondition(g, nw, v1alpha1.ControlPlaneEndpointReadyCondition, metav1.ConditionFalse, v1alpha1.ReasonEndpointConflict)
+	waitCondition(g, nw, metav1.ConditionTrue, v1alpha1.ReasonReady)
+	g.Expect(nw.Status.ControlPlaneEndpoint).To(Equal(v1alpha1.APIEndpoint{}))
+	g.Expect(vipsOf(g, ns, "default")).To(BeEmpty())
+	g.Expect(clusterEndpointOf(g, ns)).To(Equal(clusterv1.APIEndpoint{Host: "10.10.3.100", Port: 6443}))
+}
+
+// An endpoint that was set to the VIP and then changed is reported, not overwritten.
+func TestNetworkClusterEndpointChanged(t *testing.T) {
+	g := newG(t)
+	ns := newEnv(t, nil)
+	nw := vipNetwork(ns, "default")
+	g.Expect(k8s.Create(ctx, nw)).To(Succeed())
+	waitReady(g, nw)
+	waitTypedCondition(g, nw, v1alpha1.ControlPlaneEndpointReadyCondition, metav1.ConditionTrue, v1alpha1.ReasonReady)
+	vip := nw.Status.ControlPlaneEndpoint
+
+	setClusterEndpoint(t, ns, "api.example", 6443)
+	waitTypedCondition(g, nw, v1alpha1.ControlPlaneEndpointReadyCondition, metav1.ConditionFalse, v1alpha1.ReasonEndpointConflict)
+	waitCondition(g, nw, metav1.ConditionTrue, v1alpha1.ReasonReady)
+	g.Expect(nw.Status.ControlPlaneEndpoint).To(Equal(vip))
+	g.Consistently(func() clusterv1.APIEndpoint { return clusterEndpointOf(g, ns) }).Should(Equal(clusterv1.APIEndpoint{Host: "api.example", Port: 6443}))
 }

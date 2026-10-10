@@ -4,7 +4,7 @@ authors:
   - "@MicleMaslow"
 reviewers: []
 creation-date: 2026-10-07
-last-updated: 2026-10-07
+last-updated: 2026-10-10
 status: implemented
 see-also:
   - "https://github.com/kubernetes-sigs/cluster-api/blob/main/docs/proposals/20220125-ipam-integration.md"
@@ -25,6 +25,7 @@ see-also:
   - [NetBox model](#netbox-model)
   - [Ownership and idempotency](#ownership-and-idempotency)
   - [Pools and ranges](#pools-and-ranges)
+  - [Control-plane endpoint](#control-plane-endpoint)
   - [deletionPolicy](#deletionpolicy)
   - [Adoption](#adoption)
   - [clusterctl move and pivot](#clusterctl-move-and-pivot)
@@ -45,12 +46,14 @@ Cluster API terms: see the [Cluster API Book Glossary](https://cluster-api.sigs.
 
 - **Management plane**: the management cluster that runs the provider, including the clusters its state is moved to with `clusterctl move`.
 - **Owner**: the NetBox Owner object (NetBox ≥ 4.5) that marks the objects of one management plane.
-- **Parent prefix**: an existing NetBox prefix of one L2 network that cluster subnets are carved from.
+- **L2 network**: the subnet of the nodes' network, `gateway/addressPrefixLength`. Addresses get its mask; its network and broadcast address and the gateway are never handed out.
+- **Parent prefix**: an existing NetBox prefix that cluster subnets are carved from: the L2 network or a logical pool for CAPI inside it.
+- **VIP**: the address of the cluster's API server (kube-vip), reserved in the cluster prefix.
 - **Key**: the `capi_ref` custom field, `Kind/namespace/name` of the Kubernetes object a NetBox object belongs to.
 
 ## Summary
 
-An IPAM provider that implements the Cluster API IPAM contract (`IPAddressClaim`/`IPAddress`, contract v1beta2) with NetBox as the store. A `NetBoxNetwork` holds one subnet of a cluster as a NetBox prefix, carved out of a parent prefix or adopted. A `NetBoxIPPool` holds address ranges of such subnets as NetBox IP ranges. Claims get NetBox IP addresses allocated from those ranges. Every NetBox object the provider writes carries its Owner and a key, so state is found again after a restart, `clusterctl move` or pivot, and objects of others are never changed.
+An IPAM provider that implements the Cluster API IPAM contract (`IPAddressClaim`/`IPAddress`, contract v1beta2) with NetBox as the store. A `NetBoxNetwork` holds one subnet of a cluster as a NetBox prefix, carved out of a parent prefix or adopted. A `NetBoxIPPool` holds address ranges of such subnets as NetBox IP ranges. Claims get NetBox IP addresses allocated from those ranges. A network can also reserve the control plane VIP of its cluster and write it to `Cluster.spec.controlPlaneEndpoint`. Every NetBox object the provider writes carries its Owner and a key, so state is found again after a restart, `clusterctl move` or pivot, and objects of others are never changed.
 
 ## Motivation
 
@@ -64,11 +67,12 @@ Many on-premises installations keep NetBox as the source of truth for addresses.
 4. Be idempotent and safe: never change objects of another owner, survive `clusterctl move` and pivot, rebuild status from NetBox.
 5. Stay independent of the infrastructure provider; any provider that creates `IPAddressClaim`s works.
 6. Set NetBox tags and custom fields on the cluster prefix declaratively.
+7. Reserve the control plane VIP of a cluster in NetBox and give it to the Cluster before CAPI renders the kubeconfig and cloud-init.
 
 ### Non-Goals
 
 - IPv6, VRFs other than the global one, several ranges of one pool in one network.
-- Setting the control-plane endpoint of a cluster.
+- Several VIPs per cluster, a VIP outside the cluster prefix, running the load balancer (kube-vip or an external one): the provider only reserves the address and sets the endpoint.
 - Creating VM, interface or other inventory objects in NetBox.
 - Migrating existing allocations from other IPAM providers.
 - Managing NetBox itself: custom field definitions, owners, users, permissions and parent prefixes are set up by the NetBox admin.
@@ -84,6 +88,7 @@ See [Future Work](#future-work).
 2. As a network engineer, I see in NetBox which prefix, range and address belongs to which cluster and claim, and an address I take by hand is never handed to a machine.
 3. As a cluster operator, I add a pool of load balancer addresses to a running cluster by shrinking the workers pool, in one `kubectl apply`.
 4. As a platform operator, I move clusters from a bootstrap cluster to a permanent management cluster with `clusterctl move` and nothing in NetBox leaks or is duplicated.
+5. As a platform operator, the API address of a new cluster comes from its prefix in NetBox without anyone choosing it, and kube-vip, the kubeconfig and the join configs all carry it.
 
 ### API
 
@@ -95,16 +100,23 @@ kind: NetBoxNetwork
 metadata: {name: demo, namespace: demo}
 spec:
   clusterName: demo              # immutable
-  parentPrefix: 10.10.0.0/22     # immutable, IPv4
-  gateway: 10.10.0.1             # immutable, inside parentPrefix
-  prefixLength: 26               # carve; or prefix: 10.10.0.64/26 to adopt; exactly one, immutable
+  parentPrefix: 10.10.1.0/24     # immutable, IPv4; the L2 network or a logical pool inside it
+  gateway: 10.10.0.1             # immutable, inside the L2 network
+  addressPrefixLength: 22        # immutable; mask of the L2 network, by default that of parentPrefix
+  prefixLength: 26               # carve; or prefix: 10.10.1.64/26 to adopt; exactly one, immutable
+  isPool: true                   # is_pool on the carved prefix, default false
+  controlPlaneEndpoint:          # reserve the VIP and set it as the endpoint of the Cluster
+    port: 6443                   # default
+    dnsName: demo-api.example    # dns_name of the VIP in NetBox
   deletionPolicy: Retain         # Retain (default) or Delete
   tags: [k8s]                    # slugs of existing NetBox tags
   customFields: {labels: {cluster: demo}}
 status:
-  prefix: 10.10.0.64/26
+  prefix: 10.10.1.64/26
   prefixID: 42
-  conditions: [Ready, MetadataSynced]
+  addressPrefixLength: 22
+  controlPlaneEndpoint: {host: 10.10.1.127, port: 6443}
+  conditions: [Ready, MetadataSynced, ControlPlaneEndpointReady]
 ---
 apiVersion: ipam.cluster.x-k8s.io/v1alpha1
 kind: NetBoxIPPool
@@ -117,16 +129,16 @@ spec:
     description: "{{ .Cluster }} {{ .Pool }} {{ .Owner }}"   # default
 status:
   ranges:
-  - {networkName: demo, id: 7, startAddress: 10.10.0.80, endAddress: 10.10.0.117, ready: true}
+  - {networkName: demo, id: 7, startAddress: 10.10.1.80, endAddress: 10.10.1.117, ready: true}
   gateway: 10.10.0.1
   addressPrefixLength: 22
   ipAddresses: {total: 38, used: 3, free: 35}
   conditions: [Ready, RangesReady]
 ```
 
-The CRDs reject a `gateway` or `prefix` outside `parentPrefix`, a `prefixLength` not longer than the parent mask, IPv6, a changed `gateway`, switching between `prefix` and `prefixLength`, an adopted `prefix` with `deletionPolicy: Delete`, two ranges in one network and a range whose `start` is after its `end` (for offsets of the same sign).
+The CRDs reject an L2 network (`gateway/addressPrefixLength`) that does not contain `parentPrefix`, an `addressPrefixLength` longer than the parent mask, a `prefix` outside `parentPrefix`, a `prefixLength` not longer than the parent mask, IPv6, a changed `gateway` or `addressPrefixLength`, switching between `prefix` and `prefixLength`, `isPool` without `prefixLength`, an adopted `prefix` with `deletionPolicy: Delete`, two ranges in one network and a range whose `start` is after its `end` (for offsets of the same sign).
 
-Claims reference a pool with `poolRef: {apiGroup: ipam.cluster.x-k8s.io, kind: NetBoxIPPool, name: <pool>}`. The `IPAddress` gets the address, the mask of the parent prefix and the gateway. The claim lifecycle (finalizers, owner references, pause) comes from `ipamutil` of the in-cluster IPAM provider; the claim's `Ready` condition uses the reasons of the contract (`PoolNotReady`, `PoolExhausted`, `AllocationFailed`) plus `AddressConflict` and `Allocating`.
+Claims reference a pool with `poolRef: {apiGroup: ipam.cluster.x-k8s.io, kind: NetBoxIPPool, name: <pool>}`. The `IPAddress` gets the address, the mask of the L2 network and the gateway. The claim lifecycle (finalizers, owner references, pause) comes from `ipamutil` of the in-cluster IPAM provider; the claim's `Ready` condition uses the reasons of the contract (`PoolNotReady`, `PoolExhausted`, `AllocationFailed`) plus `AddressConflict` and `Allocating`.
 
 `spec.ipAddress` sets `dns_name` and `description` of every address of the pool. Both are `text/template` (`missingkey=error`) over `.Owner` (the first owner reference of the claim, else the claim itself), `.Claim`, `.Cluster`, `.Namespace` and `.Pool`; an empty field takes the default, `{{ "" }}` leaves it empty in NetBox. The result is trimmed; `dnsName` is lowercased, as NetBox stores it, and checked against the NetBox DNS name pattern; `description` is cut to 200 characters. The fields are written when an address is created, restored or handed back to the claim that holds it, and compared at every reconcile of an allocated claim: a difference is patched, so a change of the templates reaches allocated addresses and manual edits of the two fields are overwritten. The owner chain is not followed to the Machine; with CAPV the owner of the claim is the VSphereVM, whose name matches the Machine and the node. A template that does not render on sample values or gives an invalid DNS name makes the pool `InvalidSpec`: no new addresses, allocated claims keep `Ready`. A claim whose own values do not render fails with `AllocationFailed`, or, once allocated, keeps its `Ready` and backs off; its address is still restored or handed back, with both fields empty. Templates may not use `range`, `define`, `block` or `template`, and a value is limited to 1024 bytes.
 
@@ -157,12 +169,24 @@ On start the provider checks the NetBox version (≥ 4.6), both custom fields (t
 
 ### Pools and ranges
 
-- A range is `{networkName, start, end}`, offsets inside the network's prefix; a negative offset counts from the last address. All networks of a pool must share the parent and gateway of the first range's network (`MixedNetworks`).
-- A range must not cover the network, broadcast or gateway address of the parent (`InvalidRange`).
+- A range is `{networkName, start, end}`, offsets inside the network's prefix; a negative offset counts from the last address. All networks of a pool must share the L2 network (gateway and mask) of the first range's network (`MixedNetworks`); logical parents of one VLAN can share a pool.
+- A range must not cover the network, broadcast or gateway address of the L2 network, or the VIP (`InvalidRange`).
 - Every range is reconciled on its own and reported in `status.ranges[]`; claims are served by the ready ones, and the pool is `Ready` while at least one is.
 - Ranges can be changed and removed. A change that would leave allocated addresses outside the range waits (`RangeInUse`); a change that waits, overlaps another range (`RangeOverlap`) or is invalid keeps the old bounds serving while they are still valid.
 - Before a range is shrunk, deleted or deprecated, the provider checks the allocated addresses, sets `mark_populated` on the range so NetBox hands out no address from it, checks again, then shrinks or deprecates it with the ETag of that update, or deletes it. A deprecated range stays closed.
 - A range in the way of another NetBox range waits (`RangeOverlap`). Deprecated ranges of the provider in the way and without addresses are deleted; a deprecated range of the same pool and network is taken back and resized.
+
+### Control-plane endpoint
+
+KubeadmControlPlane creates no kubeconfig, machines or bootstrap data until `Cluster.spec.controlPlaneEndpoint` is set, and CAPI puts the endpoint into the kubeadm config of every node. The network reserves the VIP right after its prefix, once its Cluster exists, and writes it to the Cluster, so everything CAPI renders carries it and kube-vip reads it from the kubeadm config.
+
+- **Choice.** The host of the Cluster's endpoint if it is an address inside the prefix (migration of a running cluster). Otherwise the highest address of the prefix that is not the network, broadcast or gateway of the L2 network, holds no NetBox address and is in no IP range. An unusable endpoint address is `EndpointConflict`.
+- **NetBox.** An IP address with the L2 mask, role `vip`, status `active`, the owner, the key `NetBoxNetwork/<ns>/<name>/vip` and `dns_name` from the spec. It is found by the key, never moves, and is created again at its old address if it is lost; one moved by hand is `EndpointConflict`.
+- **Cluster.** A merge patch of `spec.controlPlaneEndpoint` only, with the VIP and `status.controlPlaneEndpoint.port`, and only while the endpoint has no host or no port. Another endpoint is `EndpointConflict` and the Cluster is not touched. The Cluster is watched, so the order of applying the manifests does not matter: a new VIP waits for the Cluster, whose endpoint may be the VIP (`WaitingForCluster`); a paused Cluster is skipped.
+- **Conditions.** `ControlPlaneEndpointReady` is True when the VIP is reserved and the Cluster has it, else False with `WaitingForCluster`, `EndpointConflict` or the reason of the VIP error. It never changes `Ready`: a VIP error stops no pool.
+- **Pools.** A range that is not in NetBox yet waits for the VIP (`NetworkNotReady`); one over the VIP is `InvalidRange`.
+- **Deletion.** The VIP follows `deletionPolicy`. Removing `controlPlaneEndpoint` from the spec keeps the VIP in NetBox and in the status, so pools keep off it.
+- **No feature gate.** The field in the spec of a network switches the behaviour on for that network. The provider needs `patch` on `clusters` and touches no infrastructure kind.
 
 ### deletionPolicy
 
@@ -170,6 +194,7 @@ On start the provider checks the NetBox version (≥ 4.6), both custom fields (t
 |---|---|---|---|
 | prefix | `deprecated`, reclaimed when the network is created again | deleted | released: `capi_ref` and `capi_cluster` cleared, the rest stays |
 | ranges in the network, when their pool releases them | `deprecated` and closed | deleted | `deprecated` and closed |
+| VIP | `deprecated`, taken back when the network is created again | deleted | `deprecated` |
 | addresses | deleted with the claim | deleted with the claim | deleted with the claim |
 
 A network being deleted waits for the pools with a range in it (`WaitingForPools`); a pool waits for its `IPAddress` objects (`WaitingForAddresses`) and for NetBox addresses left in its ranges (`RangeInUse`). Without the NetBox permission a network or pool keeps its finalizer and reports `Forbidden`; a claim keeps its finalizer and the error is only logged, since ipamutil sets no condition on a failed release.
@@ -209,7 +234,7 @@ NetBox token. The provider authenticates with a v2 token of a dedicated NetBox u
   | `ipam.iprange` | `{"owner__name": "capi-mgmt-a", "start_address__net_host_contained": "10.10.0.0/16", "end_address__net_host_contained": "10.10.0.0/16"}` |
   | `ipam.ipaddress` | `{"owner__name": "capi-mgmt-a", "address__net_host_contained": "10.10.0.0/16"}` |
 
-Kubernetes. The token reaches the provider as environment from the Secret `capi-ipam-netbox-credentials`; the provider has no RBAC on Secrets. It reads Clusters, writes its own kinds, `IPAddressClaim` status and `IPAddress` objects. Metrics are served on the diagnostics port behind authentication and authorization, as in Cluster API.
+Kubernetes. The token reaches the provider as environment from the Secret `capi-ipam-netbox-credentials`; the provider has no RBAC on Secrets. It reads Clusters and patches their `spec.controlPlaneEndpoint`, writes its own kinds, `IPAddressClaim` status and `IPAddress` objects. Metrics are served on the diagnostics port behind authentication and authorization, as in Cluster API.
 
 Tenancy. Anyone who may create a `NetBoxNetwork` in a namespace may carve from any parent prefix the token can write to and adopt deprecated prefixes of the same namespace. NetBox constraints bound what the token can reach; an admin-scoped parent object is future work.
 
@@ -229,7 +254,8 @@ Transport. The provider trusts the system roots plus an optional CA file. `http:
 - **A generic NetBox operator with its own claim kinds.** It does not implement the Cluster API IPAM contract and would need a bridge controller between claims of both kinds.
 - **Marking objects with tags or descriptions instead of an Owner.** NetBox permissions can be constrained by owner, so the token cannot touch foreign objects; tags give no such guarantee.
 - **The generated Go client for NetBox.** go-netbox v4.3 does not cover Owners and ETags; a thin client on `net/http` covers the few endpoints used.
-- **Writing the VIP into `InfraCluster.spec.controlPlaneEndpoint`.** Needs patch rights on every infrastructure kind and makes the provider a second controller of foreign objects; see [Future Work](#future-work).
+- **Writing the VIP into `InfraCluster.spec.controlPlaneEndpoint`.** Needs patch rights on every infrastructure kind and makes the provider a second controller of foreign objects.
+- **A VIP from a pool range or a claim.** The VIP would be an address of a pool, handed out with the machines; reserving it in the cluster prefix before any pool keeps it out of the ranges.
 - **Admission webhooks.** CEL covers field validation without certificates and an extra endpoint.
 
 ## Upgrade Strategy
@@ -251,7 +277,7 @@ The provider refuses to start against NetBox older than 4.6. It follows the Clus
 
 ## Future Work
 
-1. **Control-plane endpoint.** Allocate the VIP with a claim owned by the Cluster and set `Cluster.spec.controlPlaneEndpoint`, behind a feature gate (`--feature-gates=ControlPlaneEndpoint=true`). The contract lets the endpoint come from outside the infrastructure provider, so only RBAC on `clusters` is needed and no infrastructure kind is patched. The NetBox address gets the role `vip`. A spike with CAPV and KubeadmControlPlane, with and without ClusterClass, comes first; a Runtime SDK extension is the alternative.
+1. **Control-plane endpoint with ClusterClass.** The VIP is written to the Cluster the same way for a topology cluster, but only plain clusters are tested.
 2. **Address enrichment from the Machine.** Fill `dns_name` and `description` from the Machine (claim → infrastructure machine → Machine by owner references) instead of the claim's first owner, and create no VM and interface objects.
 3. **Migration with `spec.importFrom`.** Record the addresses already allocated by another IPAM pool in NetBox under the keys of their claims, so running clusters switch without re-addressing.
 4. **Admin-scoped parent.** A cluster-scoped `NetBoxParentNetwork` with prefix, gateway, VRF, defaults and `allowedNamespaces`, referenced by `NetBoxNetwork.spec.parentRef`; the gateway is set once and `MixedNetworks` becomes a check of the same reference.
@@ -261,3 +287,4 @@ The provider refuses to start against NetBox older than 4.6. It follows the Clus
 
 - 2026-10-06: design.
 - 2026-10-07: v0.1 implemented: networks, pools with per-range readiness and editable ranges, claims, metadata, owner guard, move support.
+- 2026-10-10: the L2 network separate from the parent prefix (`addressPrefixLength`, `isPool`); the control plane VIP (`controlPlaneEndpoint`) reserved in NetBox and written to `Cluster.spec.controlPlaneEndpoint`.

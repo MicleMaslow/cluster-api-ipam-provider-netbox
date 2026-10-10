@@ -57,7 +57,7 @@ SETUP_ENVTEST_BIN := setup-envtest
 SETUP_ENVTEST := $(TOOLS_BIN_DIR)/$(SETUP_ENVTEST_BIN)-$(SETUP_ENVTEST_VER)
 SETUP_ENVTEST_PKG := sigs.k8s.io/controller-runtime/tools/setup-envtest
 
-GOLANGCI_LINT_VER := v2.12.2
+GOLANGCI_LINT_VER := v2.14.0
 GOLANGCI_LINT_BIN := golangci-lint
 GOLANGCI_LINT := $(TOOLS_BIN_DIR)/$(GOLANGCI_LINT_BIN)-$(GOLANGCI_LINT_VER)
 GOLANGCI_LINT_PKG := github.com/golangci/golangci-lint/v2/cmd/golangci-lint
@@ -155,7 +155,7 @@ verify-boilerplate: ## Verify license headers
 
 ##@ Test
 
-ENVTEST_ENV = KUBEBUILDER_ASSETS="$$($(SETUP_ENVTEST) use $(ENVTEST_K8S_VERSION) -p path)" CAPI_CRDS="$$(go list -m -f '{{.Dir}}' sigs.k8s.io/cluster-api)/core/config/crd/bases"
+ENVTEST_ENV = KUBEBUILDER_ASSETS="$$($(SETUP_ENVTEST) use $(ENVTEST_K8S_VERSION) -p path)" CAPI_CRDS="$$(go mod download sigs.k8s.io/cluster-api && go list -m -f '{{.Dir}}' sigs.k8s.io/cluster-api)/core/config/crd/bases"
 
 .PHONY: test
 test: $(SETUP_ENVTEST) ## Run unit tests and CRD validation (no NetBox needed)

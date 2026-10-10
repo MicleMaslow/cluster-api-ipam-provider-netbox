@@ -62,6 +62,17 @@ spec:
           spec:
             description: spec is the desired state of NetBoxNetwork.
             properties:
+              addressPrefixLength:
+                description: |-
+                  addressPrefixLength is the mask of the nodes' subnet; with gateway it gives that subnet (the L2 network).
+                  Defaults to the mask of parentPrefix. Addresses get this mask.
+                format: int32
+                maximum: 32
+                minimum: 1
+                type: integer
+                x-kubernetes-validations:
+                - message: addressPrefixLength is immutable
+                  rule: self == oldSelf
               clusterName:
                 description: clusterName is the CAPI Cluster the network belongs to.
                 maxLength: 63
@@ -70,6 +81,29 @@ spec:
                 x-kubernetes-validations:
                 - message: clusterName is immutable
                   rule: self == oldSelf
+              controlPlaneEndpoint:
+                description: |-
+                  controlPlaneEndpoint reserves the cluster's VIP in the prefix: the address of the Cluster's endpoint if that is
+                  inside the prefix, else the highest free address. The VIP is written to Cluster.spec.controlPlaneEndpoint
+                  while that has no host or no port; another endpoint is reported, not changed.
+                  Without it no VIP is reserved; removing it later leaves the VIP in NetBox and in the status.
+                  A VIP that cannot be reserved shows in the ControlPlaneEndpointReady condition and leaves Ready alone.
+                properties:
+                  dnsName:
+                    description: dnsName of the VIP in NetBox, which stores it in
+                      lower case.
+                    maxLength: 255
+                    minLength: 1
+                    pattern: ^([0-9A-Za-z_-]+|\*)(\.[0-9A-Za-z_-]+)*\.?$
+                    type: string
+                  port:
+                    description: port of the API server behind the VIP. Defaults to
+                      6443.
+                    format: int32
+                    maximum: 65535
+                    minimum: 1
+                    type: integer
+                type: object
               customFields:
                 additionalProperties:
                   x-kubernetes-preserve-unknown-fields: true
@@ -89,7 +123,8 @@ spec:
                 - Delete
                 type: string
               gateway:
-                description: gateway of the parent network.
+                description: gateway of the L2 network; with addressPrefixLength it
+                  gives that network.
                 maxLength: 39
                 minLength: 1
                 type: string
@@ -100,9 +135,15 @@ spec:
                   rule: '!isIP(self) || ip(self).family() == 4'
                 - message: gateway is immutable
                   rule: self == oldSelf
+              isPool:
+                description: |-
+                  isPool marks the carved prefix as a pool in NetBox: all its addresses are usable hosts.
+                  It needs prefixLength; false is the same as unset.
+                type: boolean
               parentPrefix:
-                description: parentPrefix is the L2 network the prefix lives in; addresses
-                  get its mask.
+                description: |-
+                  parentPrefix is the NetBox prefix the cluster prefix is carved from, or adopted in.
+                  It lies inside the L2 network (see addressPrefixLength) and may be a logical pool in it.
                 maxLength: 43
                 minLength: 1
                 type: string
@@ -153,8 +194,22 @@ spec:
               rule: has(self.prefix) != has(self.prefixLength)
             - message: cannot switch between prefix and prefixLength
               rule: has(self.prefix) == has(oldSelf.prefix)
-            - message: gateway must be inside parentPrefix
-              rule: '!isCIDR(self.parentPrefix) || !isIP(self.gateway) || cidr(self.parentPrefix).containsIP(self.gateway)'
+            - message: gateway/addressPrefixLength must contain parentPrefix
+              rule: '!isCIDR(self.parentPrefix) || !isIP(self.gateway) || (has(self.addressPrefixLength)
+                ? cidr(self.gateway + [''/1'', ''/2'', ''/3'', ''/4'', ''/5'', ''/6'',
+                ''/7'', ''/8'', ''/9'', ''/10'', ''/11'', ''/12'', ''/13'', ''/14'',
+                ''/15'', ''/16'', ''/17'', ''/18'', ''/19'', ''/20'', ''/21'', ''/22'',
+                ''/23'', ''/24'', ''/25'', ''/26'', ''/27'', ''/28'', ''/29'', ''/30'',
+                ''/31'', ''/32''][self.addressPrefixLength - 1]).masked().containsCIDR(self.parentPrefix)
+                : cidr(self.parentPrefix).containsIP(self.gateway))'
+            - message: addressPrefixLength must not be longer than the parentPrefix
+                mask
+              rule: '!has(self.addressPrefixLength) || !isCIDR(self.parentPrefix)
+                || self.addressPrefixLength <= cidr(self.parentPrefix).prefixLength()'
+            - message: addressPrefixLength cannot be added or removed
+              rule: has(self.addressPrefixLength) == has(oldSelf.addressPrefixLength)
+            - message: isPool needs prefixLength
+              rule: '!has(self.isPool) || !self.isPool || has(self.prefixLength)'
             - message: prefix must be inside parentPrefix
               rule: '!has(self.prefix) || !isCIDR(self.parentPrefix) || !isCIDR(self.prefix)
                 || cidr(self.parentPrefix).containsCIDR(self.prefix)'
@@ -168,10 +223,17 @@ spec:
             description: status is the observed state of NetBoxNetwork.
             minProperties: 1
             properties:
+              addressPrefixLength:
+                description: 'addressPrefixLength is the mask handed to addresses:
+                  spec.addressPrefixLength or the parentPrefix mask.'
+                format: int32
+                maximum: 32
+                minimum: 1
+                type: integer
               conditions:
                 description: |-
                   conditions represents the observations of a NetBoxNetwork's current state.
-                  Known condition types are Ready and MetadataSynced.
+                  Known condition types are Ready, MetadataSynced and ControlPlaneEndpointReady.
                 items:
                   description: Condition contains details for one aspect of the current
                     state of this API Resource.
@@ -231,6 +293,25 @@ spec:
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
+              controlPlaneEndpoint:
+                description: controlPlaneEndpoint is the reserved VIP and the port
+                  of the API server behind it.
+                properties:
+                  host:
+                    description: host is the VIP.
+                    maxLength: 45
+                    minLength: 1
+                    type: string
+                  port:
+                    description: port of the API server behind the VIP.
+                    format: int32
+                    maximum: 65535
+                    minimum: 1
+                    type: integer
+                required:
+                - host
+                - port
+                type: object
               customFieldKeys:
                 additionalProperties:
                   items:

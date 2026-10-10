@@ -17,6 +17,7 @@ limitations under the License.
 package controllers
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -29,7 +30,9 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	kerrors "k8s.io/apimachinery/pkg/util/errors"
+	"k8s.io/utils/ptr"
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
+	"sigs.k8s.io/cluster-api/util/annotations"
 	"sigs.k8s.io/cluster-api/util/patch"
 	"sigs.k8s.io/cluster-api/util/predicates"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -71,7 +74,7 @@ type NetBoxNetworkReconciler struct {
 // +kubebuilder:rbac:groups=ipam.cluster.x-k8s.io,resources=netboxnetworks,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups=ipam.cluster.x-k8s.io,resources=netboxnetworks/status;netboxnetworks/finalizers,verbs=get;update;patch
 // +kubebuilder:rbac:groups=ipam.cluster.x-k8s.io,resources=netboxippools,verbs=get;list;watch
-// +kubebuilder:rbac:groups=cluster.x-k8s.io,resources=clusters,verbs=get;list;watch
+// +kubebuilder:rbac:groups=cluster.x-k8s.io,resources=clusters,verbs=get;list;watch;patch
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *NetBoxNetworkReconciler) SetupWithManager(ctx context.Context, mgr ctrl.Manager, options controller.Options) error {
@@ -144,61 +147,165 @@ func (r *NetBoxNetworkReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	if controllerutil.AddFinalizer(nw, networkFinalizer) {
 		return ctrl.Result{}, nil
 	}
-	err = r.reconcileNormal(ctx, nw)
+	var cluster *clusterv1.Cluster
+	if nw.Spec.ControlPlaneEndpoint == nil {
+		meta.RemoveStatusCondition(&nw.Status.Conditions, v1alpha1.ControlPlaneEndpointReadyCondition)
+	} else if cluster, err = r.getCluster(ctx, nw); err != nil {
+		return ctrl.Result{}, err
+	}
+	vipErr, err := r.reconcileNormal(ctx, nw, cluster)
 	setReady(&nw.Status.Conditions, nw.Generation, err)
 	if err != nil {
-		meta.SetStatusCondition(&nw.Status.Conditions, metav1.Condition{
-			Type: v1alpha1.MetadataSyncedCondition, Status: metav1.ConditionUnknown, Reason: v1alpha1.ReasonWaitingForPrefix,
-			Message: "the prefix is not Ready", ObservedGeneration: nw.Generation,
-		})
+		setWaitingForPrefix(nw, v1alpha1.MetadataSyncedCondition)
+		if nw.Spec.ControlPlaneEndpoint != nil {
+			setWaitingForPrefix(nw, v1alpha1.ControlPlaneEndpointReadyCondition)
+		}
 		return toResult(err)
+	}
+	if nw.Spec.ControlPlaneEndpoint != nil {
+		vipErr = r.syncClusterEndpoint(ctx, nw, cluster, vipErr)
+		setCondition(&nw.Status.Conditions, v1alpha1.ControlPlaneEndpointReadyCondition, v1alpha1.ReasonReady, nw.Generation, vipErr)
 	}
 	err = r.syncMetadata(ctx, nw, nw.Status.PrefixID)
 	setCondition(&nw.Status.Conditions, v1alpha1.MetadataSyncedCondition, v1alpha1.ReasonSynced, nw.Generation, err)
-	return toResult(err)
+	return toResult(foldErrors([]error{vipErr, err}))
 }
 
-func (r *NetBoxNetworkReconciler) reconcileNormal(ctx context.Context, nw *v1alpha1.NetBoxNetwork) error {
-	parent, err := netip.ParsePrefix(nw.Spec.ParentPrefix)
-	if err != nil {
-		return err
+// getCluster returns the Cluster of nw from the cache, or nil if there is none yet.
+func (r *NetBoxNetworkReconciler) getCluster(ctx context.Context, nw *v1alpha1.NetBoxNetwork) (*clusterv1.Cluster, error) {
+	cluster := &clusterv1.Cluster{}
+	if err := r.Get(ctx, client.ObjectKey{Namespace: nw.Namespace, Name: nw.Spec.ClusterName}, cluster); err != nil {
+		return nil, client.IgnoreNotFound(err)
 	}
-	parent = parent.Masked()
-	ref := refOf("NetBoxNetwork", nw)
+	return cluster, nil
+}
+
+func hostOf(cluster *clusterv1.Cluster) string {
+	if cluster == nil {
+		return ""
+	}
+	return cluster.Spec.ControlPlaneEndpoint.Host
+}
+
+// syncClusterEndpoint sets the endpoint of the Cluster to the VIP once, while it has no host or no port
+// (CAPI copies a port alone from the infrastructure cluster).
+// Its result is ControlPlaneEndpointReady: nil only when the VIP is reserved and the Cluster has it.
+// Any other endpoint is a conflict and the Cluster is left alone.
+func (r *NetBoxNetworkReconciler) syncClusterEndpoint(ctx context.Context, nw *v1alpha1.NetBoxNetwork, cluster *clusterv1.Cluster, vipErr error) error {
+	if vipErr != nil {
+		return vipErr
+	}
+	if cluster == nil {
+		return waitFor(v1alpha1.ReasonWaitingForCluster, fmt.Errorf("cluster %s not found", nw.Spec.ClusterName))
+	}
+	ep, cur := nw.Status.ControlPlaneEndpoint, cluster.Spec.ControlPlaneEndpoint
+	switch {
+	case cur.Host == ep.Host && cur.Port == ep.Port:
+		return nil
+	case cur.IsValid():
+		return retryLater(v1alpha1.ReasonEndpointConflict, fmt.Errorf("cluster %s has endpoint %s, the VIP is %s:%d", cluster.Name, cur.String(), ep.Host, ep.Port))
+	case annotations.IsPaused(cluster, nw):
+		return waitFor(v1alpha1.ReasonWaitingForCluster, fmt.Errorf("cluster %s is paused", cluster.Name))
+	}
+	before := cluster.DeepCopy()
+	cluster.Spec.ControlPlaneEndpoint = clusterv1.APIEndpoint{Host: ep.Host, Port: ep.Port}
+	// The lock keeps an endpoint that was set meanwhile, e.g. copied from the infrastructure cluster.
+	if err := r.Patch(ctx, cluster, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{})); err != nil {
+		return apiError(err)
+	}
+	return nil
+}
+
+// setWaitingForPrefix leaves condType Unknown until the prefix is Ready.
+func setWaitingForPrefix(nw *v1alpha1.NetBoxNetwork, condType string) {
+	meta.SetStatusCondition(&nw.Status.Conditions, metav1.Condition{
+		Type: condType, Status: metav1.ConditionUnknown, Reason: v1alpha1.ReasonWaitingForPrefix,
+		Message: "the prefix is not Ready", ObservedGeneration: nw.Generation,
+	})
+}
+
+// reconcileNormal brings the prefix to NetBox, then the VIP. The prefix decides Ready (err); a VIP that
+// cannot be reserved is vipErr and leaves Ready alone, so adding a VIP to a live network stops no pool.
+func (r *NetBoxNetworkReconciler) reconcileNormal(ctx context.Context, nw *v1alpha1.NetBoxNetwork, cluster *clusterv1.Cluster) (vipErr, err error) {
 	netBoxWrites.Lock()
 	defer netBoxWrites.Unlock()
+	prefix, err := r.reconcilePrefix(ctx, nw)
+	if err != nil {
+		return nil, err
+	}
+	// Without the field the VIP stays in NetBox, and in the status so that pools keep off it.
+	if nw.Spec.ControlPlaneEndpoint == nil {
+		return nil, nil
+	}
+	vip, err := r.reserveVIP(ctx, nw, prefix, preferredVIP(nw, hostOf(cluster), prefix), cluster != nil)
+	if err != nil {
+		return err, nil
+	}
+	nw.Status.ControlPlaneEndpoint = v1alpha1.APIEndpoint{Host: vip.String(), Port: cmp.Or(nw.Spec.ControlPlaneEndpoint.Port, defaultAPIPort)}
+	return nil, nil
+}
+
+// preferredVIP is the address a new VIP must take. A VIP lost from NetBox comes back at the address in the
+// status, or reports EndpointConflict: it never moves. Without one, a Cluster endpoint inside prefix is kept.
+func preferredVIP(nw *v1alpha1.NetBoxNetwork, clusterHost string, prefix netip.Prefix) netip.Addr {
+	if a, err := netip.ParseAddr(nw.Status.ControlPlaneEndpoint.Host); err == nil {
+		return a
+	}
+	if a, err := netip.ParseAddr(clusterHost); err == nil && prefix.Contains(a) {
+		return a
+	}
+	return netip.Addr{}
+}
+
+// reconcilePrefix finds, carves or adopts the prefix of nw and records it in the status. The caller holds netBoxWrites.
+func (r *NetBoxNetworkReconciler) reconcilePrefix(ctx context.Context, nw *v1alpha1.NetBoxNetwork) (netip.Prefix, error) {
+	parent, err := netip.ParsePrefix(nw.Spec.ParentPrefix)
+	if err != nil {
+		return netip.Prefix{}, err
+	}
+	parent = parent.Masked()
+	l2, _, err := l2Of(nw)
+	if err != nil {
+		return netip.Prefix{}, err
+	}
+	ref := refOf("NetBoxNetwork", nw)
 	found, err := r.NetBox.FindByRef(ctx, netbox.Prefixes, r.Owner, ref)
 	if err != nil {
-		return err
+		return netip.Prefix{}, err
 	}
 	var p netbox.Object
 	switch len(found) {
 	case 0:
 		if err := ownedByOtherOwner(ctx, r.NetBox, r.Owner, netbox.Prefixes, ref); err != nil {
-			return err
+			return netip.Prefix{}, err
 		}
 		if nw.Status.PrefixID != 0 || nw.Status.Prefix != "" {
-			return retryLater(v1alpha1.ReasonPrefixNotFound, fmt.Errorf("NetBox prefix %s of %s is gone, restore it", nw.Status.Prefix, ref))
+			return netip.Prefix{}, retryLater(v1alpha1.ReasonPrefixNotFound, fmt.Errorf("NetBox prefix %s of %s is gone, restore it", nw.Status.Prefix, ref))
 		}
 		if p, err = r.acquire(ctx, nw, ref, parent); err != nil {
-			return err
+			return netip.Prefix{}, err
 		}
 	case 1:
 		p = found[0]
 	default:
-		return retryLater(v1alpha1.ReasonDuplicate, fmt.Errorf("%d NetBox prefixes carry %s", len(found), ref))
+		return netip.Prefix{}, retryLater(v1alpha1.ReasonDuplicate, fmt.Errorf("%d NetBox prefixes carry %s", len(found), ref))
 	}
 	cidr, err := checkPrefix(nw, parent, p.Prefix)
 	if err != nil {
-		return retryLater(v1alpha1.ReasonPrefixMismatch, err)
+		return netip.Prefix{}, retryLater(v1alpha1.ReasonPrefixMismatch, err)
 	}
 	if nw.Spec.Prefix == "" && p.Status.Value == "deprecated" {
 		if _, err := r.NetBox.Patch(ctx, netbox.Prefixes, p.ID, "", map[string]any{"status": "active", "changelog_message": "capi: reclaimed by " + ref}); err != nil {
-			return err
+			return netip.Prefix{}, err
 		}
 	}
-	nw.Status.Prefix, nw.Status.PrefixID = cidr.String(), p.ID
-	return nil
+	if want := ptr.Deref(nw.Spec.IsPool, false); nw.Spec.Prefix == "" && p.IsPool != want {
+		if _, err := r.NetBox.Patch(ctx, netbox.Prefixes, p.ID, "", map[string]any{"is_pool": want, "changelog_message": "capi: is_pool of " + ref}); err != nil {
+			return netip.Prefix{}, err
+		}
+	}
+	nw.Status.Prefix, nw.Status.PrefixID, nw.Status.AddressPrefixLength = cidr.String(), p.ID, int32(l2.Bits())
+	return cidr, nil
 }
 
 // syncMetadata applies spec.customFields and spec.tags to the prefix in one update; If-Match keeps concurrent edits.
@@ -253,6 +360,7 @@ func (r *NetBoxNetworkReconciler) acquire(ctx context.Context, nw *v1alpha1.NetB
 		return netbox.Object{}, retryLater(v1alpha1.ReasonParentNotFound, fmt.Errorf("want one parent prefix %s in the global VRF, found %d", parent, len(parents)))
 	}
 	fields["prefix_length"] = nw.Spec.PrefixLength
+	fields["is_pool"] = ptr.Deref(nw.Spec.IsPool, false)
 	p, err := r.NetBox.Create(ctx, netbox.AvailablePrefixes(parents[0].ID), fields)
 	if errors.Is(err, netbox.ErrConflict) {
 		return p, retryLater(v1alpha1.ReasonExhausted, fmt.Errorf("no free /%d left in %s", nw.Spec.PrefixLength, parent))
@@ -358,6 +466,9 @@ func (r *NetBoxNetworkReconciler) reconcileDelete(ctx context.Context, nw *v1alp
 		if err != nil && !errors.Is(err, netbox.ErrNotFound) {
 			return err
 		}
+	}
+	if err := r.releaseVIP(ctx, nw); err != nil {
+		return err
 	}
 	controllerutil.RemoveFinalizer(nw, networkFinalizer)
 	return nil

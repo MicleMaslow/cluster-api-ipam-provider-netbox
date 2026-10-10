@@ -214,14 +214,23 @@ func (r *NetBoxIPPoolReconciler) reconcileNormal(ctx context.Context, pool *v1al
 	if err != nil {
 		return err
 	}
-	// The network of the first range sets the L2: every range shares its parentPrefix and gateway; without it none serves.
+	// The network of the first range sets the L2: every range shares its subnet and gateway; without it none serves.
 	first := pool.Spec.Ranges[0].NetworkName
-	l2 := &v1alpha1.NetBoxNetwork{}
-	if err := r.Get(ctx, client.ObjectKey{Namespace: pool.Namespace, Name: first}, l2); err != nil {
+	head := &v1alpha1.NetBoxNetwork{}
+	if err := r.Get(ctx, client.ObjectKey{Namespace: pool.Namespace, Name: first}, head); err != nil {
 		if !apierrors.IsNotFound(err) {
 			return apiError(err)
 		}
-		l2 = nil
+		head = nil
+	}
+	var (
+		l2 netip.Prefix
+		gw netip.Addr
+	)
+	if head != nil {
+		if l2, gw, err = l2Of(head); err != nil {
+			return err
+		}
 	}
 	prev := map[string]*v1alpha1.IPPoolRangeStatus{}
 	for i := range pool.Status.Ranges {
@@ -251,10 +260,14 @@ func (r *NetBoxIPPoolReconciler) reconcileNormal(ctx context.Context, pool *v1al
 		nw, err := r.usableNetwork(ctx, pool.Namespace, rg.NetworkName)
 		switch {
 		case err != nil:
-		case l2 == nil:
+		case head == nil:
 			err = waitFor(v1alpha1.ReasonNetworkNotReady, fmt.Errorf("network %s of the first range is missing", first))
-		case nw.Spec.ParentPrefix != l2.Spec.ParentPrefix || nw.Spec.Gateway != l2.Spec.Gateway:
-			err = retryLater(v1alpha1.ReasonMixedNetworks, fmt.Errorf("networks %s and %s differ in parentPrefix or gateway; a pool stays in one L2 network", l2.Name, nw.Name))
+		default:
+			if nl2, ngw, lerr := l2Of(nw); lerr != nil {
+				err = lerr
+			} else if nl2 != l2 || ngw != gw {
+				err = retryLater(v1alpha1.ReasonMixedNetworks, fmt.Errorf("networks %s and %s are in different L2 networks; a pool stays in one", head.Name, nw.Name))
+			}
 		}
 		if err != nil {
 			add(rg.NetworkName, notReady(last), err)
@@ -296,12 +309,8 @@ func (r *NetBoxIPPoolReconciler) reconcileNormal(ctx context.Context, pool *v1al
 	}
 	pool.Status.Ranges = ranges
 	pool.Status.IPAddresses = &v1alpha1.NetBoxIPPoolStatusIPAddresses{Total: int32(total), Used: int32(used), Free: int32(total - used)}
-	if l2 != nil {
-		parent, gw, err := l2Of(l2)
-		if err != nil {
-			return err
-		}
-		pool.Status.Gateway, pool.Status.AddressPrefixLength = gw.String(), int32(parent.Bits())
+	if head != nil {
+		pool.Status.Gateway, pool.Status.AddressPrefixLength = gw.String(), int32(l2.Bits())
 	}
 	return foldErrors(errs)
 }
@@ -321,15 +330,18 @@ func (r *NetBoxIPPoolReconciler) usableNetwork(ctx context.Context, namespace, n
 	return nw, nil
 }
 
-// foldErrors makes one error of those of the ranges: the reason of the first, the most urgent requeue, every message.
+// foldErrors makes one error of errs, nils left out: the reason of the first, the most urgent requeue, every message.
 func foldErrors(errs []error) error {
-	if len(errs) == 0 {
+	agg := kerrors.NewAggregate(errs)
+	if agg == nil {
 		return nil
 	}
-	out := reasonError{reason: errReason(errs[0]), kind: kindWait, err: kerrors.NewAggregate(errs)}
+	errs = agg.Errors()
+	out := reasonError{reason: errReason(errs[0]), kind: kindWait, err: agg}
 	for _, err := range errs {
 		re, ok := asReason(err)
 		switch {
+		case ok && re.reason == v1alpha1.ReasonInvalidSpec: // never retried, as in toResult
 		case !ok || re.kind == kindError:
 			out.kind = kindError
 		case re.kind == kindRetry && out.kind == kindWait:
@@ -354,18 +366,26 @@ func networkUsable(nw *v1alpha1.NetBoxNetwork) bool {
 	return ready.Status == metav1.ConditionTrue
 }
 
-// l2Of parses the parent network of nw.
+// l2Of returns the nodes' subnet of nw (gateway with addressPrefixLength, by default the parent mask) and its gateway.
 func l2Of(nw *v1alpha1.NetBoxNetwork) (netip.Prefix, netip.Addr, error) {
 	parent, err := netip.ParsePrefix(nw.Spec.ParentPrefix)
 	if err != nil {
 		return parent, netip.Addr{}, err
 	}
 	gw, err := netip.ParseAddr(nw.Spec.Gateway)
-	return parent.Masked(), gw, err
+	if err != nil {
+		return parent, gw, err
+	}
+	bits := parent.Bits()
+	if nw.Spec.AddressPrefixLength != 0 {
+		bits = int(nw.Spec.AddressPrefixLength)
+	}
+	l2, err := gw.Prefix(bits)
+	return l2, gw, err
 }
 
 // rangeAddresses turns a range's offsets into addresses, refusing ones a VM must never get.
-func rangeAddresses(prefix netip.Prefix, rg v1alpha1.IPPoolRange, parent netip.Prefix, gw netip.Addr) (netip.Addr, netip.Addr, error) {
+func rangeAddresses(prefix netip.Prefix, rg v1alpha1.IPPoolRange, l2 netip.Prefix, reserved ...netip.Addr) (netip.Addr, netip.Addr, error) {
 	start, err := netmath.AddressAt(prefix, int(rg.Start))
 	if err != nil {
 		return start, start, fmt.Errorf("range in %s: start: %w", rg.NetworkName, err)
@@ -374,23 +394,23 @@ func rangeAddresses(prefix netip.Prefix, rg v1alpha1.IPPoolRange, parent netip.P
 	if err != nil {
 		return start, end, fmt.Errorf("range in %s: end: %w", rg.NetworkName, err)
 	}
-	if err := checkSpan(prefix, start, end, parent, gw); err != nil {
+	if err := checkSpan(prefix, start, end, l2, reserved...); err != nil {
 		return start, end, fmt.Errorf("range in %s: %w", rg.NetworkName, err)
 	}
 	return start, end, nil
 }
 
-// checkSpan refuses start-end if it is reversed, leaves prefix or covers the network, broadcast or gateway address of parent.
-func checkSpan(prefix netip.Prefix, start, end netip.Addr, parent netip.Prefix, gw netip.Addr) error {
+// checkSpan refuses start-end if it is reversed, leaves prefix or covers the network or broadcast of l2 or a reserved address.
+func checkSpan(prefix netip.Prefix, start, end netip.Addr, l2 netip.Prefix, reserved ...netip.Addr) error {
 	switch {
 	case end.Less(start):
 		return fmt.Errorf("start %s is after end %s", start, end)
 	case !prefix.Contains(start) || !prefix.Contains(end):
 		return fmt.Errorf("%s-%s is not inside %s", start, end, prefix)
 	}
-	for _, bad := range []netip.Addr{parent.Addr(), netmath.Last(parent), gw} {
+	for _, bad := range append([]netip.Addr{l2.Addr(), netmath.Last(l2)}, reserved...) {
 		if netmath.Contains(start, end, bad) {
-			return fmt.Errorf("%s-%s covers %s (network, broadcast or gateway of %s)", start, end, bad, parent)
+			return fmt.Errorf("%s-%s covers %s (network or broadcast of %s, or a reserved address)", start, end, bad, l2)
 		}
 	}
 	return nil
@@ -432,7 +452,7 @@ func netBoxBounds(o netbox.Object) (netip.Addr, netip.Addr, error) {
 // reconcileRange makes the NetBox range of rg in nw match the spec. It returns the status of the range,
 // nil while NetBox has none; last is the one known before.
 func (r *NetBoxIPPoolReconciler) reconcileRange(ctx context.Context, pool *v1alpha1.NetBoxIPPool, nw *v1alpha1.NetBoxNetwork, rg v1alpha1.IPPoolRange, last *v1alpha1.IPPoolRangeStatus, addrs []netip.Addr) (*v1alpha1.IPPoolRangeStatus, error) {
-	parent, gw, err := l2Of(nw)
+	l2, gw, err := l2Of(nw)
 	if err != nil {
 		return notReady(last), err
 	}
@@ -440,12 +460,13 @@ func (r *NetBoxIPPoolReconciler) reconcileRange(ctx context.Context, pool *v1alp
 	if err != nil {
 		return notReady(last), err
 	}
-	start, end, err := rangeAddresses(prefix, rg, parent, gw)
+	reserved := reservedOf(nw, gw)
+	start, end, err := rangeAddresses(prefix, rg, l2, reserved...)
 	if err != nil {
 		err = retryLater(v1alpha1.ReasonInvalidRange, err)
 		// Until the spec is fixed the range keeps its old bounds, if they are still valid.
 		if last != nil && last.Ready {
-			if from, to, berr := statusBounds(*last); berr == nil && checkSpan(prefix, from, to, parent, gw) == nil {
+			if from, to, berr := statusBounds(*last); berr == nil && checkSpan(prefix, from, to, l2, reserved...) == nil {
 				c := *last
 				return &c, err
 			}
@@ -462,7 +483,11 @@ func (r *NetBoxIPPoolReconciler) reconcileRange(ctx context.Context, pool *v1alp
 	case len(found) > 1:
 		return notReady(last), retryLater(v1alpha1.ReasonDuplicate, fmt.Errorf("%d NetBox IP ranges carry %s", len(found), ref))
 	case len(found) == 1:
-		return r.resizeRange(ctx, nw, ref, found[0], start, end, parent.Bits(), addrs)
+		return r.resizeRange(ctx, nw, ref, found[0], start, end, l2.Bits(), addrs)
+	}
+	// A range over the VIP must not appear: new ranges wait for it, existing ones go on serving.
+	if nw.Spec.ControlPlaneEndpoint != nil && nw.Status.ControlPlaneEndpoint.Host == "" {
+		return nil, waitFor(v1alpha1.ReasonNetworkNotReady, fmt.Errorf("waiting for the VIP of network %s", nw.Name))
 	}
 	if err := ownedByOtherOwner(ctx, r.NetBox, r.Owner, netbox.IPRanges, ref); err != nil {
 		return nil, err
@@ -470,7 +495,7 @@ func (r *NetBoxIPPoolReconciler) reconcileRange(ctx context.Context, pool *v1alp
 	var obj netbox.Object
 	err = r.clearingDeprecated(ctx, nw, ref, start, end, 0, func() (err error) {
 		obj, err = r.NetBox.Create(ctx, netbox.IPRanges, r.Owner.Managed(ref, nw.Spec.ClusterName, "capi: range "+ref, map[string]any{
-			"start_address": netip.PrefixFrom(start, parent.Bits()).String(), "end_address": netip.PrefixFrom(end, parent.Bits()).String(),
+			"start_address": netip.PrefixFrom(start, l2.Bits()).String(), "end_address": netip.PrefixFrom(end, l2.Bits()).String(),
 			"status": "active", "description": "CAPI pool " + pool.Name,
 		}))
 		return err

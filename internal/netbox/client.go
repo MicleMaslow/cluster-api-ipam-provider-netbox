@@ -71,7 +71,9 @@ type Object struct {
 	DNSName       string                     `json:"dns_name"`
 	Description   string                     `json:"description"`
 	Status        Choice                     `json:"status"`
+	Role          Choice                     `json:"role"`
 	MarkPopulated bool                       `json:"mark_populated"`
+	IsPool        bool                       `json:"is_pool"`
 	Owner         *Ref                       `json:"owner"`
 	CustomFields  map[string]json.RawMessage `json:"custom_fields"`
 	Tags          []Tag                      `json:"tags"`
