@@ -69,12 +69,21 @@ func reservedOf(nw *v1alpha1.NetBoxNetwork, gw netip.Addr) []netip.Addr {
 
 // reserveVIP returns the VIP of nw in prefix, creating it in NetBox if it is not there yet.
 // A valid preferred is the only candidate; otherwise the highest usable address is taken once the
-// Cluster is found, as its endpoint may be the address to take. The caller holds netBoxWrites.
+// Cluster is found, as its endpoint may be the address to take.
 func (r *NetBoxNetworkReconciler) reserveVIP(ctx context.Context, nw *v1alpha1.NetBoxNetwork, prefix netip.Prefix, preferred netip.Addr, clusterFound bool) (netip.Addr, error) {
 	ref := vipRef(nw)
 	found, err := r.NetBox.FindByRef(ctx, netbox.IPAddresses, r.Owner, ref)
 	if err != nil {
 		return netip.Addr{}, err
+	}
+	// A VIP retained by a deleted network of this name outside the new prefix gives way to a new one.
+	if len(found) == 1 && found[0].Status.Value == "deprecated" {
+		if a, err := netip.ParsePrefix(found[0].Address); err == nil && !prefix.Contains(a.Addr()) {
+			if err := r.retire(ctx, nw, netbox.IPAddresses, found[0], ref, "VIPRetired"); err != nil {
+				return netip.Addr{}, err
+			}
+			found = nil
+		}
 	}
 	var ip netbox.Object
 	switch len(found) {
@@ -85,6 +94,10 @@ func (r *NetBoxNetworkReconciler) reserveVIP(ctx context.Context, nw *v1alpha1.N
 		ip, err = r.createVIP(ctx, nw, prefix, preferred)
 	case 1:
 		ip = found[0]
+		// The check after a create can have failed: until the status has the VIP, it is checked here.
+		if nw.Status.ControlPlaneEndpoint.Host == "" {
+			err = r.dropDuplicate(ctx, nw, ip)
+		}
 	default:
 		err = retryLater(v1alpha1.ReasonDuplicate, fmt.Errorf("%d NetBox addresses carry %s", len(found), ref))
 	}
@@ -128,6 +141,9 @@ func dnsNameOf(nw *v1alpha1.NetBoxNetwork) string {
 	return strings.ToLower(nw.Spec.ControlPlaneEndpoint.DNSName)
 }
 
+// beforeVIPCreate runs between the pick of the VIP address and its create; a test seam.
+var beforeVIPCreate = func() {}
+
 // createVIP creates the VIP in NetBox: preferred if it is valid, else the highest usable address of prefix.
 func (r *NetBoxNetworkReconciler) createVIP(ctx context.Context, nw *v1alpha1.NetBoxNetwork, prefix netip.Prefix, preferred netip.Addr) (netbox.Object, error) {
 	ref := vipRef(nw)
@@ -154,6 +170,7 @@ func (r *NetBoxNetworkReconciler) createVIP(ctx context.Context, nw *v1alpha1.Ne
 			return netbox.Object{}, retryLater(v1alpha1.ReasonExhausted, fmt.Errorf("no free address for the VIP in %s", prefix))
 		}
 	}
+	beforeVIPCreate()
 	nwRef := refOf("NetBoxNetwork", nw)
 	ip, err := r.NetBox.Create(ctx, netbox.IPAddresses, r.Owner.Managed(ref, nw.Spec.ClusterName, "capi: VIP for "+nwRef, map[string]any{
 		"address": netip.PrefixFrom(vip, l2.Bits()).String(), "role": "vip", "status": "active",
@@ -163,7 +180,43 @@ func (r *NetBoxNetworkReconciler) createVIP(ctx context.Context, nw *v1alpha1.Ne
 		return ip, err
 	}
 	ctrl.LoggerFrom(ctx).Info("Reserved the control plane VIP", "network", klog.KObj(nw), "address", ip.Address)
+	normalEvent(r.Recorder, nw, "VIPReserved", "Reserved the control plane VIP %s", ip.Address)
+	if err := r.dropDuplicate(ctx, nw, ip); err != nil {
+		return netbox.Object{}, err
+	}
 	return ip, nil
+}
+
+// dropDuplicate deletes ip, the VIP of nw, when an older global-VRF NetBox address holds its address too:
+// NetBox lets VIP-role addresses share an address, so another creator can have taken it at the same time.
+// Of racing creators the older one stays; a VIP that only newer objects share is long-lived and is kept.
+func (r *NetBoxNetworkReconciler) dropDuplicate(ctx context.Context, nw *v1alpha1.NetBoxNetwork, ip netbox.Object) error {
+	p, err := netip.ParsePrefix(ip.Address)
+	if err != nil {
+		return err
+	}
+	same, err := r.NetBox.List(ctx, netbox.IPAddresses, url.Values{"address": {p.Addr().String()}, "vrf_id": {"null"}})
+	if err != nil {
+		return err
+	}
+	log := ctrl.LoggerFrom(ctx)
+	for _, o := range same {
+		if o.ID == ip.ID {
+			continue
+		}
+		if o.ID > ip.ID {
+			log.Info("Another NetBox address holds the control plane VIP too, it is newer: keeping the VIP", "network", klog.KObj(nw), "address", ip.Address, "other", o.ID)
+			continue
+		}
+		msg := fmt.Sprintf("capi: VIP of %s duplicates NetBox address #%d", refOf("NetBoxNetwork", nw), o.ID)
+		if err := r.NetBox.Delete(ctx, netbox.IPAddresses, ip.ID, "", msg); err != nil {
+			return err
+		}
+		log.Info("Deleted the control plane VIP, an older NetBox address holds it", "network", klog.KObj(nw), "address", ip.Address, "other", o.ID)
+		normalEvent(r.Recorder, nw, "VIPDeleted", "Deleted the control plane VIP %s: NetBox address #%d holds it too", ip.Address, o.ID)
+		return retryLater(v1alpha1.ReasonEndpointConflict, fmt.Errorf("%s is also held by NetBox address #%d", p.Addr(), o.ID))
+	}
+	return nil
 }
 
 // occupied returns the global-VRF addresses NetBox holds inside prefix and the IP ranges inside l2.
@@ -207,13 +260,18 @@ func (r *NetBoxNetworkReconciler) releaseVIP(ctx context.Context, nw *v1alpha1.N
 	released := "capi: released by " + refOf("NetBoxNetwork", nw)
 	for _, ip := range found {
 		if nw.Spec.DeletionPolicy == v1alpha1.DeletionPolicyDelete {
-			err = r.NetBox.Delete(ctx, netbox.IPAddresses, ip.ID, released)
+			err = r.NetBox.Delete(ctx, netbox.IPAddresses, ip.ID, "", released)
 		} else {
 			_, err = r.NetBox.Patch(ctx, netbox.IPAddresses, ip.ID, "", map[string]any{"status": "deprecated", "changelog_message": released})
 		}
-		if err != nil && !errors.Is(err, netbox.ErrNotFound) {
+		if errors.Is(err, netbox.ErrNotFound) {
+			continue
+		}
+		if err != nil {
 			return err
 		}
+		ctrl.LoggerFrom(ctx).Info("Released the control plane VIP", "network", klog.KObj(nw), "address", ip.Address, "policy", nw.Spec.DeletionPolicy)
+		normalEvent(r.Recorder, nw, "VIPReleased", "Released the control plane VIP %s (deletionPolicy %s)", ip.Address, nw.Spec.DeletionPolicy)
 	}
 	return nil
 }

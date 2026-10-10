@@ -17,21 +17,29 @@ limitations under the License.
 package controllers
 
 import (
+	"context"
 	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"strconv"
+	"sync"
 	"sync/atomic"
 	"testing"
 
 	. "github.com/onsi/gomega"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/tools/events"
 	"k8s.io/utils/ptr"
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	"github.com/MicleMaslow/cluster-api-ipam-provider-netbox/api/v1alpha1"
 	"github.com/MicleMaslow/cluster-api-ipam-provider-netbox/internal/netbox"
@@ -134,7 +142,8 @@ func TestPoolNewRangeWaitsForVIP(t *testing.T) {
 func TestReserveVIPPreferred(t *testing.T) {
 	g := newG(t)
 	ns := newEnv(t, nil)
-	r := &NetBoxNetworkReconciler{NetBox: admin, Owner: owner}
+	rec := events.NewFakeRecorder(10)
+	r := &NetBoxNetworkReconciler{NetBox: admin, Owner: owner, Recorder: rec}
 	nw := vipNetwork(ns, "default")
 	prefix := netip.MustParsePrefix("10.10.3.80/28")
 	byHand(t, g, netbox.IPAddresses, map[string]any{"address": "10.10.3.90/22", "status": "active"})
@@ -149,11 +158,13 @@ func TestReserveVIPPreferred(t *testing.T) {
 	g.Expect(err).NotTo(HaveOccurred())
 	g.Expect(vip.String()).To(Equal("10.10.3.85"))
 	g.Expect(vipsOf(g, ns, "default")).To(HaveLen(1))
+	g.Expect(emitted(rec)).To(ConsistOf("Normal VIPReserved Reserved the control plane VIP 10.10.3.85/22"))
 
 	vip, err = r.reserveVIP(ctx, nw, prefix, netip.MustParseAddr("10.10.3.86"), true)
 	g.Expect(err).NotTo(HaveOccurred())
 	g.Expect(vip.String()).To(Equal("10.10.3.85"))
 	g.Expect(vipsOf(g, ns, "default")).To(HaveLen(1))
+	g.Expect(emitted(rec)).To(BeEmpty(), "no change in NetBox, no event")
 }
 
 func TestPreferredVIP(t *testing.T) {
@@ -174,8 +185,6 @@ func TestSyncClusterEndpoint(t *testing.T) {
 	cluster := func(ep clusterv1.APIEndpoint) *clusterv1.Cluster {
 		return &clusterv1.Cluster{ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "ns"}, Spec: clusterv1.ClusterSpec{ControlPlaneEndpoint: ep}}
 	}
-	paused := cluster(clusterv1.APIEndpoint{})
-	paused.Spec.Paused = ptr.To(true)
 	for name, tc := range map[string]struct {
 		cluster *clusterv1.Cluster
 		vipErr  error
@@ -185,11 +194,11 @@ func TestSyncClusterEndpoint(t *testing.T) {
 		"no cluster":    {reason: v1alpha1.ReasonWaitingForCluster},
 		"vip failed":    {cluster: cluster(clusterv1.APIEndpoint{}), vipErr: retryLater(v1alpha1.ReasonExhausted, errors.New("none")), reason: v1alpha1.ReasonExhausted},
 		"empty":         {cluster: cluster(clusterv1.APIEndpoint{}), want: clusterv1.APIEndpoint{Host: vip.Host, Port: vip.Port}},
-		"port only":     {cluster: cluster(clusterv1.APIEndpoint{Port: 8443}), want: clusterv1.APIEndpoint{Host: vip.Host, Port: vip.Port}},
-		"paused":        {cluster: paused, reason: v1alpha1.ReasonWaitingForCluster},
+		"port only":     {cluster: cluster(clusterv1.APIEndpoint{Port: 8443}), want: clusterv1.APIEndpoint{Host: vip.Host, Port: 8443}},
+		"host only":     {cluster: cluster(clusterv1.APIEndpoint{Host: vip.Host}), want: clusterv1.APIEndpoint{Host: vip.Host, Port: 6443}},
 		"already there": {cluster: cluster(clusterv1.APIEndpoint{Host: vip.Host, Port: vip.Port}), want: clusterv1.APIEndpoint{Host: vip.Host, Port: vip.Port}},
 		"other host":    {cluster: cluster(clusterv1.APIEndpoint{Host: "10.10.0.5", Port: 6443}), reason: v1alpha1.ReasonEndpointConflict, want: clusterv1.APIEndpoint{Host: "10.10.0.5", Port: 6443}},
-		"other port":    {cluster: cluster(clusterv1.APIEndpoint{Host: vip.Host, Port: 8443}), reason: v1alpha1.ReasonEndpointConflict, want: clusterv1.APIEndpoint{Host: vip.Host, Port: 8443}},
+		"other port":    {cluster: cluster(clusterv1.APIEndpoint{Host: vip.Host, Port: 8443}), want: clusterv1.APIEndpoint{Host: vip.Host, Port: 8443}},
 		"dns name":      {cluster: cluster(clusterv1.APIEndpoint{Host: "api.example", Port: 6443}), reason: v1alpha1.ReasonEndpointConflict, want: clusterv1.APIEndpoint{Host: "api.example", Port: 6443}},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -220,4 +229,207 @@ func TestSyncClusterEndpoint(t *testing.T) {
 			g.Expect(got.Spec.ControlPlaneEndpoint).To(Equal(tc.want))
 		})
 	}
+}
+
+func TestEndpointFor(t *testing.T) {
+	const vip = "10.10.0.126"
+	ep := func(host string, port int32) clusterv1.APIEndpoint {
+		return clusterv1.APIEndpoint{Host: host, Port: port}
+	}
+	for name, tc := range map[string]struct {
+		cluster  clusterv1.APIEndpoint
+		specPort int32
+		patch    clusterv1.APIEndpoint // zero: the Cluster is left as it is
+		port     int32                 // of the status
+		conflict bool
+	}{
+		"empty":                    {patch: ep(vip, 6443), port: 6443},
+		"empty, spec port":         {specPort: 443, patch: ep(vip, 443), port: 443},
+		"port only":                {cluster: ep("", 443), patch: ep(vip, 443), port: 443},
+		"port only, spec port":     {cluster: ep("", 443), specPort: 6443, port: 6443, conflict: true},
+		"host only":                {cluster: ep(vip, 0), patch: ep(vip, 6443), port: 6443},
+		"other host only":          {cluster: ep("10.10.0.5", 0), port: 6443, conflict: true},
+		"the VIP":                  {cluster: ep(vip, 6443), port: 6443},
+		"other host":               {cluster: ep("10.10.0.5", 6443), port: 6443, conflict: true},
+		"dns name, port only kept": {cluster: ep("api.example", 443), port: 443, conflict: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			g := NewWithT(t)
+			nw := vipNetwork("ns", "default")
+			nw.Spec.ControlPlaneEndpoint.Port = tc.specPort
+			cluster := &clusterv1.Cluster{Spec: clusterv1.ClusterSpec{ControlPlaneEndpoint: tc.cluster}}
+			want, err := endpointFor(nw, cluster, netip.MustParseAddr(vip))
+			g.Expect(want.Port).To(Equal(tc.port))
+			if tc.conflict {
+				g.Expect(errReason(err)).To(Equal(v1alpha1.ReasonEndpointConflict))
+				return
+			}
+			g.Expect(err).NotTo(HaveOccurred())
+			if tc.patch.IsZero() {
+				g.Expect(want).To(Equal(tc.cluster))
+			} else {
+				g.Expect(want).To(Equal(tc.patch))
+			}
+		})
+	}
+	g := NewWithT(t)
+	want, err := endpointFor(vipNetwork("ns", "default"), nil, netip.MustParseAddr(vip))
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(want).To(Equal(ep(vip, 6443)), "no Cluster yet")
+}
+
+// A Cluster with a host only gets the port; the host is never changed.
+func TestEndpointPartialHostOnly(t *testing.T) {
+	g := newG(t)
+	ns := newEnv(t, nil)
+	setClusterEndpoint(t, ns, "10.10.3.100", 0)
+	nw := adoptedNetwork(ns, "10.10.3.96/28")
+	nw.Spec.ControlPlaneEndpoint = &v1alpha1.ControlPlaneEndpoint{}
+	g.Expect(k8s.Create(ctx, nw)).To(Succeed())
+	waitTypedCondition(g, nw, v1alpha1.ControlPlaneEndpointReadyCondition, metav1.ConditionTrue, v1alpha1.ReasonReady)
+	g.Expect(nw.Status.ControlPlaneEndpoint).To(Equal(v1alpha1.APIEndpoint{Host: "10.10.3.100", Port: 6443}))
+	g.Expect(clusterEndpointOf(g, ns)).To(Equal(clusterv1.APIEndpoint{Host: "10.10.3.100", Port: 6443}))
+}
+
+// A Cluster with a port only, as CAPI copies it from the infrastructure cluster, gets the VIP and keeps its port.
+func TestEndpointPartialPortOnly(t *testing.T) {
+	g := newG(t)
+	ns := newEnv(t, nil)
+	setClusterEndpoint(t, ns, "", 443)
+	nw := vipNetwork(ns, "default")
+	g.Expect(k8s.Create(ctx, nw)).To(Succeed())
+	waitTypedCondition(g, nw, v1alpha1.ControlPlaneEndpointReadyCondition, metav1.ConditionTrue, v1alpha1.ReasonReady)
+	g.Expect(nw.Status.ControlPlaneEndpoint.Port).To(Equal(int32(443)))
+	g.Expect(clusterEndpointOf(g, ns)).To(Equal(clusterv1.APIEndpoint{Host: nw.Status.ControlPlaneEndpoint.Host, Port: 443}))
+}
+
+// A VIP whose address an older NetBox object took at the same time is deleted; the next pick avoids it.
+func TestVIPDuplicate(t *testing.T) {
+	g := newG(t)
+	ns := newEnv(t, nil)
+	var once sync.Once
+	beforeVIPCreate = func() {
+		once.Do(func() {
+			// The highest usable address of 10.10.3.96/28: the one the VIP takes.
+			_, err := admin.Create(ctx, netbox.IPAddresses, map[string]any{
+				"address": "10.10.3.111/22", "status": "active", "role": "vip", "custom_fields": map[string]any{netbox.FieldCluster: ns},
+			})
+			if err != nil {
+				t.Error(err)
+			}
+		})
+	}
+	t.Cleanup(func() { beforeVIPCreate = func() {} })
+
+	nw := adoptedNetwork(ns, "10.10.3.96/28")
+	nw.Spec.ControlPlaneEndpoint = &v1alpha1.ControlPlaneEndpoint{}
+	g.Expect(k8s.Create(ctx, nw)).To(Succeed())
+	waitTypedCondition(g, nw, v1alpha1.ControlPlaneEndpointReadyCondition, metav1.ConditionFalse, v1alpha1.ReasonEndpointConflict)
+	g.Expect(meta.FindStatusCondition(nw.Status.Conditions, v1alpha1.ControlPlaneEndpointReadyCondition).Message).To(ContainSubstring("10.10.3.111 is also held by NetBox address #"))
+	g.Expect(vipsOf(g, ns, "default")).To(BeEmpty())
+	g.Expect(nw.Status.ControlPlaneEndpoint).To(BeZero())
+
+	touch(g, nw)
+	waitTypedCondition(g, nw, v1alpha1.ControlPlaneEndpointReadyCondition, metav1.ConditionTrue, v1alpha1.ReasonReady)
+	g.Expect(nw.Status.ControlPlaneEndpoint.Host).To(Equal("10.10.3.110"))
+	vips := vipsOf(g, ns, "default")
+	g.Expect(vips).To(HaveLen(1))
+	g.Expect(vips[0].Address).To(Equal("10.10.3.110/22"))
+}
+
+// A Cluster changed under the endpoint patch is read again at once; the condition is left as it was.
+// Metadata is synced as usual, and an unexpected error of it goes back to controller-runtime.
+func TestClusterPatchConflictQuiet(t *testing.T) {
+	for name, tags := range map[string][]string{"metadata synced": nil, "metadata fails": {"capi"}} {
+		t.Run(name, func(t *testing.T) {
+			g := NewWithT(t)
+			scheme := runtime.NewScheme()
+			g.Expect(v1alpha1.AddToScheme(scheme)).To(Succeed())
+			g.Expect(clusterv1.AddToScheme(scheme)).To(Succeed())
+			nw := vipNetwork("ns", "default")
+			nw.Spec.ClusterName, nw.Spec.Tags = "ns", tags
+			nw.Finalizers = []string{networkFinalizer}
+			nw.Status.Conditions = []metav1.Condition{
+				{Type: clusterv1.PausedCondition, Status: metav1.ConditionFalse, Reason: clusterv1.NotPausedReason},
+				{Type: v1alpha1.ControlPlaneEndpointReadyCondition, Status: metav1.ConditionFalse, Reason: v1alpha1.ReasonWaitingForCluster, Message: "before"},
+				{Type: v1alpha1.MetadataSyncedCondition, Status: metav1.ConditionUnknown, Reason: v1alpha1.ReasonWaitingForPrefix},
+			}
+			cluster := &clusterv1.Cluster{ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "ns"}, Spec: clusterv1.ClusterSpec{Paused: ptr.To(false)}}
+			c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(nw, cluster).WithStatusSubresource(nw).
+				WithInterceptorFuncs(interceptor.Funcs{Patch: func(ctx context.Context, c client.WithWatch, obj client.Object, p client.Patch, opts ...client.PatchOption) error {
+					if _, ok := obj.(*clusterv1.Cluster); ok {
+						return apierrors.NewConflict(clusterv1.GroupVersion.WithResource("clusters").GroupResource(), obj.GetName(), errors.New("changed"))
+					}
+					return c.Patch(ctx, obj, p, opts...)
+				}}).Build()
+			var writes []string
+			r := networkOn(networkNetBox(t, 1<<30, &writes))
+			r.Client = c
+
+			res, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(nw)})
+			g.Expect(c.Get(ctx, client.ObjectKeyFromObject(nw), nw)).To(Succeed())
+			synced := meta.FindStatusCondition(nw.Status.Conditions, v1alpha1.MetadataSyncedCondition)
+			if tags == nil {
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(res).To(Equal(ctrl.Result{Requeue: true})) //nolint:staticcheck // the result under test
+				g.Expect(synced.Status).To(Equal(metav1.ConditionTrue))
+			} else {
+				g.Expect(err).To(MatchError(ContainSubstring("HTTP 500")), "requeued with back-off and logged")
+				g.Expect(res).To(BeZero())
+				g.Expect(synced.Reason).To(Equal(v1alpha1.ReasonNetBoxError))
+			}
+			cond := meta.FindStatusCondition(nw.Status.Conditions, v1alpha1.ControlPlaneEndpointReadyCondition)
+			g.Expect(cond.Reason).To(Equal(v1alpha1.ReasonWaitingForCluster))
+			g.Expect(cond.Message).To(Equal("before"))
+			g.Expect(meta.IsStatusConditionTrue(nw.Status.Conditions, v1alpha1.ReadyCondition)).To(BeTrue())
+		})
+	}
+}
+
+// A VIP found by ref is checked for a duplicate while the status does not have it yet, as when the check after
+// its create failed or after a move; once the status has it, it is not checked again. Only an older object
+// makes it give way: a long-lived VIP is never deleted for a newer one.
+func TestVIPDuplicateCheckedUntilInStatus(t *testing.T) {
+	g := NewWithT(t)
+	var lists, deletes, other atomic.Int32
+	other.Store(9)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		switch {
+		case r.Method == http.MethodDelete:
+			deletes.Add(1)
+			w.WriteHeader(http.StatusNoContent)
+		case q.Has("address"):
+			lists.Add(1)
+			_, _ = io.WriteString(w, `{"results":[`+networkVIP+`,{"id":`+strconv.Itoa(int(other.Load()))+`,"address":"10.10.0.31/22","role":{"value":"vip"}}]}`)
+		case q.Has("owner_id"):
+			_, _ = io.WriteString(w, `{"results":[`+networkVIP+`]}`)
+		default:
+			_, _ = io.WriteString(w, `{"results":[]}`)
+		}
+	}))
+	defer srv.Close()
+	r := networkOn(srv)
+	prefix := netip.MustParsePrefix("10.10.0.16/28")
+
+	nw := vipNetwork("ns", "default")
+	nw.Status.ControlPlaneEndpoint = v1alpha1.APIEndpoint{Host: "10.10.0.31", Port: 6443}
+	vip, err := r.reserveVIP(ctx, nw, prefix, netip.Addr{}, true)
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(vip.String()).To(Equal("10.10.0.31"))
+	g.Expect(lists.Load()).To(BeZero(), "the status has the VIP: no check")
+
+	nw.Status.ControlPlaneEndpoint = v1alpha1.APIEndpoint{}
+	vip, err = r.reserveVIP(ctx, nw, prefix, netip.Addr{}, true)
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(vip.String()).To(Equal("10.10.0.31"))
+	g.Expect(lists.Load()).To(Equal(int32(1)))
+	g.Expect(deletes.Load()).To(BeZero(), "the other object is newer: ours is kept")
+
+	other.Store(1)
+	_, err = r.reserveVIP(ctx, nw, prefix, netip.Addr{}, true)
+	g.Expect(errReason(err)).To(Equal(v1alpha1.ReasonEndpointConflict))
+	g.Expect(err.Error()).To(ContainSubstring("10.10.0.31 is also held by NetBox address #1"))
+	g.Expect(lists.Load()).To(Equal(int32(2)))
+	g.Expect(deletes.Load()).To(Equal(int32(1)), "the other object is older: ours is deleted")
 }

@@ -24,13 +24,14 @@ import (
 	"sync"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/tools/events"
 	ipamv1 "sigs.k8s.io/cluster-api/api/ipam/v1beta2"
 	clusterctlv1 "sigs.k8s.io/cluster-api/cmd/clusterctl/api/v1alpha3"
-	"sigs.k8s.io/cluster-api/util/annotations"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
@@ -58,10 +59,41 @@ var clusterEvents = predicate.Or(
 
 // netBoxWrites serialises the NetBox sections that check, then create or change address space: NetBox checks
 // range overlap and IP and prefix uniqueness in clean(), without a lock, so two parallel writes can both pass.
-// Held only around NetBox calls and cache reads, taken once per operation, never nested.
+// Held only while a section writes, taken once per operation, never nested; reads run first without it (underLock).
 // ponytail: one process (leader election); management planes with other owners that share a parent are not covered.
 // Upgrade: per-parent locks if it throttles, a lock or constraint in NetBox for many planes.
 var netBoxWrites sync.Mutex
+
+// netBoxWriteTimeout bounds a section under netBoxWrites, so a slow NetBox cannot hold every reconcile for long.
+const netBoxWriteTimeout = 30 * time.Second
+
+// underLock runs op on a read-only NetBox client without the lock; only when op has something to write
+// it runs again on nb under netBoxWrites. Steady-state reconciles never wait for the lock.
+// op reads everything anew on each run and leaves no trace of a run that stopped at ErrWriteNeeded.
+// A result that depends on a read racing with a write of ours is not final on the first pass: op returns
+// ErrWriteNeeded for it, so that the locked pass decides.
+func underLock(ctx context.Context, nb *netbox.Client, op func(context.Context, *netbox.Client) error) error {
+	if err := op(ctx, nb.ReadOnly()); !errors.Is(err, netbox.ErrWriteNeeded) {
+		return err
+	}
+	return locked(ctx, nb, op)
+}
+
+// locked runs op on nb under netBoxWrites, within netBoxWriteTimeout.
+func locked(ctx context.Context, nb *netbox.Client, op func(context.Context, *netbox.Client) error) error {
+	start := time.Now()
+	netBoxWrites.Lock()
+	defer netBoxWrites.Unlock()
+	lockWait.Observe(time.Since(start).Seconds())
+	ctx, cancel := context.WithTimeout(ctx, netBoxWriteTimeout)
+	defer cancel()
+	return op(ctx, nb)
+}
+
+// normalEvent records a change the provider made in NetBox as a Normal Event on obj.
+func normalEvent(rec events.EventRecorder, obj runtime.Object, reason, note string, args ...any) {
+	rec.Eventf(obj, nil, corev1.EventTypeNormal, reason, "Reconcile", note, args...)
+}
 
 // refOf is the key of a Kubernetes object in NetBox. Unlike the UID it survives clusterctl move.
 func refOf(kind string, o client.Object) string {
@@ -208,21 +240,6 @@ func goneWhenDeleting(obj client.Object, err error) error {
 func deletedForMove(o client.Object) bool {
 	_, ok := o.GetAnnotations()[clusterctlv1.DeleteForMoveAnnotation]
 	return ok
-}
-
-// isPaused reports whether obj or its Cluster is paused, as CAPI controllers check it.
-func isPaused(ctx context.Context, c client.Client, obj client.Object, clusterName string) (bool, error) {
-	if annotations.HasPaused(obj) {
-		return true, nil
-	}
-	if clusterName == "" {
-		return false, nil
-	}
-	cluster := &clusterv1.Cluster{}
-	if err := c.Get(ctx, client.ObjectKey{Namespace: obj.GetNamespace(), Name: clusterName}, cluster); err != nil {
-		return false, client.IgnoreNotFound(err)
-	}
-	return annotations.IsPaused(cluster, obj), nil
 }
 
 const poolRefField = "spec.poolRef.netboxIPPool"

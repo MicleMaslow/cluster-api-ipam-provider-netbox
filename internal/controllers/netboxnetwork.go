@@ -25,15 +25,20 @@ import (
 	"net/url"
 	"path"
 	"slices"
+	"strings"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	kerrors "k8s.io/apimachinery/pkg/util/errors"
+	"k8s.io/client-go/tools/events"
+	"k8s.io/klog/v2"
 	"k8s.io/utils/ptr"
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
-	"sigs.k8s.io/cluster-api/util/annotations"
+	"sigs.k8s.io/cluster-api/util/labels"
 	"sigs.k8s.io/cluster-api/util/patch"
+	"sigs.k8s.io/cluster-api/util/paused"
 	"sigs.k8s.io/cluster-api/util/predicates"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
@@ -69,6 +74,7 @@ type NetBoxNetworkReconciler struct {
 	NetBox           *netbox.Client
 	Owner            netbox.Owner
 	WatchFilterValue string
+	Recorder         events.EventRecorder
 }
 
 // +kubebuilder:rbac:groups=ipam.cluster.x-k8s.io,resources=netboxnetworks,verbs=get;list;watch;update;patch
@@ -127,11 +133,19 @@ func (r *NetBoxNetworkReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	if err := r.Get(ctx, req.NamespacedName, nw); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
-	if paused, err := isPaused(ctx, r.Client, nw, nw.Spec.ClusterName); err != nil || paused {
+	if r.WatchFilterValue != "" && !labels.HasWatchLabel(nw, r.WatchFilterValue) {
+		return ctrl.Result{}, nil
+	}
+	cluster, err := r.getCluster(ctx, nw)
+	if err != nil {
 		return ctrl.Result{}, err
 	}
+	// The helper comes first: a Paused condition that only lags the generation is set in memory, for it to write.
 	helper, err := patch.NewHelper(nw, r.Client)
 	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if isPaused, requeue, err := paused.EnsurePausedCondition(ctx, r.Client, cluster, nw); err != nil || isPaused || requeue {
 		return ctrl.Result{}, err
 	}
 	defer func() {
@@ -140,20 +154,24 @@ func (r *NetBoxNetworkReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		}
 	}()
 	if !nw.DeletionTimestamp.IsZero() {
-		err = r.reconcileDelete(ctx, nw)
+		err = r.reconcileDelete(ctx, nw, cluster)
 		setDeleting(&nw.Status.Conditions, nw.Generation, err)
 		return toResult(err)
 	}
 	if controllerutil.AddFinalizer(nw, networkFinalizer) {
 		return ctrl.Result{}, nil
 	}
-	var cluster *clusterv1.Cluster
 	if nw.Spec.ControlPlaneEndpoint == nil {
 		meta.RemoveStatusCondition(&nw.Status.Conditions, v1alpha1.ControlPlaneEndpointReadyCondition)
-	} else if cluster, err = r.getCluster(ctx, nw); err != nil {
-		return ctrl.Result{}, err
 	}
-	vipErr, err := r.reconcileNormal(ctx, nw, cluster)
+	var vipErr error
+	if cluster == nil && nw.Status.PrefixID == 0 {
+		// Nothing reaches NetBox before the Cluster: after a move or restore the status is gone, and until the Cluster
+		// exists (and is unpaused) nw must not act; the Cluster may also come with an endpoint of its own. The Cluster watch wakes nw.
+		err = waitFor(v1alpha1.ReasonWaitingForCluster, fmt.Errorf("cluster %s does not exist", nw.Spec.ClusterName))
+	} else {
+		vipErr, err = r.reconcileNormal(ctx, nw, cluster)
+	}
 	setReady(&nw.Status.Conditions, nw.Generation, err)
 	if err != nil {
 		setWaitingForPrefix(nw, v1alpha1.MetadataSyncedCondition)
@@ -164,14 +182,22 @@ func (r *NetBoxNetworkReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	}
 	if nw.Spec.ControlPlaneEndpoint != nil {
 		vipErr = r.syncClusterEndpoint(ctx, nw, cluster, vipErr)
-		setCondition(&nw.Status.Conditions, v1alpha1.ControlPlaneEndpointReadyCondition, v1alpha1.ReasonReady, nw.Generation, vipErr)
+		if !errors.Is(vipErr, errClusterChanged) {
+			setCondition(&nw.Status.Conditions, v1alpha1.ControlPlaneEndpointReadyCondition, v1alpha1.ReasonReady, nw.Generation, vipErr)
+		}
 	}
 	err = r.syncMetadata(ctx, nw, nw.Status.PrefixID)
 	setCondition(&nw.Status.Conditions, v1alpha1.MetadataSyncedCondition, v1alpha1.ReasonSynced, nw.Generation, err)
+	if errors.Is(vipErr, errClusterChanged) {
+		if _, err := toResult(err); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{Requeue: true}, nil //nolint:staticcheck // rate-limited: a Cluster that keeps changing backs off
+	}
 	return toResult(foldErrors([]error{vipErr, err}))
 }
 
-// getCluster returns the Cluster of nw from the cache, or nil if there is none yet.
+// getCluster returns the Cluster of nw from the cache, or nil if there is none.
 func (r *NetBoxNetworkReconciler) getCluster(ctx context.Context, nw *v1alpha1.NetBoxNetwork) (*clusterv1.Cluster, error) {
 	cluster := &clusterv1.Cluster{}
 	if err := r.Get(ctx, client.ObjectKey{Namespace: nw.Namespace, Name: nw.Spec.ClusterName}, cluster); err != nil {
@@ -187,10 +213,32 @@ func hostOf(cluster *clusterv1.Cluster) string {
 	return cluster.Spec.ControlPlaneEndpoint.Host
 }
 
-// syncClusterEndpoint sets the endpoint of the Cluster to the VIP once, while it has no host or no port
-// (CAPI copies a port alone from the infrastructure cluster).
+// endpointFor is the endpoint the Cluster must have for vip; the status reports it too. The parts the Cluster has
+// are kept, the empty ones filled: host vip, port spec.port, else 6443 (CAPI copies a port alone from the
+// infrastructure cluster). A host other than vip, or a port other than spec.port, is a conflict: never overwritten.
+func endpointFor(nw *v1alpha1.NetBoxNetwork, cluster *clusterv1.Cluster, vip netip.Addr) (want clusterv1.APIEndpoint, conflict error) {
+	var cur clusterv1.APIEndpoint
+	if cluster != nil {
+		cur = cluster.Spec.ControlPlaneEndpoint
+	}
+	port := nw.Spec.ControlPlaneEndpoint.Port
+	want = clusterv1.APIEndpoint{Host: vip.String(), Port: cmp.Or(port, cur.Port, defaultAPIPort)}
+	switch {
+	case cur.Host != "" && cur.Host != want.Host:
+		conflict = fmt.Errorf("cluster %s has endpoint host %s, the VIP is %s", nw.Spec.ClusterName, cur.Host, want.Host)
+	case cur.Port != 0 && cur.Port != want.Port:
+		conflict = fmt.Errorf("cluster %s has endpoint port %d, spec.controlPlaneEndpoint.port is %d", nw.Spec.ClusterName, cur.Port, port)
+	default:
+		return want, nil
+	}
+	return want, retryLater(v1alpha1.ReasonEndpointConflict, conflict)
+}
+
+// errClusterChanged is a Cluster changed since it was read: it is read again at once and the condition stays.
+var errClusterChanged = errors.New("the cluster changed since it was read")
+
+// syncClusterEndpoint fills the empty parts of the Cluster endpoint (endpointFor).
 // Its result is ControlPlaneEndpointReady: nil only when the VIP is reserved and the Cluster has it.
-// Any other endpoint is a conflict and the Cluster is left alone.
 func (r *NetBoxNetworkReconciler) syncClusterEndpoint(ctx context.Context, nw *v1alpha1.NetBoxNetwork, cluster *clusterv1.Cluster, vipErr error) error {
 	if vipErr != nil {
 		return vipErr
@@ -198,19 +246,22 @@ func (r *NetBoxNetworkReconciler) syncClusterEndpoint(ctx context.Context, nw *v
 	if cluster == nil {
 		return waitFor(v1alpha1.ReasonWaitingForCluster, fmt.Errorf("cluster %s not found", nw.Spec.ClusterName))
 	}
-	ep, cur := nw.Status.ControlPlaneEndpoint, cluster.Spec.ControlPlaneEndpoint
-	switch {
-	case cur.Host == ep.Host && cur.Port == ep.Port:
-		return nil
-	case cur.IsValid():
-		return retryLater(v1alpha1.ReasonEndpointConflict, fmt.Errorf("cluster %s has endpoint %s, the VIP is %s:%d", cluster.Name, cur.String(), ep.Host, ep.Port))
-	case annotations.IsPaused(cluster, nw):
-		return waitFor(v1alpha1.ReasonWaitingForCluster, fmt.Errorf("cluster %s is paused", cluster.Name))
+	vip, err := netip.ParseAddr(nw.Status.ControlPlaneEndpoint.Host)
+	if err != nil {
+		return err
+	}
+	want, err := endpointFor(nw, cluster, vip)
+	if err != nil || want == cluster.Spec.ControlPlaneEndpoint {
+		return err
 	}
 	before := cluster.DeepCopy()
-	cluster.Spec.ControlPlaneEndpoint = clusterv1.APIEndpoint{Host: ep.Host, Port: ep.Port}
+	cluster.Spec.ControlPlaneEndpoint = want
 	// The lock keeps an endpoint that was set meanwhile, e.g. copied from the infrastructure cluster.
-	if err := r.Patch(ctx, cluster, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{})); err != nil {
+	err = r.Patch(ctx, cluster, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{}))
+	switch {
+	case apierrors.IsConflict(err):
+		return errClusterChanged
+	case err != nil:
 		return apiError(err)
 	}
 	return nil
@@ -227,8 +278,23 @@ func setWaitingForPrefix(nw *v1alpha1.NetBoxNetwork, condType string) {
 // reconcileNormal brings the prefix to NetBox, then the VIP. The prefix decides Ready (err); a VIP that
 // cannot be reserved is vipErr and leaves Ready alone, so adding a VIP to a live network stops no pool.
 func (r *NetBoxNetworkReconciler) reconcileNormal(ctx context.Context, nw *v1alpha1.NetBoxNetwork, cluster *clusterv1.Cluster) (vipErr, err error) {
-	netBoxWrites.Lock()
-	defer netBoxWrites.Unlock()
+	before := nw.Status.DeepCopy()
+	err = underLock(ctx, r.NetBox, func(ctx context.Context, nb *netbox.Client) error {
+		rr := *r
+		rr.NetBox = nb
+		var perr error
+		vipErr, perr = rr.prefixAndVIP(ctx, nw, cluster)
+		if werr := errors.Join(perr, vipErr); errors.Is(werr, netbox.ErrWriteNeeded) {
+			nw.Status = *before // the locked pass starts from what the first one found
+			return werr
+		}
+		return perr
+	})
+	return vipErr, err
+}
+
+// prefixAndVIP is the section of reconcileNormal that underLock runs.
+func (r *NetBoxNetworkReconciler) prefixAndVIP(ctx context.Context, nw *v1alpha1.NetBoxNetwork, cluster *clusterv1.Cluster) (vipErr, err error) {
 	prefix, err := r.reconcilePrefix(ctx, nw)
 	if err != nil {
 		return nil, err
@@ -241,7 +307,8 @@ func (r *NetBoxNetworkReconciler) reconcileNormal(ctx context.Context, nw *v1alp
 	if err != nil {
 		return err, nil
 	}
-	nw.Status.ControlPlaneEndpoint = v1alpha1.APIEndpoint{Host: vip.String(), Port: cmp.Or(nw.Spec.ControlPlaneEndpoint.Port, defaultAPIPort)}
+	ep, _ := endpointFor(nw, cluster, vip) // a conflict is syncClusterEndpoint's to report
+	nw.Status.ControlPlaneEndpoint = v1alpha1.APIEndpoint{Host: ep.Host, Port: ep.Port}
 	return nil, nil
 }
 
@@ -257,7 +324,7 @@ func preferredVIP(nw *v1alpha1.NetBoxNetwork, clusterHost string, prefix netip.P
 	return netip.Addr{}
 }
 
-// reconcilePrefix finds, carves or adopts the prefix of nw and records it in the status. The caller holds netBoxWrites.
+// reconcilePrefix finds, carves or adopts the prefix of nw and records it in the status.
 func (r *NetBoxNetworkReconciler) reconcilePrefix(ctx context.Context, nw *v1alpha1.NetBoxNetwork) (netip.Prefix, error) {
 	parent, err := netip.ParsePrefix(nw.Spec.ParentPrefix)
 	if err != nil {
@@ -273,6 +340,15 @@ func (r *NetBoxNetworkReconciler) reconcilePrefix(ctx context.Context, nw *v1alp
 	if err != nil {
 		return netip.Prefix{}, err
 	}
+	// A prefix retained by a deleted network of this name that does not fit the spec gives way to a new one.
+	if len(found) == 1 && nw.Spec.Prefix == "" && nw.Status.PrefixID == 0 && found[0].Status.Value == "deprecated" {
+		if _, err := checkPrefix(nw, parent, found[0].Prefix); err != nil {
+			if err := r.retire(ctx, nw, netbox.Prefixes, found[0], ref, "PrefixRetired"); err != nil {
+				return netip.Prefix{}, err
+			}
+			found = nil
+		}
+	}
 	var p netbox.Object
 	switch len(found) {
 	case 0:
@@ -282,9 +358,19 @@ func (r *NetBoxNetworkReconciler) reconcilePrefix(ctx context.Context, nw *v1alp
 		if nw.Status.PrefixID != 0 || nw.Status.Prefix != "" {
 			return netip.Prefix{}, retryLater(v1alpha1.ReasonPrefixNotFound, fmt.Errorf("NetBox prefix %s of %s is gone, restore it", nw.Status.Prefix, ref))
 		}
+		// A live VIP means a live network whose status was lost; a retained one is deprecated.
+		vips, err := r.NetBox.FindByRef(ctx, netbox.IPAddresses, r.Owner, vipRef(nw))
+		if err != nil {
+			return netip.Prefix{}, err
+		}
+		if slices.ContainsFunc(vips, func(o netbox.Object) bool { return o.Status.Value != "deprecated" }) {
+			return netip.Prefix{}, retryLater(v1alpha1.ReasonPrefixNotFound, fmt.Errorf("the VIP of %s is in NetBox, the prefix is gone; restore it", ref))
+		}
 		if p, err = r.acquire(ctx, nw, ref, parent); err != nil {
 			return netip.Prefix{}, err
 		}
+		ctrl.LoggerFrom(ctx).Info("Acquired the NetBox prefix", "network", klog.KObj(nw), "prefix", p.Prefix, "id", p.ID)
+		normalEvent(r.Recorder, nw, "PrefixAcquired", "Acquired the NetBox prefix %s", p.Prefix)
 	case 1:
 		p = found[0]
 	default:
@@ -306,6 +392,23 @@ func (r *NetBoxNetworkReconciler) reconcilePrefix(ctx context.Context, nw *v1alp
 	}
 	nw.Status.Prefix, nw.Status.PrefixID, nw.Status.AddressPrefixLength = cidr.String(), p.ID, int32(l2.Bits())
 	return cidr, nil
+}
+
+// retiredRef is the key a retained object moves to when it does not fit the spec of a new network of its name.
+func retiredRef(ref string) string { return ref + "/retired" }
+
+// retire moves o, retained by a deleted network of nw's name, to retiredRef, so that a new object takes ref.
+// capi_cluster stays: the clean-up of the cluster finds it.
+func (r *NetBoxNetworkReconciler) retire(ctx context.Context, nw *v1alpha1.NetBoxNetwork, path string, o netbox.Object, ref, reason string) error {
+	if _, err := r.NetBox.Patch(ctx, path, o.ID, "", map[string]any{
+		"custom_fields": map[string]any{netbox.FieldRef: retiredRef(ref)}, "changelog_message": "capi: retired by " + refOf("NetBoxNetwork", nw),
+	}); err != nil {
+		return err
+	}
+	addr := cmp.Or(o.Prefix, o.Address)
+	ctrl.LoggerFrom(ctx).Info("Retired a retained NetBox object that does not fit the spec", "network", klog.KObj(nw), "address", addr, "id", o.ID, "ref", retiredRef(ref))
+	normalEvent(r.Recorder, nw, reason, "Retired %s: retained by a deleted network, it does not fit the spec", addr)
+	return nil
 }
 
 // syncMetadata applies spec.customFields and spec.tags to the prefix in one update; If-Match keeps concurrent edits.
@@ -404,10 +507,10 @@ func (r *NetBoxNetworkReconciler) adopt(ctx context.Context, ref, cidr string, p
 }
 
 // heldBy returns the ref of another object the prefix is bound to.
-// A deprecated prefix is free to adopt, but only from the namespace of ref.
+// A deprecated prefix, retired ones included, is free to adopt, but only from the namespace of ref.
 func heldBy(o netbox.Object, ref string) string {
 	got := o.Ref()
-	if got == ref || o.Status.Value == "deprecated" && path.Dir(got) == path.Dir(ref) {
+	if got == ref || o.Status.Value == "deprecated" && strings.HasPrefix(got, path.Dir(ref)+"/") {
 		return ""
 	}
 	return got
@@ -431,7 +534,7 @@ func checkPrefix(nw *v1alpha1.NetBoxNetwork, parent netip.Prefix, got string) (n
 	return p, nil
 }
 
-func (r *NetBoxNetworkReconciler) reconcileDelete(ctx context.Context, nw *v1alpha1.NetBoxNetwork) error {
+func (r *NetBoxNetworkReconciler) reconcileDelete(ctx context.Context, nw *v1alpha1.NetBoxNetwork, cluster *clusterv1.Cluster) error {
 	if deletedForMove(nw) {
 		controllerutil.RemoveFinalizer(nw, networkFinalizer)
 		return nil
@@ -445,6 +548,10 @@ func (r *NetBoxNetworkReconciler) reconcileDelete(ctx context.Context, nw *v1alp
 			return waitFor(v1alpha1.ReasonWaitingForPools, fmt.Errorf("network is still used by NetBoxIPPool %s", pools.Items[i].Name))
 		}
 	}
+	// A deleted VIP could go to another cluster while this one still serves on it; a retained one is never handed out.
+	if vip := nw.Status.ControlPlaneEndpoint.Host; nw.Spec.DeletionPolicy == v1alpha1.DeletionPolicyDelete && vip != "" && hostOf(cluster) == vip {
+		return waitFor(v1alpha1.ReasonWaitingForCluster, fmt.Errorf("cluster %s still uses the VIP %s", nw.Spec.ClusterName, vip))
+	}
 	ref := refOf("NetBoxNetwork", nw)
 	found, err := r.NetBox.FindByRef(ctx, netbox.Prefixes, r.Owner, ref)
 	if err != nil {
@@ -452,20 +559,27 @@ func (r *NetBoxNetworkReconciler) reconcileDelete(ctx context.Context, nw *v1alp
 	}
 	released := "capi: released by " + ref
 	for _, p := range found {
+		policy := nw.Spec.DeletionPolicy
 		switch {
 		case nw.Spec.Prefix != "":
 			// An adopted prefix is only let go: its status, tags and other custom fields stay.
+			policy = v1alpha1.DeletionPolicyRetain
 			_, err = r.NetBox.Patch(ctx, netbox.Prefixes, p.ID, "", map[string]any{
 				"custom_fields": map[string]any{netbox.FieldRef: nil, netbox.FieldCluster: nil}, "changelog_message": released,
 			})
 		case nw.Spec.DeletionPolicy == v1alpha1.DeletionPolicyDelete:
-			err = r.NetBox.Delete(ctx, netbox.Prefixes, p.ID, released)
+			err = r.NetBox.Delete(ctx, netbox.Prefixes, p.ID, "", released)
 		default:
 			_, err = r.NetBox.Patch(ctx, netbox.Prefixes, p.ID, "", map[string]any{"status": "deprecated", "changelog_message": released})
 		}
-		if err != nil && !errors.Is(err, netbox.ErrNotFound) {
+		if errors.Is(err, netbox.ErrNotFound) {
+			continue
+		}
+		if err != nil {
 			return err
 		}
+		ctrl.LoggerFrom(ctx).Info("Released the NetBox prefix", "network", klog.KObj(nw), "prefix", p.Prefix, "id", p.ID, "policy", policy)
+		normalEvent(r.Recorder, nw, "PrefixReleased", "Released the NetBox prefix %s (deletionPolicy %s)", p.Prefix, policy)
 	}
 	if err := r.releaseVIP(ctx, nw); err != nil {
 		return err

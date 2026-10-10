@@ -271,5 +271,22 @@ func TestValidation(t *testing.T) {
 		if err := c.Update(ctx, p); err != nil {
 			t.Errorf("remove: %v", err)
 		}
+
+		p = pool("grace-negative", a)
+		p.Spec.AddressReuseGracePeriodSeconds = ptr.To(int32(-1))
+		wantErr(t, c.Create(ctx, p), "spec.addressReuseGracePeriodSeconds")
+		p = pool("grace-zero", a)
+		p.Spec.AddressReuseGracePeriodSeconds, p.Spec.OmitGateway = ptr.To(int32(0)), ptr.To(true)
+		if err := c.Create(ctx, p); err != nil {
+			t.Errorf("grace 0, omitGateway: %v", err)
+		}
+		p = pool("grace-too-long", a)
+		p.Spec.AddressReuseGracePeriodSeconds = ptr.To(int32(86401))
+		wantErr(t, c.Create(ctx, p), "spec.addressReuseGracePeriodSeconds")
+		p = pool("grace-day", a)
+		p.Spec.AddressReuseGracePeriodSeconds = ptr.To(int32(86400))
+		if err := c.Create(ctx, p); err != nil {
+			t.Errorf("grace 86400: %v", err)
+		}
 	})
 }

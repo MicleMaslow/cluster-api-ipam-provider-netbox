@@ -24,7 +24,7 @@ The dev stand writes its kubeconfig to `hack/dev/kubeconfig` and the NetBox toke
 | `make generate` | deepcopy, CRDs and RBAC |
 | `make lint` | golangci-lint, and kube-api-linter on `api/` |
 | `make verify` | generated files, `go.mod`/`go.sum` and license headers are up to date |
-| `make test` | unit tests and CRD validation on envtest, no NetBox needed |
+| `make test` | unit tests and CRD validation on envtest, and the shell test of the control-plane VIP command (`hack/test-control-plane-vip.sh`); no NetBox needed |
 | `make test-integration` | also the controller tests against the dev NetBox (`make netbox-up` first); `TEST_LOG=1` prints the provider logs |
 | `make deploy-dev` | build the image and run the provider inside kind through clusterctl |
 | `make release-manifests` | `out/ipam-components.yaml` with the image `IMG`, and `out/metadata.yaml` |

@@ -107,6 +107,12 @@ linters:
       linters:
         - kubeapilinter
 
+    ## omitGateway is a plain switch with no other states to grow into.
+    - path: "api/v1alpha1/netboxippool_types.go"
+      text: "nobools: field OmitGateway pointer should not use a bool"
+      linters:
+        - kubeapilinter
+
     ## customFields mirrors NetBox's custom_fields object; customFieldKeys is keyed by the same field names.
     - path: "api/v1alpha1/netboxnetwork_types.go"
       text: "nomaps: NetBoxNetwork(Spec.CustomFields|Status.CustomFieldKeys) should not use a map type"

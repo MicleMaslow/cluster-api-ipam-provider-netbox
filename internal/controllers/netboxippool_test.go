@@ -24,6 +24,8 @@ import (
 	"net/http/httptest"
 	"net/netip"
 	"net/url"
+	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -34,6 +36,8 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/tools/events"
+	"k8s.io/utils/ptr"
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	ipamv1 "sigs.k8s.io/cluster-api/api/ipam/v1beta2"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -148,6 +152,7 @@ func TestPoolDeleteForbidden(t *testing.T) {
 	pool := newPool("ns", "worker", v1alpha1.IPPoolRange{NetworkName: "default", Start: 2, End: 3})
 	pool.Finalizers = []string{poolFinalizer}
 	pool.DeletionTimestamp = &metav1.Time{Time: time.Now()}
+	pool.Status.Conditions = []metav1.Condition{{Type: clusterv1.PausedCondition, Status: metav1.ConditionFalse, Reason: clusterv1.NotPausedReason}}
 	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(nw, pool).WithStatusSubresource(pool).
 		WithIndex(&ipamv1.IPAddress{}, poolRefField, func(o client.Object) []string {
 			a, ok := o.(*ipamv1.IPAddress)
@@ -201,6 +206,32 @@ func TestPoolCreatesRanges(t *testing.T) {
 	g.Expect(rng.EndAddress).To(Equal(addr(p, 5) + "/22"))
 	g.Expect(owner.Owns(rng)).To(BeTrue())
 	g.Expect(cfString(rng, netbox.FieldRef)).To(Equal("NetBoxIPPool/" + ns + "/worker/default"))
+}
+
+// Every change the provider makes in NetBox is recorded as an Event on the object behind it.
+func TestChangesAreRecordedAsEvents(t *testing.T) {
+	g := newG(t)
+	ns := newEnv(t, nil)
+	nw := vipNetwork(ns, "default")
+	nw.Spec.DeletionPolicy = v1alpha1.DeletionPolicyDelete
+	g.Expect(k8s.Create(ctx, nw)).To(Succeed())
+	waitReady(g, nw)
+	pool := newPool(ns, "worker", v1alpha1.IPPoolRange{NetworkName: "default", Start: 2, End: 5})
+	g.Expect(k8s.Create(ctx, pool)).To(Succeed())
+	waitReady(g, pool)
+	waitEvent(g, ns, "default", "PrefixAcquired")
+	waitEvent(g, ns, "default", "VIPReserved")
+	waitEvent(g, ns, "worker", "RangeCreated")
+
+	setRanges(g, pool, v1alpha1.IPPoolRange{NetworkName: "default", Start: 2, End: 6})
+	waitEvent(g, ns, "worker", "RangeUpdated")
+
+	g.Expect(k8s.Delete(ctx, pool)).To(Succeed())
+	waitEvent(g, ns, "worker", "RangeReleased")
+	g.Expect(k8s.Delete(ctx, nw)).To(Succeed())
+	deleteCluster(t, g, ns) // under Delete the VIP waits for the Cluster that uses it
+	waitEvent(g, ns, "default", "VIPReleased")
+	waitEvent(g, ns, "default", "PrefixReleased")
 }
 
 func TestPoolRejectsMixedNetworks(t *testing.T) {
@@ -836,6 +867,50 @@ func TestPoolMetallbCarveOut(t *testing.T) {
 	g.Expect(boundsInNetBox(g, mid)).To(Equal(addr(p, -4) + "-" + addr(p, -2)))
 }
 
+// A pool without the cluster-name label pauses with the Cluster of its network.
+func TestPoolPausedByNetworkCluster(t *testing.T) {
+	g := newG(t)
+	ns := newEnv(t, nil)
+	nw := newNetwork(ns, "default")
+	g.Expect(k8s.Create(ctx, nw)).To(Succeed())
+	waitReady(g, nw)
+	p := netip.MustParsePrefix(nw.Status.Prefix)
+	pool := newPool(ns, "worker", v1alpha1.IPPoolRange{NetworkName: "default", Start: 2, End: 3})
+	pool.Labels = nil
+	g.Expect(k8s.Create(ctx, pool)).To(Succeed())
+	id := waitRange(g, pool, "default", addr(p, 2), addr(p, 3)).ID
+
+	setPaused(t, ns, true)
+	waitTypedCondition(g, pool, clusterv1.PausedCondition, metav1.ConditionTrue, clusterv1.PausedReason)
+	setRanges(g, pool, v1alpha1.IPPoolRange{NetworkName: "default", Start: 2, End: 5})
+	g.Consistently(func() string { return boundsInNetBox(g, id) }).Should(Equal(addr(p, 2) + "-" + addr(p, 3)))
+
+	setPaused(t, ns, false)
+	waitTypedCondition(g, pool, clusterv1.PausedCondition, metav1.ConditionFalse, clusterv1.NotPausedReason)
+	waitRange(g, pool, "default", addr(p, 2), addr(p, 5))
+	g.Expect(boundsInNetBox(g, id)).To(Equal(addr(p, 2) + "-" + addr(p, 5)))
+}
+
+func TestOmitGateway(t *testing.T) {
+	g := newG(t)
+	ns := newEnv(t, nil)
+	nw := newNetwork(ns, "default")
+	g.Expect(k8s.Create(ctx, nw)).To(Succeed())
+	waitReady(g, nw)
+	pool := newPool(ns, "worker", v1alpha1.IPPoolRange{NetworkName: "default", Start: 2, End: 4})
+	pool.Spec.OmitGateway = ptr.To(true)
+	g.Expect(k8s.Create(ctx, pool)).To(Succeed())
+	waitReady(g, pool)
+	g.Expect(pool.Status.Gateway).To(BeEmpty())
+	g.Expect(pool.Status.AddressPrefixLength).To(Equal(int32(22)))
+
+	claim := newClaim(ns, "m1", "worker")
+	g.Expect(k8s.Create(ctx, claim)).To(Succeed())
+	a := address(g, claim)
+	g.Expect(a.Spec.Address).NotTo(BeEmpty())
+	g.Expect(a.Spec.Gateway).To(BeEmpty())
+}
+
 // TestPoolsRaceForOverlappingRanges creates two pools at once: NetBox checks range overlap without a lock.
 func TestPoolsRaceForOverlappingRanges(t *testing.T) {
 	g := newG(t)
@@ -892,5 +967,164 @@ func TestFoldErrors(t *testing.T) {
 	}
 	if err := foldErrors([]error{wait, retry}); err.Error() != "[a, b]" {
 		t.Errorf("message %q", err)
+	}
+}
+
+// rangeNetBox serves the NetBox range 7 of pool worker in network default, if o is not empty, and records the writes.
+func rangeNetBox(t *testing.T, o string, writes *[]string) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(writesNeedLock(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method != http.MethodGet:
+			b, _ := io.ReadAll(r.Body)
+			*writes = append(*writes, r.Method+" "+r.URL.Path+" "+string(b))
+			_, _ = io.WriteString(w, `{"id":8}`)
+		case r.URL.Path == "/api/ipam/ip-ranges/7/" && o == "":
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = io.WriteString(w, `{"detail":"Not found."}`)
+		case r.URL.Path == "/api/ipam/ip-ranges/7/":
+			w.Header().Set("ETag", `"e1"`)
+			_, _ = io.WriteString(w, o)
+		case r.URL.Path == "/api/ipam/ip-ranges/" && o != "":
+			_, _ = io.WriteString(w, `{"results":[`+o+`]}`)
+		default:
+			_, _ = io.WriteString(w, `{"results":[]}`)
+		}
+	})))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func rangeObject(start, end string, closed bool) string {
+	return `{"id":7,"start_address":"` + start + `/22","end_address":"` + end + `/22","mark_populated":` + strconv.FormatBool(closed) +
+		`,"status":{"value":"active"},"custom_fields":{"capi_ref":"NetBoxIPPool/ns/worker/default"}}`
+}
+
+func poolOn(srv *httptest.Server) *NetBoxIPPoolReconciler {
+	return &NetBoxIPPoolReconciler{Client: claimClient(), NetBox: &netbox.Client{URL: srv.URL, Token: "t"}, Owner: netbox.Owner{ID: 1}, Recorder: events.NewFakeRecorder(10)}
+}
+
+// Only a range that is to change, or is not there yet, waits for the lock; one that is as it should be does not.
+func TestPoolReconcileRangeTakesLockToWrite(t *testing.T) {
+	nw := newNetwork("ns", "default")
+	nw.Status.Prefix = "10.10.0.16/28"
+	for name, tc := range map[string]struct {
+		existing string
+		end      int32
+		writes   int
+	}{
+		"unchanged": {rangeObject("10.10.0.18", "10.10.0.19", false), 3, 0},
+		"resized":   {rangeObject("10.10.0.18", "10.10.0.19", false), 4, 1},
+		"created":   {"", 3, 1},
+	} {
+		var writes []string
+		r := poolOn(rangeNetBox(t, tc.existing, &writes))
+		var (
+			rs  *v1alpha1.IPPoolRangeStatus
+			err error
+		)
+		pool := newPool("ns", "worker")
+		rg := v1alpha1.IPPoolRange{NetworkName: "default", Start: 2, End: tc.end}
+		if got := returnsWhileLocked(func() { rs, err = r.reconcileRange(ctx, pool, nw, rg, nil, nil) }); got != (tc.writes == 0) {
+			t.Errorf("%s: finished while locked %t, want %t", name, got, tc.writes == 0)
+		}
+		if err != nil || rs == nil || !rs.Ready || len(writes) != tc.writes {
+			t.Errorf("%s: status %+v, err %v, writes %v, want a ready range and %d writes", name, rs, err, writes, tc.writes)
+		}
+		if tc.writes > 0 && rs != nil && rs.EndAddress != "10.10.0."+map[int32]string{3: "19", 4: "20"}[tc.end] {
+			t.Errorf("%s: range ends at %s", name, rs.EndAddress)
+		}
+	}
+}
+
+// A range that is already gone from NetBox is released without the lock.
+func TestPoolReleaseRangeTakesLockToWrite(t *testing.T) {
+	for _, gone := range []bool{true, false} {
+		o := ""
+		if !gone {
+			o = rangeObject("10.10.0.18", "10.10.0.19", false)
+		}
+		var writes []string
+		r := poolOn(rangeNetBox(t, o, &writes))
+		var err error
+		listed := netbox.Object{ID: 7, Status: netbox.Choice{Value: "active"}}
+		if got := returnsWhileLocked(func() { err = r.releaseRange(ctx, newPool("ns", "worker"), "default", listed, nil) }); got != gone {
+			t.Errorf("gone %t: finished while locked %t", gone, got)
+		}
+		if want := map[bool]int{true: 0, false: 2}[gone]; err != nil || len(writes) != want {
+			t.Errorf("gone %t: err %v, writes %q, want nil and %d", gone, err, writes, want)
+		}
+		if !gone && (!strings.Contains(writes[0], `"mark_populated":true`) || !strings.Contains(writes[1], `"status":"deprecated"`)) {
+			t.Errorf("writes %q, want the range closed, then deprecated", writes)
+		}
+	}
+}
+
+// RangeReleased is recorded for a range the provider released, not for one that vanished in between.
+func TestPoolReleaseRangeEventOnlyOnChange(t *testing.T) {
+	for name, tc := range map[string]struct {
+		policy v1alpha1.DeletionPolicy
+		status int
+		events int
+	}{
+		"deleted":    {v1alpha1.DeletionPolicyDelete, http.StatusOK, 1},
+		"deprecated": {v1alpha1.DeletionPolicyRetain, http.StatusOK, 1},
+		"gone":       {v1alpha1.DeletionPolicyRetain, http.StatusNotFound, 0},
+	} {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			b, _ := io.ReadAll(r.Body)
+			switch {
+			case r.Method == http.MethodDelete:
+				w.WriteHeader(http.StatusNoContent)
+			case r.Method == http.MethodPatch && strings.Contains(string(b), `"status":"deprecated"`) && tc.status == http.StatusNotFound:
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusNotFound)
+				_, _ = io.WriteString(w, `{"detail":"Not found."}`)
+			case r.Method == http.MethodPatch:
+				_, _ = io.WriteString(w, `{"id":7}`)
+			case r.URL.Path == "/api/ipam/ip-ranges/7/":
+				w.Header().Set("ETag", `"e1"`)
+				_, _ = io.WriteString(w, rangeObject("10.10.0.18", "10.10.0.19", false))
+			default:
+				_, _ = io.WriteString(w, `{"results":[]}`)
+			}
+		}))
+		nw := newNetwork("ns", "default")
+		nw.Spec.DeletionPolicy = tc.policy
+		r := poolOn(srv)
+		r.Client = claimClient(nw)
+
+		err := r.releaseRange(ctx, newPool("ns", "worker"), "default", netbox.Object{ID: 7, Status: netbox.Choice{Value: "active"}}, nil)
+		if ev := emitted(r.Recorder); err != nil || len(ev) != tc.events {
+			t.Errorf("%s: err %v, events %q, want nil and %d", name, err, ev, tc.events)
+		}
+		srv.Close()
+	}
+}
+
+// Whichever way a range section goes about its write, ErrWriteNeeded of the first pass comes out of it as it is:
+// no wrapper turns it into another reason, a conflict or a success.
+func TestPoolWriteNeededSurvivesTheSection(t *testing.T) {
+	nw := newNetwork("ns", "default")
+	nw.Status.Prefix = "10.10.0.16/28"
+	start, end := netip.MustParseAddr("10.10.0.18"), netip.MustParseAddr("10.10.0.19")
+	for name, tc := range map[string]struct {
+		existing string
+		end      netip.Addr
+		held     []netip.Addr
+	}{
+		"create":                 {"", end, nil},
+		"resize":                 {rangeObject("10.10.0.18", "10.10.0.19", false), start.Next().Next(), nil},
+		"close before shrinking": {rangeObject("10.10.0.18", "10.10.0.19", false), start, nil},
+		"keep a closed range":    {rangeObject("10.10.0.18", "10.10.0.19", true), start, []netip.Addr{end}},
+	} {
+		var writes []string
+		r := poolOn(rangeNetBox(t, tc.existing, &writes))
+		r.NetBox = r.NetBox.ReadOnly()
+		rs, err := r.syncRange(ctx, newPool("ns", "worker"), nw, nil, start, tc.end, 22, tc.held)
+		if !errors.Is(err, netbox.ErrWriteNeeded) || errReason(err) != v1alpha1.ReasonNetBoxError || len(writes) != 0 {
+			t.Errorf("%s: status %+v, err %v (reason %s), writes %q, want ErrWriteNeeded and no writes", name, rs, err, errReason(err), writes)
+		}
 	}
 }

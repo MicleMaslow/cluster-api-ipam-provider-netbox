@@ -66,6 +66,15 @@ spec:
           spec:
             description: spec is the desired state of NetBoxIPPool.
             properties:
+              addressReuseGracePeriodSeconds:
+                description: |-
+                  addressReuseGracePeriodSeconds keeps the address of a deleted claim in NetBox this long, so that it is not handed
+                  to a new machine while caches of the old one still point at it, at most a day. Not applied while the pool
+                  is being deleted.
+                format: int32
+                maximum: 86400
+                minimum: 0
+                type: integer
               ipAddress:
                 description: |-
                   ipAddress sets dns_name and description of the pool's NetBox IP addresses with Go templates, rendered per claim.
@@ -89,6 +98,11 @@ spec:
                     minLength: 1
                     type: string
                 type: object
+              omitGateway:
+                description: |-
+                  omitGateway hands out addresses without a gateway, e.g. for a second NIC whose default route is on the first.
+                  Applies to addresses allocated after the change.
+                type: boolean
               ranges:
                 description: |-
                   ranges are used in order. A range can be changed or removed; a change that would leave

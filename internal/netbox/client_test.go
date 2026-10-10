@@ -29,23 +29,28 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
+	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/prometheus/client_golang/prometheus/testutil"
 
 	"github.com/MicleMaslow/cluster-api-ipam-provider-netbox/internal/version"
 )
 
 var ctx = context.Background()
 
-type recorded struct{ method, path, query, auth, ifMatch, body, ua string }
+type recorded struct{ method, path, query, auth, ifMatch, body, ua, lang string }
 
 func newServer(t *testing.T, status int, body string) (*Client, *recorded) {
 	t.Helper()
 	rec := &recorded{}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		b, _ := io.ReadAll(r.Body)
-		*rec = recorded{r.Method, r.URL.Path, r.URL.RawQuery, r.Header.Get("Authorization"), r.Header.Get("If-Match"), string(b), r.Header.Get("User-Agent")}
+		*rec = recorded{r.Method, r.URL.Path, r.URL.RawQuery, r.Header.Get("Authorization"), r.Header.Get("If-Match"), string(b), r.Header.Get("User-Agent"), r.Header.Get("Accept-Language")}
 		w.Header().Set("ETag", `W/"v1"`)
+		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(status)
 		_, _ = io.WriteString(w, body)
 	}))
@@ -111,7 +116,7 @@ func TestErrorMapping(t *testing.T) {
 
 func TestDeleteIgnoresMissing(t *testing.T) {
 	c, rec := newServer(t, 404, ``)
-	if err := c.Delete(ctx, IPAddresses, 9, "msg"); err != nil {
+	if err := c.Delete(ctx, IPAddresses, 9, "", "msg"); err != nil {
 		t.Fatal(err)
 	}
 	if rec.method != "DELETE" || rec.path != "/api/ipam/ip-addresses/9/" {
@@ -121,7 +126,7 @@ func TestDeleteIgnoresMissing(t *testing.T) {
 
 func TestDeleteSendsChangelogMessage(t *testing.T) {
 	c, rec := newServer(t, 204, ``)
-	if err := c.Delete(ctx, Prefixes, 3, "capi: released by x"); err != nil {
+	if err := c.Delete(ctx, Prefixes, 3, "", "capi: released by x"); err != nil {
 		t.Fatal(err)
 	}
 	if rec.body != `{"changelog_message":"capi: released by x"}` {
@@ -129,24 +134,39 @@ func TestDeleteSendsChangelogMessage(t *testing.T) {
 	}
 }
 
-func TestListFollowsNext(t *testing.T) {
-	var srv *httptest.Server
-	var queries []string
-	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		queries = append(queries, r.URL.RawQuery)
-		if r.URL.Query().Get("offset") != "" {
-			_, _ = io.WriteString(w, `{"next":null,"results":[{"id":1000}]}`)
+func TestListKeyset(t *testing.T) {
+	const pageSize = 2
+	ids := []int64{1, 2, 3, 4, 5}
+	var queries []url.Values
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		queries = append(queries, q)
+		if q.Get("ordering") != "id" || q.Get("limit") != "1000" {
+			http.Error(w, "want ordering=id and limit=1000", http.StatusBadRequest)
 			return
 		}
-		var b strings.Builder
-		for i := range 1000 {
-			if i > 0 {
-				b.WriteByte(',')
+		after, _ := strconv.ParseInt(q.Get("id__gt"), 10, 64)
+		var page []string
+		more := false
+		for _, id := range ids {
+			switch {
+			case id <= after:
+			case len(page) == pageSize:
+				more = true
+			default:
+				page = append(page, fmt.Sprintf(`{"id":%d}`, id))
 			}
-			fmt.Fprintf(&b, `{"id":%d}`, i)
 		}
-		// next carries the server's own idea of its host, which the client must not trust.
-		_, _ = fmt.Fprintf(w, `{"next":"http://netbox.invalid/api/ipam/prefixes/?limit=1000&offset=1000&owner_id=3","results":[%s]}`, b.String())
+		next := "null"
+		if more {
+			// next carries the server's own idea of its host, which the client must not use.
+			next = `"http://netbox.invalid/api/ipam/prefixes/?limit=1000&offset=2"`
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(w, `{"next":%s,"results":[%s]}`, next, strings.Join(page, ","))
+		if len(queries) == 1 {
+			ids = []int64{2, 3, 4, 5, 6} // 1 deleted, 6 created while the client holds page 1
+		}
 	}))
 	t.Cleanup(srv.Close)
 	c := &Client{URL: srv.URL, Token: "nbt_k.t"}
@@ -154,35 +174,51 @@ func TestListFollowsNext(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got) != 1001 || got[0].ID != 0 || got[1000].ID != 1000 {
-		t.Errorf("got %d objects", len(got))
+	var gotIDs []int64
+	for _, o := range got {
+		gotIDs = append(gotIDs, o.ID)
 	}
-	if len(queries) != 2 || !strings.Contains(queries[1], "offset=1000") || !strings.Contains(queries[1], "owner_id=3") {
-		t.Errorf("queries %v", queries)
+	if want := []int64{1, 2, 3, 4, 5, 6}; !slices.Equal(gotIDs, want) {
+		t.Errorf("ids %v, want %v", gotIDs, want)
+	}
+	var after []string
+	for _, q := range queries {
+		after = append(after, q.Get("id__gt"))
+		if q.Get("owner_id") != "3" {
+			t.Errorf("query %v lost owner_id", q)
+		}
+	}
+	if want := []string{"", "2", "4"}; !slices.Equal(after, want) {
+		t.Errorf("id__gt per request %q, want %q", after, want)
 	}
 }
 
-func TestListPaginationLoop(t *testing.T) {
+func TestListKeysetRequiresProgress(t *testing.T) {
 	requests := 0
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		requests++
-		switch {
-		case requests > 50: // lets an unguarded List terminate
-			_, _ = io.WriteString(w, `{"next":null,"results":[]}`)
-		case r.URL.Query().Get("offset") == "":
-			_, _ = io.WriteString(w, `{"next":"http://netbox.invalid/api/ipam/prefixes/?limit=1000&offset=1000","results":[{"id":1}]}`)
-		default:
-			_, _ = io.WriteString(w, `{"next":"http://netbox.invalid/api/ipam/prefixes/?limit=1000","results":[{"id":2}]}`)
+		next := `"http://netbox.invalid/api/ipam/prefixes/"`
+		if requests > 50 { // lets an unguarded List terminate
+			next = "null"
 		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(w, `{"next":%s,"results":[{"id":1},{"id":2}]}`, next) // ignores id__gt
 	}))
 	t.Cleanup(srv.Close)
 	c := &Client{URL: srv.URL, Token: "nbt_k.t"}
 	_, err := c.List(ctx, Prefixes, nil)
-	if err == nil || !strings.Contains(err.Error(), "pagination loop") || !strings.Contains(err.Error(), Prefixes) {
-		t.Errorf("got %v, want pagination loop error naming the path", err)
+	if err == nil || !strings.Contains(err.Error(), "pagination did not advance") || !strings.Contains(err.Error(), Prefixes) {
+		t.Errorf("got %v, want pagination error naming the path", err)
 	}
-	if requests > 3 {
-		t.Errorf("%d requests, want at most 3", requests)
+	if requests > 2 {
+		t.Errorf("%d requests, want at most 2", requests)
+	}
+}
+
+func TestListEmptyPageWithNext(t *testing.T) {
+	c, _ := newServer(t, 200, `{"next":"http://netbox.invalid/","results":[]}`)
+	if _, err := c.List(ctx, Prefixes, nil); err == nil || !strings.Contains(err.Error(), "pagination did not advance") {
+		t.Errorf("got %v", err)
 	}
 }
 
@@ -360,10 +396,199 @@ func TestRedirectError(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 	c := &Client{URL: srv.URL, Token: "nbt_k.t"}
-	if err := c.Delete(ctx, IPAddresses, 9, "msg"); err == nil || !strings.Contains(err.Error(), "HTTP 301") {
+	if err := c.Delete(ctx, IPAddresses, 9, "", "msg"); err == nil || !strings.Contains(err.Error(), "HTTP 301") {
 		t.Errorf("redirect: got %v, want error with HTTP 301", err)
 	}
 	if redirected {
 		t.Error("redirect: /elsewhere was requested, CheckRedirect should have prevented it")
+	}
+}
+
+func TestAcceptLanguage(t *testing.T) {
+	c, rec := newServer(t, 200, `{"results":[]}`)
+	if _, err := c.List(ctx, Prefixes, nil); err != nil || rec.lang != "en" {
+		t.Errorf("List: Accept-Language %q, err %v", rec.lang, err)
+	}
+	if _, err := c.Create(ctx, Prefixes, map[string]any{}); err != nil || rec.lang != "en" {
+		t.Errorf("Create: Accept-Language %q, err %v", rec.lang, err)
+	}
+}
+
+func TestTruncatesLongTexts(t *testing.T) {
+	c, rec := newServer(t, 200, `{}`)
+	long := strings.Repeat("я", 300)
+	fields := map[string]any{"changelog_message": long, "description": long, "dns_name": long, "status": "active"}
+	if _, err := c.Create(ctx, IPAddresses, fields); err != nil {
+		t.Fatal(err)
+	}
+	var sent map[string]string
+	if err := json.Unmarshal([]byte(rec.body), &sent); err != nil {
+		t.Fatal(err)
+	}
+	short := strings.Repeat("я", 200)
+	if sent["changelog_message"] != short || sent["description"] != short {
+		t.Errorf("changelog_message %d runes, description %d runes, want 200",
+			len([]rune(sent["changelog_message"])), len([]rune(sent["description"])))
+	}
+	if sent["dns_name"] != long || sent["status"] != "active" {
+		t.Errorf("other fields changed: %d runes in dns_name, status %q", len([]rune(sent["dns_name"])), sent["status"])
+	}
+	if fields["changelog_message"] != long || fields["description"] != long {
+		t.Error("the caller's map was modified")
+	}
+
+	if err := c.Delete(ctx, IPAddresses, 1, "", long); err != nil {
+		t.Fatal(err)
+	}
+	if want := `{"changelog_message":"` + short + `"}`; rec.body != want {
+		t.Errorf("delete body %d bytes, want the message cut to 200 runes", len(rec.body))
+	}
+}
+
+func TestNotFoundNeedsJSON(t *testing.T) {
+	c, _ := newServer(t, 404, `{"detail":"Not found."}`)
+	if _, _, err := c.Get(ctx, Prefixes, 1); !errors.Is(err, ErrNotFound) {
+		t.Errorf("JSON 404: got %v, want ErrNotFound", err)
+	}
+	if err := c.Delete(ctx, Prefixes, 1, "", "msg"); err != nil {
+		t.Errorf("JSON 404: Delete returned %v, want nil", err)
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = io.WriteString(w, "<html>no route</html>")
+	}))
+	t.Cleanup(srv.Close)
+	c = &Client{URL: srv.URL, Token: "t"}
+	err := c.Delete(ctx, Prefixes, 1, "", "msg")
+	if err == nil || errors.Is(err, ErrNotFound) || !strings.Contains(err.Error(), "HTTP 404: <html>no route</html>") {
+		t.Errorf("HTML 404: Delete returned %v, want an HTTP 404 error", err)
+	}
+	if _, _, err := c.Get(ctx, Prefixes, 1); err == nil || errors.Is(err, ErrNotFound) {
+		t.Errorf("HTML 404: Get returned %v, want an HTTP 404 error", err)
+	}
+}
+
+func TestDeleteIfMatch(t *testing.T) {
+	c, rec := newServer(t, 204, ``)
+	if err := c.Delete(ctx, IPRanges, 4, `W/"abc"`, "msg"); err != nil || rec.method != "DELETE" || rec.ifMatch != `W/"abc"` {
+		t.Errorf("conditional: err %v, request %+v", err, rec)
+	}
+	if err := c.Delete(ctx, IPRanges, 4, "", "msg"); err != nil || rec.method != "DELETE" || rec.ifMatch != "" {
+		t.Errorf("unconditional: err %v, request %+v", err, rec)
+	}
+}
+
+func TestDeletePreconditionFailed(t *testing.T) {
+	c, _ := newServer(t, 412, `{"detail":"x"}`)
+	if err := c.Delete(ctx, IPRanges, 4, `W/"old"`, "msg"); !errors.Is(err, ErrModified) {
+		t.Errorf("got %v, want ErrModified", err)
+	}
+}
+
+func TestTokenFile(t *testing.T) {
+	c, rec := newServer(t, 200, `{"results":[]}`)
+	c.Token = "ignored"
+	c.TokenFile = filepath.Join(t.TempDir(), "token")
+	if err := os.WriteFile(c.TokenFile, []byte("nbt_a.1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.List(ctx, Prefixes, nil); err != nil || rec.auth != "Bearer nbt_a.1" {
+		t.Fatalf("first: Authorization %q, err %v", rec.auth, err)
+	}
+	if err := os.WriteFile(c.TokenFile, []byte(" nbt_b.2 \n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.List(ctx, Prefixes, nil); err != nil || rec.auth != "Bearer nbt_b.2" {
+		t.Errorf("second: Authorization %q, err %v", rec.auth, err)
+	}
+
+	*rec = recorded{}
+	c.TokenFile = filepath.Join(t.TempDir(), "none")
+	if _, err := c.List(ctx, Prefixes, nil); !errors.Is(err, os.ErrNotExist) || rec.method != "" {
+		t.Errorf("missing file: err %v, request %+v, want an error and no request", err, rec)
+	}
+}
+
+func TestTokenFileEmpty(t *testing.T) {
+	c, rec := newServer(t, 200, `{"results":[]}`)
+	c.TokenFile = filepath.Join(t.TempDir(), "token")
+	if err := os.WriteFile(c.TokenFile, []byte(" \n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := c.List(ctx, Prefixes, nil)
+	if err == nil || !strings.Contains(err.Error(), "token file "+c.TokenFile+" is empty") || rec.method != "" {
+		t.Errorf("err %v, request %+v, want \"token file ... is empty\" and no request", err, rec)
+	}
+	if err := c.CheckToken(); err == nil {
+		t.Error("CheckToken passes an empty token file")
+	}
+}
+
+func TestReadOnly(t *testing.T) {
+	c, rec := newServer(t, 200, `{"id":1}`)
+	ro := c.ReadOnly()
+	if _, _, err := ro.Get(ctx, Prefixes, 1); err != nil || rec.method != "GET" {
+		t.Fatalf("GET: err %v, request %+v", err, rec)
+	}
+	*rec = recorded{}
+	for _, tc := range []struct {
+		method string
+		do     func() error
+	}{
+		{"POST", func() error { _, err := ro.Create(ctx, Prefixes, map[string]any{}); return err }},
+		{"PATCH", func() error { _, err := ro.Patch(ctx, Prefixes, 1, "", map[string]any{}); return err }},
+		{"DELETE", func() error { return ro.Delete(ctx, Prefixes, 1, "", "msg") }},
+	} {
+		if err := tc.do(); !errors.Is(err, ErrWriteNeeded) || !strings.Contains(err.Error(), tc.method) {
+			t.Errorf("%s: got %v, want ErrWriteNeeded", tc.method, err)
+		}
+	}
+	if rec.method != "" {
+		t.Errorf("the server got %+v, want no request", rec)
+	}
+	if _, err := c.Create(ctx, Prefixes, map[string]any{}); err != nil || rec.method != "POST" {
+		t.Errorf("original client: err %v, request %+v", err, rec)
+	}
+}
+
+func TestMetricsPath(t *testing.T) {
+	for in, want := range map[string]string{
+		"ipam/ip-ranges/12/available-ips/": "ipam/ip-ranges/{id}/available-ips/",
+		"ipam/prefixes/":                   "ipam/prefixes/",
+		"ipam/ip-addresses/7/":             "ipam/ip-addresses/{id}/",
+		"status/":                          "status/",
+	} {
+		if got := apiPath(in); got != want {
+			t.Errorf("apiPath(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestMetricsRecorded(t *testing.T) {
+	count := func(method, path, code string) float64 {
+		return testutil.ToFloat64(requests.WithLabelValues(method, path, code))
+	}
+	c, _ := newServer(t, 200, `{"id":1}`)
+	ok, missing := count("GET", "ipam/prefixes/{id}/", "200"), count("GET", "ipam/prefixes/{id}/", "404")
+	if _, _, err := c.Get(ctx, Prefixes, 5); err != nil {
+		t.Fatal(err)
+	}
+	if got := count("GET", "ipam/prefixes/{id}/", "200"); got != ok+1 {
+		t.Errorf("200 count %v, want %v", got, ok+1)
+	}
+	if got := count("GET", "ipam/prefixes/{id}/", "404"); got != missing {
+		t.Errorf("404 count %v, want %v", got, missing)
+	}
+
+	failed := count("GET", "ipam/prefixes/{id}/", "error")
+	srv := httptest.NewServer(http.NotFoundHandler())
+	srv.Close()
+	if _, _, err := (&Client{URL: srv.URL, Token: "t"}).Get(ctx, Prefixes, 5); err == nil {
+		t.Fatal("want a transport error")
+	}
+	if got := count("GET", "ipam/prefixes/{id}/", "error"); got != failed+1 {
+		t.Errorf("error count %v, want %v", got, failed+1)
 	}
 }

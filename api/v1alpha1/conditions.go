@@ -57,4 +57,6 @@ const (
 	ReasonForbidden           = "Forbidden"
 	ReasonOwnedByOtherOwner   = "OwnedByOtherOwner"
 	ReasonInternalError       = "InternalError"
+	ReasonReleasing           = "Releasing"
+	ReasonReleaseFailed       = "ReleaseFailed"
 )

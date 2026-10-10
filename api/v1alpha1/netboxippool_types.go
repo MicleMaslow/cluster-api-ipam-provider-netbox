@@ -41,6 +41,19 @@ type NetBoxIPPoolSpec struct {
 	// and a value is limited to 1024 bytes.
 	// +optional
 	IPAddress IPAddressFields `json:"ipAddress,omitempty,omitzero"`
+
+	// addressReuseGracePeriodSeconds keeps the address of a deleted claim in NetBox this long, so that it is not handed
+	// to a new machine while caches of the old one still point at it, at most a day. Not applied while the pool
+	// is being deleted.
+	// +optional
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=86400
+	AddressReuseGracePeriodSeconds *int32 `json:"addressReuseGracePeriodSeconds,omitempty"`
+
+	// omitGateway hands out addresses without a gateway, e.g. for a second NIC whose default route is on the first.
+	// Applies to addresses allocated after the change.
+	// +optional
+	OmitGateway *bool `json:"omitGateway,omitempty"`
 }
 
 // IPAddressFields are Go templates of NetBox IP address fields, rendered per claim.

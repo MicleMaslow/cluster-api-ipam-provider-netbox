@@ -23,16 +23,20 @@ import (
 	"net/netip"
 	"net/url"
 	"slices"
+	"strings"
+	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/tools/events"
 	"k8s.io/klog/v2"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/cluster-api-ipam-provider-in-cluster/pkg/ipamutil"
 	ipampredicates "sigs.k8s.io/cluster-api-ipam-provider-in-cluster/pkg/predicates"
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	ipamv1 "sigs.k8s.io/cluster-api/api/ipam/v1beta2"
+	"sigs.k8s.io/cluster-api/util/annotations"
 	"sigs.k8s.io/cluster-api/util/conditions"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
@@ -60,6 +64,7 @@ type ProviderAdapter struct {
 	Client      client.Client
 	NetBox      *netbox.Client
 	Owner       netbox.Owner
+	Recorder    events.EventRecorder
 	Concurrency int
 }
 
@@ -72,11 +77,22 @@ var _ ipamutil.ProviderAdapter = &ProviderAdapter{}
 
 // SetupWithManager adds the claim watches that the NetBoxIPPool needs.
 func (a *ProviderAdapter) SetupWithManager(ctx context.Context, b *ctrl.Builder) error {
-	b.WithOptions(controller.Options{MaxConcurrentReconciles: a.Concurrency}).
+	b.WithOptions(controller.Options{MaxConcurrentReconciles: a.Concurrency, RateLimiter: rateLimiter()}).
 		For(&ipamv1.IPAddressClaim{}, builder.WithPredicates(ipampredicates.ClaimReferencesPoolKind(poolGK))).
-		Watches(&v1alpha1.NetBoxIPPool{}, handler.EnqueueRequestsFromMapFunc(a.poolToClaims), builder.WithPredicates(predicate.Or(poolOpened(ctx), poolReadied(ctx), addressFieldsChanged)))
+		Watches(&v1alpha1.NetBoxIPPool{}, handler.EnqueueRequestsFromMapFunc(a.poolToClaims),
+			builder.WithPredicates(predicate.Or(poolOpened(ctx), poolReadied(ctx), addressFieldsChanged, poolDeleting, poolUnpaused)))
 	return nil
 }
+
+// poolUnpaused passes pool updates that lift the paused annotation: ipamutil skipped its claims meanwhile.
+var poolUnpaused = predicate.Funcs{UpdateFunc: func(e event.UpdateEvent) bool {
+	return annotations.HasPaused(e.ObjectOld) && !annotations.HasPaused(e.ObjectNew)
+}}
+
+// poolDeleting passes the start of a pool's deletion: deleted claims stop waiting for the grace period.
+var poolDeleting = predicate.Funcs{UpdateFunc: func(e event.UpdateEvent) bool {
+	return e.ObjectOld.GetDeletionTimestamp().IsZero() && !e.ObjectNew.GetDeletionTimestamp().IsZero()
+}}
 
 // ClaimHandlerFor returns the handler of claim.
 func (a *ProviderAdapter) ClaimHandlerFor(_ client.Client, claim *ipamv1.IPAddressClaim) ipamutil.ClaimHandler {
@@ -147,8 +163,11 @@ func (h *claimHandler) poolNotReady(message string) {
 
 // FetchPool loads the claim's NetBoxIPPool.
 // Until the pool is ready a live claim waits: the result makes ipamutil end the reconcile without an error,
-// and poolOpened wakes the claim. A deleted claim needs no ready pool.
+// and poolOpened wakes the claim. A deleted claim needs no ready pool. A paused claim is left alone.
 func (h *claimHandler) FetchPool(ctx context.Context) (client.Object, *ctrl.Result, error) {
+	if annotations.HasPaused(h.claim) {
+		return nil, &ctrl.Result{}, nil
+	}
 	pool := &v1alpha1.NetBoxIPPool{}
 	if err := h.Client.Get(ctx, client.ObjectKey{Namespace: h.claim.Namespace, Name: h.claim.Spec.PoolRef.Name}, pool); err != nil {
 		if apierrors.IsNotFound(err) {
@@ -176,15 +195,19 @@ func poolReady(p *v1alpha1.NetBoxIPPool) bool {
 // A failure is reported in the claim's Ready condition and returned, so the claim backs off.
 // The exception is a NetBox error while an allocated address is checked: an outage does not undo the allocation.
 func (h *claimHandler) EnsureAddress(ctx context.Context, address *ipamv1.IPAddress) (*ctrl.Result, error) {
-	netBoxWrites.Lock()
-	defer netBoxWrites.Unlock()
-	var err error
 	recheck := address.Spec.Address != "" // addresses never move once allocated
-	if recheck {
-		err = h.restore(ctx, address)
-	} else {
-		err = h.allocate(ctx, address)
-	}
+	err := underLock(ctx, h.NetBox, func(ctx context.Context, nb *netbox.Client) error {
+		hh := h.on(nb)
+		if !recheck {
+			return hh.allocate(ctx, address)
+		}
+		err := hh.restore(ctx, address)
+		if errors.Is(err, errAddressConflict) && nb != h.NetBox {
+			// A hand-back to this claim can land between the reads of the first pass: the locked pass decides.
+			return netbox.ErrWriteNeeded
+		}
+		return err
+	})
 	if err != nil {
 		switch {
 		case errors.Is(err, errAddressConflict):
@@ -198,13 +221,22 @@ func (h *claimHandler) EnsureAddress(ctx context.Context, address *ipamv1.IPAddr
 		return nil, err
 	}
 	// ipamutil records AddressRef only once the IPAddress exists, and that update wakes the claim.
-	// Unknown, not a deleted condition: an empty status is invalid.
-	if h.claim.Status.AddressRef.Name == "" {
+	// Unknown, not a deleted condition: an empty status is invalid. A recheck, as after clusterctl move, is ready at once.
+	if !recheck && h.claim.Status.AddressRef.Name == "" {
 		h.setReady(metav1.ConditionUnknown, reasonAllocating, "address allocated, waiting for the IPAddress object")
 		return nil, nil
 	}
 	h.setReady(metav1.ConditionTrue, clusterv1.ReadyReason, "") // CAPI defines no reason for a ready claim
 	return nil, nil
+}
+
+// on is h working on nb.
+func (h *claimHandler) on(nb *netbox.Client) *claimHandler {
+	a := *h.ProviderAdapter
+	a.NetBox = nb
+	hh := *h
+	hh.ProviderAdapter = &a
+	return &hh
 }
 
 // restore makes sure NetBox still holds address for the claim, and puts it back if someone deleted it.
@@ -244,6 +276,7 @@ func (h *claimHandler) restore(ctx context.Context, address *ipamv1.IPAddress) e
 		return err
 	}
 	ctrl.LoggerFrom(ctx).Info("Restored the NetBox address deleted outside the provider", "claim", klog.KObj(h.claim), "address", cidr)
+	normalEvent(h.Recorder, h.claim, "AddressRestored", "Restored the NetBox address %s deleted outside the provider", cidr)
 	return nil
 }
 
@@ -283,7 +316,9 @@ func (h *claimHandler) allocate(ctx context.Context, address *ipamv1.IPAddress) 
 	}
 	address.Spec.Address = p.Addr().String()
 	address.Spec.Prefix = ptr.To(h.pool.Status.AddressPrefixLength)
-	address.Spec.Gateway = h.pool.Status.Gateway
+	if !ptr.Deref(h.pool.Spec.OmitGateway, false) {
+		address.Spec.Gateway = h.pool.Status.Gateway
+	}
 	return nil
 }
 
@@ -314,6 +349,7 @@ func (h *claimHandler) findOrAllocate(ctx context.Context, ref string) (netbox.O
 		}
 		ctrl.LoggerFrom(ctx).Info("Gave the NetBox address deleted outside the provider back to its claim",
 			"claim", klog.KObj(h.claim), "holder", klog.KObj(holder), "address", ip.Address)
+		normalEvent(h.Recorder, holder, "AddressHandedBack", "Gave the NetBox address %s deleted outside the provider back to this claim", ip.Address)
 	}
 	return netbox.Object{}, fmt.Errorf("pool %s: the next %d free addresses are held by other claims, retrying", h.pool.Name, maxAllocationAttempts)
 }
@@ -376,25 +412,68 @@ func (h *claimHandler) findOrCreate(ctx context.Context, ref string) (netbox.Obj
 	return netbox.Object{}, fmt.Errorf("pool %s: %w", h.pool.Name, errPoolExhausted)
 }
 
-// ReleaseAddress deletes the claim's NetBox IP.
+// ReleaseAddress deletes the claim's NetBox IP once no other finalizer guards the claim, such as one an
+// infrastructure provider removes when the machine is gone, and the pool's grace period is over.
 func (h *claimHandler) ReleaseAddress(ctx context.Context) (*ctrl.Result, error) {
 	if deletedForMove(h.claim) {
 		return nil, nil
 	}
-	// Serialised with a hand-back to this claim.
-	netBoxWrites.Lock()
-	defer netBoxWrites.Unlock()
+	if f := foreignFinalizers(h.claim); len(f) > 0 {
+		h.setReady(metav1.ConditionFalse, v1alpha1.ReasonReleasing, "waiting for finalizers "+strings.Join(f, ", "))
+		return &ctrl.Result{RequeueAfter: netBoxRequeueAfter}, nil
+	}
+	if d := releaseWait(h.claim, h.pool, time.Now()); d > 0 {
+		t := releaseAt(h.claim, h.pool)
+		h.setReady(metav1.ConditionFalse, v1alpha1.ReasonReleasing, fmt.Sprintf("address kept until %s (addressReuseGracePeriodSeconds)", t.UTC().Format(time.RFC3339)))
+		return &ctrl.Result{RequeueAfter: d}, nil
+	}
 	ref := refOf("IPAddressClaim", h.claim)
-	found, err := h.NetBox.FindByRef(ctx, netbox.IPAddresses, h.Owner, ref)
-	if err != nil {
-		return nil, err
-	}
-	for _, ip := range found {
-		if err := h.NetBox.Delete(ctx, netbox.IPAddresses, ip.ID, "capi: released by "+ref); err != nil {
-			return nil, err
+	// Serialised with a hand-back to this claim: a release that finished without the lock could miss the address
+	// the hand-back writes right after it, and leave it behind.
+	err := locked(ctx, h.NetBox, func(ctx context.Context, nb *netbox.Client) error {
+		found, err := nb.FindByRef(ctx, netbox.IPAddresses, h.Owner, ref)
+		if err != nil {
+			return err
 		}
+		for _, ip := range found {
+			if err := nb.Delete(ctx, netbox.IPAddresses, ip.ID, "", "capi: released by "+ref); err != nil {
+				return err
+			}
+			ctrl.LoggerFrom(ctx).Info("Released the NetBox address", "claim", klog.KObj(h.claim), "address", ip.Address)
+			normalEvent(h.Recorder, h.claim, "AddressReleased", "Released the NetBox address %s", ip.Address)
+		}
+		return nil
+	})
+	if err != nil {
+		h.setReady(metav1.ConditionFalse, v1alpha1.ReasonReleaseFailed, err.Error())
 	}
-	return nil, nil
+	return nil, err
+}
+
+// foreignFinalizers are the finalizers of claim other than ipamutil's and those of the garbage collector.
+func foreignFinalizers(claim *ipamv1.IPAddressClaim) []string {
+	return slices.DeleteFunc(slices.Clone(claim.Finalizers), func(f string) bool {
+		return f == ipamutil.ReleaseAddressFinalizer || f == metav1.FinalizerDeleteDependents || f == metav1.FinalizerOrphanDependents
+	})
+}
+
+// releaseAt is when the address of the deleted claim may leave NetBox: its deletion plus the pool's grace period.
+// Zero without a grace period, without the pool or while the pool is being deleted.
+func releaseAt(claim *ipamv1.IPAddressClaim, pool *v1alpha1.NetBoxIPPool) time.Time {
+	if pool == nil || !pool.DeletionTimestamp.IsZero() || claim.DeletionTimestamp.IsZero() {
+		return time.Time{}
+	}
+	grace := ptr.Deref(pool.Spec.AddressReuseGracePeriodSeconds, 0)
+	if grace == 0 {
+		return time.Time{}
+	}
+	return claim.DeletionTimestamp.Add(time.Duration(grace) * time.Second)
+}
+
+// releaseWait is how long at now the address of the deleted claim still stays, 0 once it may leave. A RequeueAfter
+// of 0 or less would make ipamutil finish the deletion without the release.
+func releaseWait(claim *ipamv1.IPAddressClaim, pool *v1alpha1.NetBoxIPPool, now time.Time) time.Duration {
+	return max(releaseAt(claim, pool).Sub(now), 0)
 }
 
 func clusterOf(claim *ipamv1.IPAddressClaim) string {

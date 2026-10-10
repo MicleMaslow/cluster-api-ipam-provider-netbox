@@ -22,15 +22,18 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
 	. "github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
+	eventsv1 "k8s.io/api/events/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/tools/events"
 	"k8s.io/client-go/util/retry"
 	"k8s.io/utils/ptr"
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
@@ -50,6 +53,66 @@ func newG(t *testing.T) *WithT {
 	g.SetDefaultConsistentlyDuration(3 * time.Second)
 	g.SetDefaultConsistentlyPollingInterval(250 * time.Millisecond)
 	return g
+}
+
+// emitted drains the Events that a FakeRecorder collected.
+func emitted(r events.EventRecorder) []string {
+	fake, ok := r.(*events.FakeRecorder)
+	if !ok {
+		panic("emitted: not a FakeRecorder")
+	}
+	var out []string
+	for {
+		select {
+		case e := <-fake.Events:
+			out = append(out, e)
+		default:
+			return out
+		}
+	}
+}
+
+// waitEvent waits for a Normal Event with reason about the object name of ns.
+func waitEvent(g *WithT, ns, name, reason string) {
+	g.Eventually(func(g Gomega) {
+		list := &eventsv1.EventList{}
+		g.Expect(k8s.List(ctx, list, client.InNamespace(ns))).To(Succeed())
+		g.Expect(slices.ContainsFunc(list.Items, func(e eventsv1.Event) bool {
+			return e.Type == corev1.EventTypeNormal && e.Reason == reason && e.Regarding.Name == name
+		})).To(BeTrue(), "no %s event about %s", reason, name)
+	}).Should(Succeed())
+}
+
+// returnsWhileLocked reports whether f finishes while netBoxWrites is held, i.e. without waiting for the lock.
+// A section that does wait is let through once the time is up, so f always finishes.
+func returnsWhileLocked(f func()) bool {
+	netBoxWrites.Lock()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		f()
+	}()
+	select {
+	case <-done:
+		netBoxWrites.Unlock()
+		return true
+	case <-time.After(500 * time.Millisecond):
+	}
+	netBoxWrites.Unlock()
+	<-done
+	return false
+}
+
+// writesNeedLock fails t for a NetBox write that arrives while netBoxWrites is free.
+func writesNeedLock(t *testing.T, next http.Handler) http.Handler {
+	t.Helper()
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet && netBoxWrites.TryLock() {
+			netBoxWrites.Unlock()
+			t.Errorf("%s %s without netBoxWrites", r.Method, r.URL.Path)
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func needNetBox(t *testing.T) {
@@ -85,7 +148,7 @@ func newEnv(t *testing.T, clusterLabels map[string]string) string {
 				continue
 			}
 			for _, o := range objs {
-				if err := admin.Delete(ctx, path, o.ID, "test cleanup"); err != nil {
+				if err := admin.Delete(ctx, path, o.ID, "", "test cleanup"); err != nil {
 					t.Error(err)
 				}
 			}
@@ -212,7 +275,7 @@ func byHand(t *testing.T, g *WithT, path string, fields map[string]any) netbox.O
 	t.Helper()
 	o, err := admin.Create(ctx, path, fields)
 	g.Expect(err).NotTo(HaveOccurred())
-	t.Cleanup(func() { _ = admin.Delete(ctx, path, o.ID, "test cleanup") })
+	t.Cleanup(func() { _ = admin.Delete(ctx, path, o.ID, "", "test cleanup") })
 	return o
 }
 

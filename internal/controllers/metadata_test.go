@@ -85,6 +85,51 @@ func TestMergeCustomFields(t *testing.T) {
 	}
 }
 
+func TestNormalizeCustomField(t *testing.T) {
+	const (
+		vlan5    = `{"id":5,"url":"http://nb/api/ipam/vlans/5/","display":"v5","vid":50,"name":"v5"}`
+		vlan7    = `{"id":7,"url":"http://nb/api/ipam/vlans/7/","display":"v7","vid":70,"name":"v7"}`
+		choiceA  = `{"value":"a","label":"A"}`
+		choiceB  = `{"value":"b","label":"B"}`
+		urlValue = `"https://example.com/a b?x=1#f"`
+	)
+	for name, tc := range map[string]struct {
+		got, want string
+		equal     bool
+	}{
+		"object":                {vlan5, `5`, true},
+		"object, other id":      {vlan5, `6`, false},
+		"object, wrong shape":   {vlan5, `"5"`, false},
+		"object unset":          {``, `5`, false},
+		"object cleared":        {`null`, `null`, true},
+		"multi-object":          {`[` + vlan5 + `,` + vlan7 + `]`, `[5,7]`, true},
+		"multi-object unsorted": {`[` + vlan5 + `,` + vlan7 + `]`, `[7,5]`, true},
+		"multi-object, subset":  {`[` + vlan5 + `]`, `[5,7]`, false},
+		"multi-object, other":   {`[` + vlan5 + `,` + vlan7 + `]`, `[5,8]`, false},
+		"multi-object emptied":  {`[]`, `[]`, true},
+		"select 4.7":            {choiceA, `"a"`, true},
+		"select 4.7, other":     {choiceA, `"b"`, false},
+		"select 4.6":            {`"a"`, `"a"`, true},
+		"multiselect 4.7":       {`[` + choiceA + `,` + choiceB + `]`, `["a","b"]`, true},
+		"multiselect, order":    {`[` + choiceA + `,` + choiceB + `]`, `["b","a"]`, false},
+		"multiselect 4.6":       {`["a","b"]`, `["a","b"]`, true},
+		"multiselect, longer":   {`[` + choiceA + `,` + choiceB + `]`, `["a"]`, false},
+		"url":                   {urlValue, urlValue, true},
+		"url, other":            {urlValue, `"https://example.com"`, false},
+		"number":                {`5`, `5`, true},
+		"json list kept":        {`[3,1]`, `[3,1]`, true},
+		"json list, order":      {`[3,1]`, `[1,3]`, false},
+	} {
+		var want any
+		if err := json.Unmarshal([]byte(tc.want), &want); err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if got := jsonEqual(json.RawMessage(tc.got), want); got != tc.equal {
+			t.Errorf("%s: jsonEqual(%s, %s) = %v, want %v", name, tc.got, tc.want, got, tc.equal)
+		}
+	}
+}
+
 func TestMergeTags(t *testing.T) {
 	for name, tc := range map[string]struct {
 		current, desired, owned []string

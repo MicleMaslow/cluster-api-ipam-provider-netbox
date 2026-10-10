@@ -26,6 +26,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
+	"math"
 	"net/http"
 	"net/url"
 	"os"
@@ -49,7 +51,7 @@ const (
 )
 
 var (
-	// ErrNotFound means the object does not exist.
+	// ErrNotFound means NetBox answered 404 with JSON: the object does not exist.
 	ErrNotFound = errors.New("netbox: not found")
 	// ErrConflict is NetBox's answer when available-prefixes or available-ips has no room left.
 	ErrConflict = errors.New("netbox: conflict")
@@ -59,6 +61,10 @@ var (
 	ErrForbidden = errors.New("netbox: forbidden")
 	// ErrOverlap means an IP range would overlap another one.
 	ErrOverlap = errors.New("netbox: overlaps another IP range")
+	// ErrWriteNeeded means a read-only client was asked to write.
+	ErrWriteNeeded = errors.New("netbox: write needed")
+	// ErrMisconfigured means NetBox is set up in a way the provider cannot work with; retrying does not help.
+	ErrMisconfigured = errors.New("netbox: misconfigured")
 )
 
 // Object holds the fields the provider reads from prefixes, IP ranges, IP addresses and owners.
@@ -99,15 +105,49 @@ type Ref struct {
 const (
 	maxBody    = 10 << 20
 	maxErrBody = 512
+	// maxText is the length NetBox allows for changelog_message and description.
+	maxText = 200
 )
 
 // Client talks to one NetBox with a v2 API token (nbt_<key>.<token>).
 type Client struct {
 	URL   string
 	Token string
+	// TokenFile, if set, is read for the token on every request, so a rotated secret needs no restart.
+	TokenFile string
 	// UserAgent defaults to cluster-api-ipam-provider-netbox/<version>.
 	UserAgent string
 	HTTP      *http.Client
+
+	readOnly bool
+}
+
+// ReadOnly returns a copy of c that fails every request but GET with ErrWriteNeeded.
+func (c *Client) ReadOnly() *Client {
+	cp := *c
+	cp.readOnly = true
+	return &cp
+}
+
+// CheckToken fails if the token cannot be read: a token file that is missing or empty.
+func (c *Client) CheckToken() error {
+	_, err := c.token()
+	return err
+}
+
+func (c *Client) token() (string, error) {
+	if c.TokenFile == "" {
+		return c.Token, nil
+	}
+	b, err := os.ReadFile(filepath.Clean(c.TokenFile))
+	if err != nil {
+		return "", fmt.Errorf("read token file: %w", err)
+	}
+	token := strings.TrimSpace(string(b))
+	if token == "" {
+		return "", fmt.Errorf("token file %s is empty", c.TokenFile)
+	}
+	return token, nil
 }
 
 var defaultHTTP = &http.Client{
@@ -155,21 +195,17 @@ func AvailableIPs(rangeID int64) string {
 	return IPRanges + strconv.FormatInt(rangeID, 10) + "/available-ips/"
 }
 
-// List returns all objects at path matching q, following the pagination links.
-// Only the query of a next link is used: its host is whatever NetBox thinks it is behind a proxy.
+// List returns all objects at path matching q. It pages by id (ordering=id, id__gt=<last id>), so objects
+// created or deleted meanwhile cannot shift a page; the next link only tells whether there is more of it.
 func (c *Client) List(ctx context.Context, path string, q url.Values) ([]Object, error) {
 	query := url.Values{"limit": {"1000"}}
 	for k, v := range q {
 		query[k] = v
 	}
+	query.Set("ordering", "id")
 	var all []Object
-	seen := map[string]bool{}
+	prev := int64(math.MinInt64)
 	for {
-		key := query.Encode()
-		if seen[key] {
-			return nil, fmt.Errorf("GET %s: pagination loop at %q", path, key)
-		}
-		seen[key] = true
 		var page struct {
 			Next    string   `json:"next"`
 			Results []Object `json:"results"`
@@ -181,11 +217,11 @@ func (c *Client) List(ctx context.Context, path string, q url.Values) ([]Object,
 		if page.Next == "" {
 			return all, nil
 		}
-		next, err := url.Parse(page.Next)
-		if err != nil {
-			return nil, fmt.Errorf("GET %s: next link: %w", path, err)
+		if len(page.Results) == 0 || page.Results[len(page.Results)-1].ID <= prev {
+			return nil, fmt.Errorf("GET %s: pagination did not advance", path)
 		}
-		query = next.Query()
+		prev = page.Results[len(page.Results)-1].ID
+		query.Set("id__gt", strconv.FormatInt(prev, 10))
 	}
 }
 
@@ -209,8 +245,9 @@ func (c *Client) Patch(ctx context.Context, path string, id int64, etag string, 
 }
 
 // Delete removes one object, recording message in the changelog; one that is already gone is not an error.
-func (c *Client) Delete(ctx context.Context, path string, id int64, message string) error {
-	_, err := c.do(ctx, http.MethodDelete, objectPath(path, id), nil, "", map[string]any{"changelog_message": message}, nil)
+// A non-empty etag makes the delete conditional.
+func (c *Client) Delete(ctx context.Context, path string, id int64, etag, message string) error {
+	_, err := c.do(ctx, http.MethodDelete, objectPath(path, id), nil, etag, map[string]any{"changelog_message": message}, nil)
 	if errors.Is(err, ErrNotFound) {
 		return nil
 	}
@@ -220,13 +257,20 @@ func (c *Client) Delete(ctx context.Context, path string, id int64, message stri
 func objectPath(path string, id int64) string { return path + strconv.FormatInt(id, 10) + "/" }
 
 func (c *Client) do(ctx context.Context, method, path string, q url.Values, ifMatch string, body, out any) (etag string, err error) {
+	if c.readOnly && method != http.MethodGet {
+		return "", fmt.Errorf("%s %s: %w", method, path, ErrWriteNeeded)
+	}
+	token, err := c.token()
+	if err != nil {
+		return "", fmt.Errorf("%s %s: %w", method, path, err)
+	}
 	u := strings.TrimSuffix(c.URL, "/") + "/api/" + path
 	if len(q) > 0 {
 		u += "?" + q.Encode()
 	}
 	var reqBody io.Reader
 	if body != nil {
-		b, err := json.Marshal(body)
+		b, err := json.Marshal(truncateTexts(body))
 		if err != nil {
 			return "", err
 		}
@@ -236,8 +280,9 @@ func (c *Client) do(ctx context.Context, method, path string, q url.Values, ifMa
 	if err != nil {
 		return "", err
 	}
-	req.Header.Set("Authorization", "Bearer "+c.Token)
+	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Accept-Language", "en")
 	ua := c.UserAgent
 	if ua == "" {
 		ua = "cluster-api-ipam-provider-netbox/" + version.Get().GitVersion
@@ -253,7 +298,9 @@ func (c *Client) do(ctx context.Context, method, path string, q url.Values, ifMa
 	if hc == nil {
 		hc = defaultHTTP
 	}
+	start := time.Now()
 	resp, err := hc.Do(req)
+	observe(method, path, resp, err, start)
 	if err != nil {
 		return "", err
 	}
@@ -270,7 +317,7 @@ func (c *Client) do(ctx context.Context, method, path string, q url.Values, ifMa
 		return "", fmt.Errorf("%s %s: response too large (over %d bytes)", method, path, maxBody)
 	}
 	switch {
-	case resp.StatusCode == http.StatusNotFound:
+	case resp.StatusCode == http.StatusNotFound && strings.HasPrefix(resp.Header.Get("Content-Type"), "application/json"):
 		return "", fmt.Errorf("%s %s: %w", method, path, ErrNotFound)
 	case resp.StatusCode == http.StatusForbidden:
 		return "", fmt.Errorf("%s %s: %w: %s", method, path, ErrForbidden, snippet(data))
@@ -289,6 +336,23 @@ func (c *Client) do(ctx context.Context, method, path string, q url.Values, ifMa
 		}
 	}
 	return resp.Header.Get("ETag"), nil
+}
+
+// truncateTexts cuts the texts NetBox limits to maxText runes in a copy of body.
+func truncateTexts(body any) any {
+	fields, ok := body.(map[string]any)
+	if !ok {
+		return body
+	}
+	fields = maps.Clone(fields)
+	for _, k := range []string{"changelog_message", "description"} {
+		if s, ok := fields[k].(string); ok {
+			if r := []rune(s); len(r) > maxText {
+				fields[k] = string(r[:maxText])
+			}
+		}
+	}
+	return fields
 }
 
 func snippet(data []byte) string {

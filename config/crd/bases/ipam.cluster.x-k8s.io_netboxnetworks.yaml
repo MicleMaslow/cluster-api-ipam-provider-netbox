@@ -25,6 +25,10 @@ spec:
       jsonPath: .status.prefix
       name: Prefix
       type: string
+    - description: Control plane VIP
+      jsonPath: .status.controlPlaneEndpoint.host
+      name: VIP
+      type: string
     - description: Whether the network is reflected in NetBox
       jsonPath: .status.conditions[?(@.type=='Ready')].status
       name: Ready

@@ -23,7 +23,8 @@ CAPI_VERSION ?= v1.14.3
 ENVTEST_K8S_VERSION ?= 1.37.0
 KIND_CLUSTER ?= capi-netbox-dev
 DEV_COMPOSE := docker compose -f hack/dev/compose.yaml
-DEV_ENV := set -a && source hack/dev/.env && set +a
+DEV_ENV_FILE ?= hack/dev/.env
+DEV_ENV := set -a && source $(DEV_ENV_FILE) && set +a
 export KUBECONFIG := $(CURDIR)/hack/dev/kubeconfig
 
 #
@@ -158,7 +159,8 @@ verify-boilerplate: ## Verify license headers
 ENVTEST_ENV = KUBEBUILDER_ASSETS="$$($(SETUP_ENVTEST) use $(ENVTEST_K8S_VERSION) -p path)" CAPI_CRDS="$$(go mod download sigs.k8s.io/cluster-api && go list -m -f '{{.Dir}}' sigs.k8s.io/cluster-api)/core/config/crd/bases"
 
 .PHONY: test
-test: $(SETUP_ENVTEST) ## Run unit tests and CRD validation (no NetBox needed)
+test: $(SETUP_ENVTEST) ## Run unit tests, CRD validation and the control-plane VIP command test (no NetBox needed)
+	hack/test-control-plane-vip.sh
 	$(ENVTEST_ENV) go test ./...
 
 .PHONY: test-integration
@@ -212,7 +214,7 @@ dev-up: netbox-up kind-up ## NetBox + kind management cluster with CAPI core
 dev-down: kind-down netbox-down ## Remove the whole dev stand
 
 .PHONY: netbox-up
-netbox-up: ## Start NetBox 4.6.7 on :18000 and seed it
+netbox-up: ## Start NetBox on :18000 and seed it (4.6.7, NETBOX_IMAGE for another version)
 	$(DEV_COMPOSE) up -d --wait
 	hack/dev/seed.sh
 

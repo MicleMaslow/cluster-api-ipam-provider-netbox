@@ -48,7 +48,7 @@ Cluster API terms: see the [Cluster API Book Glossary](https://cluster-api.sigs.
 - **Owner**: the NetBox Owner object (NetBox ≥ 4.5) that marks the objects of one management plane.
 - **L2 network**: the subnet of the nodes' network, `gateway/addressPrefixLength`. Addresses get its mask; its network and broadcast address and the gateway are never handed out.
 - **Parent prefix**: an existing NetBox prefix that cluster subnets are carved from: the L2 network or a logical pool for CAPI inside it.
-- **VIP**: the address of the cluster's API server (kube-vip), reserved in the cluster prefix.
+- **VIP**: the address of the cluster's API server, reserved in the cluster prefix and served by a load balancer of the user's template (kube-vip, keepalived, ...).
 - **Key**: the `capi_ref` custom field, `Kind/namespace/name` of the Kubernetes object a NetBox object belongs to.
 
 ## Summary
@@ -88,7 +88,7 @@ See [Future Work](#future-work).
 2. As a network engineer, I see in NetBox which prefix, range and address belongs to which cluster and claim, and an address I take by hand is never handed to a machine.
 3. As a cluster operator, I add a pool of load balancer addresses to a running cluster by shrinking the workers pool, in one `kubectl apply`.
 4. As a platform operator, I move clusters from a bootstrap cluster to a permanent management cluster with `clusterctl move` and nothing in NetBox leaks or is duplicated.
-5. As a platform operator, the API address of a new cluster comes from its prefix in NetBox without anyone choosing it, and kube-vip, the kubeconfig and the join configs all carry it.
+5. As a platform operator, the API address of a new cluster comes from its prefix in NetBox without anyone choosing it, and the load balancer, the kubeconfig and the join configs all carry it.
 
 ### API
 
@@ -116,7 +116,7 @@ status:
   prefixID: 42
   addressPrefixLength: 22
   controlPlaneEndpoint: {host: 10.10.1.127, port: 6443}
-  conditions: [Ready, MetadataSynced, ControlPlaneEndpointReady]
+  conditions: [Ready, MetadataSynced, ControlPlaneEndpointReady, Paused]
 ---
 apiVersion: ipam.cluster.x-k8s.io/v1alpha1
 kind: NetBoxIPPool
@@ -127,18 +127,22 @@ spec:
   ipAddress:                     # optional Go templates of NetBox address fields
     dnsName: "{{ .Owner }}"      # default
     description: "{{ .Cluster }} {{ .Pool }} {{ .Owner }}"   # default
+  addressReuseGracePeriodSeconds: 300   # keep the address of a deleted claim this long, default 0, at most 86400
+  omitGateway: true              # addresses without a gateway, e.g. for a second NIC; default false
 status:
   ranges:
   - {networkName: demo, id: 7, startAddress: 10.10.1.80, endAddress: 10.10.1.117, ready: true}
   gateway: 10.10.0.1
   addressPrefixLength: 22
   ipAddresses: {total: 38, used: 3, free: 35}
-  conditions: [Ready, RangesReady]
+  conditions: [Ready, RangesReady, Paused]
 ```
 
 The CRDs reject an L2 network (`gateway/addressPrefixLength`) that does not contain `parentPrefix`, an `addressPrefixLength` longer than the parent mask, a `prefix` outside `parentPrefix`, a `prefixLength` not longer than the parent mask, IPv6, a changed `gateway` or `addressPrefixLength`, switching between `prefix` and `prefixLength`, `isPool` without `prefixLength`, an adopted `prefix` with `deletionPolicy: Delete`, two ranges in one network and a range whose `start` is after its `end` (for offsets of the same sign).
 
-Claims reference a pool with `poolRef: {apiGroup: ipam.cluster.x-k8s.io, kind: NetBoxIPPool, name: <pool>}`. The `IPAddress` gets the address, the mask of the L2 network and the gateway. The claim lifecycle (finalizers, owner references, pause) comes from `ipamutil` of the in-cluster IPAM provider; the claim's `Ready` condition uses the reasons of the contract (`PoolNotReady`, `PoolExhausted`, `AllocationFailed`) plus `AddressConflict` and `Allocating`.
+Claims reference a pool with `poolRef: {apiGroup: ipam.cluster.x-k8s.io, kind: NetBoxIPPool, name: <pool>}`. The `IPAddress` gets the address, the mask of the L2 network and the gateway; with `omitGateway` it gets no gateway, as for a second NIC whose default route is on the first one (it applies to addresses allocated after the change, as the `IPAddress` spec is immutable). The claim lifecycle (finalizers, owner references, pause) comes from `ipamutil` of the in-cluster IPAM provider; the claim's `Ready` condition uses the reasons of the contract (`PoolNotReady`, `PoolExhausted`, `AllocationFailed`) plus `AddressConflict`, `Allocating`, `Releasing` and `ReleaseFailed`.
+
+An address leaves NetBox when its claim is deleted, but not earlier than the machine stops using it. The release waits while the claim has finalizers of others than ipamutil, `foregroundDeletion` and `orphan`: an infrastructure provider keeps its finalizer on the claim until the machine is gone (CAPV: `ip-claim-protection`), and the claim is `Releasing` with their names, checked again every minute or when a finalizer goes. Then `addressReuseGracePeriodSeconds` of the pool keeps the address for that long after the deletion of the claim (`Releasing` with the time), so that caches of the old machine do not meet the new one; it does not apply while the pool is being deleted or is gone. A failed release is `ReleaseFailed` with the error. A claim deleted for `clusterctl move` releases nothing.
 
 `spec.ipAddress` sets `dns_name` and `description` of every address of the pool. Both are `text/template` (`missingkey=error`) over `.Owner` (the first owner reference of the claim, else the claim itself), `.Claim`, `.Cluster`, `.Namespace` and `.Pool`; an empty field takes the default, `{{ "" }}` leaves it empty in NetBox. The result is trimmed; `dnsName` is lowercased, as NetBox stores it, and checked against the NetBox DNS name pattern; `description` is cut to 200 characters. The fields are written when an address is created, restored or handed back to the claim that holds it, and compared at every reconcile of an allocated claim: a difference is patched, so a change of the templates reaches allocated addresses and manual edits of the two fields are overwritten. The owner chain is not followed to the Machine; with CAPV the owner of the claim is the VSphereVM, whose name matches the Machine and the node. A template that does not render on sample values or gives an invalid DNS name makes the pool `InvalidSpec`: no new addresses, allocated claims keep `Ready`. A claim whose own values do not render fails with `AllocationFailed`, or, once allocated, keeps its `Ready` and backs off; its address is still restored or handed back, with both fields empty. Templates may not use `range`, `define`, `block` or `template`, and a value is limited to 1024 bytes.
 
@@ -154,7 +158,9 @@ Every object the provider writes carries `owner`, the custom fields `capi_ref` a
 
 An object is looked up with `cf_capi_ref=<key>&owner_id=<owner>`, the ranges of a pool with `cf_capi_ref__isw=NetBoxIPPool/<ns>/<pool>/`. NetBox ignores unknown `cf_` filters and matches text fields with `icontains` unless `filter_logic` is `exact`, so the provider checks both custom fields at start and re-checks every result on the client. Lists follow pagination.
 
-On start the provider checks the NetBox version (≥ 4.6), both custom fields (type text, `filter_logic: exact`, object types prefix, IP range, IP address) and the Owner, and exits with the reason otherwise.
+On start the provider checks the NetBox version (≥ 4.6), both custom fields (type text, `filter_logic: exact`, object types prefix, IP range, IP address, in NetBox 4.7 status `active`), that NetBox answers with an `ETag` (conditional updates need it; a proxy may strip it) and the Owner. The check runs in the manager without leader election, and the controllers start after it passes; until then `/readyz` is not ready and `/healthz` answers. Errors that a retry may clear (NetBox down, 5xx, a custom field in status `provisioning`) are retried in the process with a wait of 1 s growing to 1 min, so a restart during a NetBox outage does not crash-loop the pod. A setup the provider cannot work with (version, custom fields, no `ETag`, no such Owner) makes it exit with code 1 and the reason.
+
+Every request carries `Accept-Language: en` (the overlap of ranges is recognised by the English error text of NetBox); `changelog_message` and `description` are cut to the 200 characters NetBox allows; a 404 is "not found" only when NetBox answers it with JSON, so one from a proxy is an error; lists are paged by `id` (`ordering=id&id__gt=<last>`), which creation and deletion between the pages cannot skip or repeat. The token is `NETBOX_TOKEN` or the file `NETBOX_TOKEN_FILE`, read at every request, so a rotated secret needs no restart.
 
 ### Ownership and idempotency
 
@@ -164,8 +170,10 @@ On start the provider checks the NetBox version (≥ 4.6), both custom fields (t
 - Out-of-band changes in NetBox:
   - a prefix gone while the status holds it: `PrefixNotFound`, no new carve;
   - an address gone while its `IPAddress` exists: created again with the same address, or `AddressConflict` if NetBox gave the address to another object;
-  - an address deleted by hand and allocated to another claim before its owner noticed: given back to the claim that holds it, and the next free address is taken.
-- Errors map to reasons on conditions. States that only a NetBox change can clear (`Forbidden`, `Exhausted`, `RangeInUse`, ...) are checked again every minute; waits on Kubernetes objects are woken by watches.
+  - an address deleted by hand and allocated to another claim before its owner noticed: given back to the claim that holds it, and the next free address is taken;
+  - a prefix, or the VIP, left `deprecated` by a deleted network of the same name that does not fit the spec of the new one (another prefix length, a VIP outside the new prefix): its key becomes `<ref>/retired` (`capi_cluster` stays), and a new prefix is carved or a new VIP reserved. The clean-up script finds retired objects by `capi_cluster`.
+- Errors map to reasons on conditions. States that only a NetBox change can clear (`Forbidden`, `Exhausted`, `RangeInUse`, ...) are checked again every minute; waits on Kubernetes objects are woken by watches. A failing object backs off at most a minute in all three controllers.
+- Sections that check and then write (prefix and VIP, a range, an address) run one at a time in the process. Each runs first without the lock on a client that fails on any write; only a section that has something to write runs again under the lock, so steady-state reconciles never wait for it. Releasing an address always takes the lock. The wait is the metric `netbox_ipam_write_lock_wait_seconds`.
 
 ### Pools and ranges
 
@@ -178,14 +186,18 @@ On start the provider checks the NetBox version (≥ 4.6), both custom fields (t
 
 ### Control-plane endpoint
 
-KubeadmControlPlane creates no kubeconfig, machines or bootstrap data until `Cluster.spec.controlPlaneEndpoint` is set, and CAPI puts the endpoint into the kubeadm config of every node. The network reserves the VIP right after its prefix, once its Cluster exists, and writes it to the Cluster, so everything CAPI renders carries it and kube-vip reads it from the kubeadm config.
+KubeadmControlPlane creates no kubeconfig, machines or bootstrap data until `Cluster.spec.controlPlaneEndpoint` is set, and CAPI puts the endpoint into the kubeadm config of every node. The network reserves the VIP right after its prefix, once its Cluster exists, and writes it to the Cluster, so everything CAPI renders carries it. The field is for infrastructure providers without a load balancer of their own (CAPV, Metal3 and similar); CAPO, CAPA and others that create one set the endpoint themselves.
+
+The provider knows nothing about the load balancer. The address is chosen after the template is applied, and CAPI puts no field of the Cluster into files of a KubeadmConfig, so the load balancer config of the user's template carries the placeholders `__CONTROL_PLANE_ENDPOINT__` and `__CONTROL_PLANE_PORT__`. One `preKubeadmCommands` command replaces them on the node with the host and port of the kubeadm config that CAPI renders there (`/run/kubeadm/kubeadm.yaml`, `/run/kubeadm/kubeadm-join-config.yaml`, `/etc/kubeadm.yml` with Ignition) and fails without an address. The file it edits is a parameter of the command: a kube-vip manifest, `keepalived.conf` or another. The command is [`docs/examples/control-plane-vip.yaml`](../examples/control-plane-vip.yaml); `make test` runs it on the configs CAPI v1.14 renders for init and join, with cloud-init and Ignition. The kube-vip manifest itself is the user's, from the CAPV cluster template.
 
 - **Choice.** The host of the Cluster's endpoint if it is an address inside the prefix (migration of a running cluster). Otherwise the highest address of the prefix that is not the network, broadcast or gateway of the L2 network, holds no NetBox address and is in no IP range. An unusable endpoint address is `EndpointConflict`.
 - **NetBox.** An IP address with the L2 mask, role `vip`, status `active`, the owner, the key `NetBoxNetwork/<ns>/<name>/vip` and `dns_name` from the spec. It is found by the key, never moves, and is created again at its old address if it is lost; one moved by hand is `EndpointConflict`.
-- **Cluster.** A merge patch of `spec.controlPlaneEndpoint` only, with the VIP and `status.controlPlaneEndpoint.port`, and only while the endpoint has no host or no port. Another endpoint is `EndpointConflict` and the Cluster is not touched. The Cluster is watched, so the order of applying the manifests does not matter: a new VIP waits for the Cluster, whose endpoint may be the VIP (`WaitingForCluster`); a paused Cluster is skipped.
+- **Cluster.** A merge patch of `spec.controlPlaneEndpoint` only, and only of the empty parts: the host with the VIP, the port with `spec.controlPlaneEndpoint.port`, else the port of the Cluster, else 6443 (CAPI copies a port alone from an infrastructure cluster); `status.controlPlaneEndpoint` has the same port. A host other than the VIP, or a port other than a given `spec.controlPlaneEndpoint.port`, is `EndpointConflict` and the Cluster is not touched. A conflict on the patch (409) is retried at once without a change of the condition. The Cluster is watched, so the order of applying the manifests does not matter: a new VIP waits for the Cluster, whose endpoint may be the VIP (`WaitingForCluster`). A network whose Cluster does not exist and that has no prefix yet touches nothing in NetBox (`Ready=False`, `WaitingForCluster`), one that holds a prefix works on. A network is paused with its Cluster or by its own annotation (condition `Paused`, set with `paused.EnsurePausedCondition`).
 - **Conditions.** `ControlPlaneEndpointReady` is True when the VIP is reserved and the Cluster has it, else False with `WaitingForCluster`, `EndpointConflict` or the reason of the VIP error. It never changes `Ready`: a VIP error stops no pool.
 - **Pools.** A range that is not in NetBox yet waits for the VIP (`NetworkNotReady`); one over the VIP is `InvalidRange`.
-- **Deletion.** The VIP follows `deletionPolicy`. Removing `controlPlaneEndpoint` from the spec keeps the VIP in NetBox and in the status, so pools keep off it.
+- **Deletion.** The VIP follows `deletionPolicy`. Under `Delete` the network waits (`WaitingForCluster`) while its Cluster has the VIP as endpoint host, since a deleted VIP could go to another cluster that the first one is still served on; a retained VIP is never handed out and needs no wait. Removing `controlPlaneEndpoint` from the spec keeps the VIP in NetBox and in the status, so pools keep off it; the address is freed by deleting the network or the VIP address.
+- **Lost status.** If the prefix is not found by its key and the status is empty, but an active VIP of the network is in NetBox, the network is `PrefixNotFound`, as with a known status: the prefix is not carved again.
+- **Duplicates.** NetBox does not check the uniqueness of addresses with role `vip`, so after creating the VIP the provider looks for other global-VRF objects with its address. If it finds an older one (a lower NetBox id), it deletes its own VIP and reports `EndpointConflict`; the next reconcile picks another address. Newer objects only make it log: of two racing creators the older stays, and a long-lived VIP is not deleted for a newer object. The check also runs while the status has no VIP, as after `clusterctl move`.
 - **No feature gate.** The field in the spec of a network switches the behaviour on for that network. The provider needs `patch` on `clusters` and touches no infrastructure kind.
 
 ### deletionPolicy
@@ -197,7 +209,7 @@ KubeadmControlPlane creates no kubeconfig, machines or bootstrap data until `Clu
 | VIP | `deprecated`, taken back when the network is created again | deleted | `deprecated` |
 | addresses | deleted with the claim | deleted with the claim | deleted with the claim |
 
-A network being deleted waits for the pools with a range in it (`WaitingForPools`); a pool waits for its `IPAddress` objects (`WaitingForAddresses`) and for NetBox addresses left in its ranges (`RangeInUse`). Without the NetBox permission a network or pool keeps its finalizer and reports `Forbidden`; a claim keeps its finalizer and the error is only logged, since ipamutil sets no condition on a failed release.
+A network being deleted waits for the pools with a range in it (`WaitingForPools`); a pool waits for its `IPAddress` objects (`WaitingForAddresses`) and for NetBox addresses left in its ranges (`RangeInUse`). Without the NetBox permission a network or pool keeps its finalizer and reports `Forbidden`; a claim keeps its finalizer and is `ReleaseFailed` with the error.
 
 ### Adoption
 
@@ -207,11 +219,12 @@ With `spec.prefix` the network takes a given CIDR inside the parent. An existing
 
 - NetBox objects are not touched by a move: a deletion with the `clusterctl.cluster.x-k8s.io/delete-for-move` annotation releases nothing. The target finds everything by key and rebuilds the status, including removed ranges that still hold addresses.
 - Invariant: one Owner per management plane, kept through move and pivot; source and target run with the same `--netbox-owner`. Management planes that share a NetBox must not repeat the namespace and name of these objects.
-- A network pauses with its Cluster (`spec.clusterName`); a pool pauses with the Cluster named by its `cluster.x-k8s.io/cluster-name` label.
+- `clusterctl move` pauses Clusters only. A network pauses with its Cluster (`spec.clusterName`); a pool pauses with the Cluster named by its `cluster.x-k8s.io/cluster-name` label or the Cluster of any of its networks, or by its own paused annotation, which a pool shared by several clusters needs for the move; its claims are skipped with it. A network in the target without a prefix in its status waits for its Cluster and touches nothing in NetBox.
+- The key is `Kind/namespace/name`: a move that changes the namespace makes the target carve new objects.
 
 ### Metadata
 
-`spec.customFields` and `spec.tags` are applied to the prefix in one conditional update. A JSON-object custom field is merged key by key; keys the provider wrote earlier (`status.customFieldKeys`) and no longer given are removed; other values replace the field. Tags the provider set (`status.tags`) and no longer given are removed, tags of others stay. `capi_ref` and `capi_cluster` cannot be set. Failures show in `MetadataSynced` and never block `Ready`.
+`spec.customFields` and `spec.tags` are applied to the prefix in one conditional update. A JSON-object custom field is merged key by key; keys the provider wrote earlier (`status.customFieldKeys`) and no longer given are removed; other values replace the field. Tags the provider set (`status.tags`) and no longer given are removed, tags of others stay. `capi_ref` and `capi_cluster` cannot be set. Failures show in `MetadataSynced` and never block `Ready`. A value is compared with what NetBox returns in the form it is written in, otherwise it would be written at every reconcile: the `value` of a select and multiselect (NetBox 4.7 returns `{value,label}`), the `id` of an object and multi-object field, a multi-object list without regard to its order. Other types are returned as written (checked on 4.6.7 and 4.7.2) except a datetime written with a space, which NetBox rewrites with `T`: write ISO 8601.
 
 ### Security Model
 
@@ -234,7 +247,7 @@ NetBox token. The provider authenticates with a v2 token of a dedicated NetBox u
   | `ipam.iprange` | `{"owner__name": "capi-mgmt-a", "start_address__net_host_contained": "10.10.0.0/16", "end_address__net_host_contained": "10.10.0.0/16"}` |
   | `ipam.ipaddress` | `{"owner__name": "capi-mgmt-a", "address__net_host_contained": "10.10.0.0/16"}` |
 
-Kubernetes. The token reaches the provider as environment from the Secret `capi-ipam-netbox-credentials`; the provider has no RBAC on Secrets. It reads Clusters and patches their `spec.controlPlaneEndpoint`, writes its own kinds, `IPAddressClaim` status and `IPAddress` objects. Metrics are served on the diagnostics port behind authentication and authorization, as in Cluster API.
+Kubernetes. The token reaches the provider as environment from the Secret `capi-ipam-netbox-credentials`, or as a file the user mounts (`NETBOX_TOKEN_FILE`); the provider has no RBAC on Secrets. It reads Clusters and patches their `spec.controlPlaneEndpoint`, writes its own kinds, `IPAddressClaim` status and `IPAddress` objects, and creates Events. Metrics (controller-runtime, `netbox_ipam_requests_total`, `netbox_ipam_request_duration_seconds`, `netbox_ipam_write_lock_wait_seconds`) are served on the diagnostics port behind authentication and authorization, as in Cluster API.
 
 Tenancy. Anyone who may create a `NetBoxNetwork` in a namespace may carve from any parent prefix the token can write to and adopt deprecated prefixes of the same namespace. NetBox constraints bound what the token can reach; an admin-scoped parent object is future work.
 
@@ -242,10 +255,11 @@ Transport. The provider trusts the system roots plus an optional CA file. `http:
 
 ### Risks and Mitigations
 
-- **Retained prefixes fill the parent.** A deprecated prefix still occupies its space for `available-prefixes`. Mitigation: documented; cleanup of retained objects by the NetBox admin; a report or GC is future work.
-- **NetBox checks overlap and uniqueness without a lock.** Two parallel range creates, or a plain create next to an `available-*` request, can both pass. Mitigation: the provider runs its check-then-write sections (range create, resize and release with the fence, prefix adopt and carve, address allocation and restore) one at a time in its process, and leader election makes that process the only writer of its Owner. Management planes with other Owners that share a parent are not covered.
-- **Pool to Cluster link is a label.** Without `cluster.x-k8s.io/cluster-name` a pool does not pause with its Cluster. Mitigation: documented; deriving the cluster from the pool's networks is possible later.
-- **NetBox outage.** The provider does not start without NetBox. While running, allocated claims stay `Ready`; new allocations and changes wait and are retried.
+- **Retained prefixes fill the parent.** A deprecated prefix still occupies its space for `available-prefixes`; so do retired ones (`<ref>/retired`). Mitigation: documented; cleanup of retained objects by the NetBox admin with `hack/netbox-cleanup-retained.sh`, which deletes each object conditionally on its ETag; a report or GC is future work.
+- **NetBox checks overlap and uniqueness without a lock.** Two parallel range creates, or a plain create next to an `available-*` request, can both pass. Mitigation: the provider runs its check-then-write sections (range create, resize and release with the fence, prefix adopt and carve, address allocation and restore) one at a time in its process, and leader election makes that process the only writer of its Owner. Management planes with other Owners that share a parent are not covered, and neither is a NetBox behind PgBouncer in transaction pooling, which does not hold the advisory lock of `available-*`.
+- **Pool to Cluster link is a label, or a network.** A pool pauses with the Cluster of its label and of any of its networks; a pool shared by several clusters needs the paused annotation for a move. Mitigation: documented.
+- **An address freed while the machine uses it.** ipamutil calls the release as soon as the claim is deleted, and a deleted namespace or a claim deleted by hand would free the address of a live VM. Mitigation: the release waits for finalizers of others (CAPV's `ip-claim-protection`), and `addressReuseGracePeriodSeconds` delays the reuse; neither applies to a claim deleted for `clusterctl move`.
+- **NetBox outage.** The provider starts without NetBox, not ready, and retries the check with a back-off of at most a minute. While running, allocated claims stay `Ready`; new allocations and changes wait and are retried. Calls to NetBox are visible in the metrics, changes as Events.
 - **Shared NetBox between management planes.** Protected by the Owner, the owner guard and the key invariant; a broken invariant blocks with `OwnedByOtherOwner` instead of writing.
 
 ## Alternatives
@@ -268,12 +282,13 @@ The API is `v1alpha1`: fields can change between minor releases, without convers
 
 - Unit tests with `httptest` for the NetBox client (pagination included), preflight, metadata merge and address math.
 - CRD validation tests on envtest.
-- Controller tests on envtest against a real NetBox 4.6.7 (docker compose), including deletion without the delete permission, objects deleted in NetBox by hand, blocked shrinks, missing tags, objects of another owner and `clusterctl move`.
+- Controller tests on envtest against a real NetBox (docker compose) in CI on 4.6.7 and 4.7.2, including deletion without the delete permission, objects deleted in NetBox by hand, blocked shrinks, missing tags, custom fields that NetBox returns in another form, objects of another owner and `clusterctl move`.
+- A shell test of the control-plane VIP command on the kubeadm configs of CAPI v1.14 (cloud-init and Ignition, init and join), run by `make test` with bash, sed, awk and grep only.
 - Future: end-to-end tests with the Cluster API test framework, an infrastructure provider simulator, `clusterctl move` between two management clusters.
 
 ### Version Skew Strategy
 
-The provider refuses to start against NetBox older than 4.6. It follows the Cluster API contract v1beta2 (tested with Cluster API v1.14.3).
+The provider exits at start against NetBox older than 4.6 (tested with 4.6.7 and 4.7.2). It follows the Cluster API contract v1beta2 (tested with Cluster API v1.14.3).
 
 ## Future Work
 
@@ -281,10 +296,11 @@ The provider refuses to start against NetBox older than 4.6. It follows the Clus
 2. **Address enrichment from the Machine.** Fill `dns_name` and `description` from the Machine (claim → infrastructure machine → Machine by owner references) instead of the claim's first owner, and create no VM and interface objects.
 3. **Migration with `spec.importFrom`.** Record the addresses already allocated by another IPAM pool in NetBox under the keys of their claims, so running clusters switch without re-addressing.
 4. **Admin-scoped parent.** A cluster-scoped `NetBoxParentNetwork` with prefix, gateway, VRF, defaults and `allowedNamespaces`, referenced by `NetBoxNetwork.spec.parentRef`; the gateway is set once and `MixedNetworks` becomes a check of the same reference.
-5. Further: IPv6 and VRFs, a report or GC of retained objects, a `Paused` condition, a token file with rotation, start without NetBox.
+5. Further: IPv6 and VRFs, a report or GC of retained objects.
 
 ## Implementation History
 
 - 2026-10-06: design.
 - 2026-10-07: v0.1 implemented: networks, pools with per-range readiness and editable ranges, claims, metadata, owner guard, move support.
 - 2026-10-10: the L2 network separate from the parent prefix (`addressPrefixLength`, `isPool`); the control plane VIP (`controlPlaneEndpoint`) reserved in NetBox and written to `Cluster.spec.controlPlaneEndpoint`.
+- 2026-10-10: hardening from the experience of other providers: start without NetBox, token file, metrics and Events, writes under the lock only when needed, claims released after finalizers of others and a grace period, `omitGateway`, `Paused` condition, partial Cluster endpoint, retired retained objects, NetBox 4.7 tested, a load balancer-agnostic VIP command.

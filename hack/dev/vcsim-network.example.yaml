@@ -7,6 +7,8 @@ spec:
     team: platform      # text
     priority: 2         # integer
     monitored: true     # boolean
+    site_tier: standard # select
+    vlan: 1             # object, the id of the VLAN dev-vlan from seed.sh (1 on a fresh NetBox)
     labels:             # json, merged key by key
       cluster: ${CLUSTER_NAME}
       env: dev

@@ -15,9 +15,15 @@ permissions:
 
 jobs:
   integration:
-    name: integration
+    name: integration (NetBox ${{ matrix.netbox }})
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        netbox: [v4.6.7-5.0.2, v4.7.2-5.1.1]
+    env:
+      NETBOX_IMAGE: docker.io/netboxcommunity/netbox:${{ matrix.netbox }}
     steps:
     - name: Checkout
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

@@ -15,8 +15,11 @@
 # limitations under the License.
 
 # Deletes the deprecated NetBox objects a cluster left under deletionPolicy: Retain:
-# the control-plane VIP, the pool IP ranges and the prefix. Lists them unless --yes is given.
+# the control-plane VIP, the pool IP ranges and the prefix, and those a new network of the same name retired
+# (capi_ref <ref>/retired). Lists them unless --yes is given.
 # --namespace keeps only objects whose capi_ref is in that namespace: same-named clusters share capi_cluster.
+# Each delete is conditional on the ETag of the object read just before (NetBox checks it) and counts
+# only with HTTP 204.
 # Needs bash, curl, jq and a token that may delete them.
 set -euo pipefail
 
@@ -29,7 +32,7 @@ cluster='' yes='' ns=''
 while [ $# -gt 0 ]; do
   case $1 in
     --yes) yes=1 ;;
-    --namespace) [ $# -gt 1 ] && [ -n "$2" ] || usage; ns=$2; shift ;;
+    --namespace) case ${2-} in '' | --*) usage ;; esac; ns=$2; shift ;;
     -*) usage ;;
     *) [ -z "$cluster" ] || usage; cluster=$1 ;;
   esac
@@ -64,12 +67,32 @@ list() {
   done
 }
 
-remove() {
-  local body
-  body=$(jq -nc --arg m "capi: retained objects of $cluster cleaned up" '{changelog_message: $m}')
-  api DELETE "ipam/$1/$2/" --fail-with-body -H 'Content-Type: application/json' --data "$body" \
-    || { echo "DELETE $1/$2 failed" >&2; return 1; }
+# call METHOD PATH [curl args]: the status in $code, the headers in $tmp/head, the body in $tmp/body.
+call() {
+  code=$(api "$@" -o "$tmp/body" -D "$tmp/head" -w '%{http_code}') || return 1
 }
+
+# fail MESSAGE: MESSAGE, then the body of the last answer on a line of its own.
+fail() {
+  echo "$1 (HTTP $code)" >&2
+  [ ! -s "$tmp/body" ] || { cat "$tmp/body"; echo; } >&2
+  return 1
+}
+
+# remove TYPE ID: reads the object for its ETag, deletes it only if it still is that version.
+remove() {
+  local etag body
+  call GET "ipam/$1/$2/" || return 1
+  [ "$code" = 200 ] || fail "GET $1/$2 failed" || return 1
+  etag=$(tr -d '\r' <"$tmp/head" | awk 'tolower($1) == "etag:" {sub(/^[^:]*: */, ""); print; exit}')
+  [ -n "$etag" ] || { echo "GET $1/$2 returned no ETag (a proxy strips it?)" >&2; return 1; }
+  body=$(jq -nc --arg m "capi: retained objects of $cluster cleaned up" '{changelog_message: $m}')
+  call DELETE "ipam/$1/$2/" -H 'Content-Type: application/json' -H "If-Match: $etag" --data "$body" || return 1
+  [ "$code" = 204 ] || fail "DELETE $1/$2 failed" || return 1
+}
+
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
 
 res=$(api GET users/owners/ --fail-with-body -G --data-urlencode "name=$NETBOX_OWNER")
 owner=$(jq -r --arg n "$NETBOX_OWNER" '[.results[] | select(.name == $n)][0].id // empty' <<<"$res")

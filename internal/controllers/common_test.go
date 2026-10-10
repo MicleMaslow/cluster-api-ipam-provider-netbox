@@ -36,6 +36,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+	crmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
 	"github.com/MicleMaslow/cluster-api-ipam-provider-netbox/api/v1alpha1"
 	"github.com/MicleMaslow/cluster-api-ipam-provider-netbox/internal/netbox"
@@ -181,5 +182,93 @@ func TestNetworkUsable(t *testing.T) {
 		if got := networkUsable(nw); got != tc.want {
 			t.Errorf("%s: networkUsable = %t, want %t", name, got, tc.want)
 		}
+	}
+}
+
+// lockFree reports whether netBoxWrites can be taken; a controller of the suite may hold it for a moment.
+func lockFree() bool {
+	for range 200 {
+		if netBoxWrites.TryLock() {
+			netBoxWrites.Unlock()
+			return true
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return false
+}
+
+// lockWaits is the number of waits for netBoxWrites that the metric has seen.
+func lockWaits(t *testing.T) uint64 {
+	t.Helper()
+	families, err := crmetrics.Registry.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range families {
+		if f.GetName() == "netbox_ipam_write_lock_wait_seconds" {
+			return f.GetMetric()[0].GetHistogram().GetSampleCount()
+		}
+	}
+	t.Fatal("netbox_ipam_write_lock_wait_seconds is not registered")
+	return 0
+}
+
+func TestUnderLockReadOnly(t *testing.T) {
+	nb := &netbox.Client{URL: "http://netbox.invalid", Token: "t"}
+	calls := 0
+	err := underLock(context.Background(), nb, func(ctx context.Context, c *netbox.Client) error {
+		calls++
+		if !lockFree() {
+			t.Error("netBoxWrites is held while the section only reads")
+		}
+		if _, err := c.Patch(ctx, netbox.Prefixes, 1, "", nil); !errors.Is(err, netbox.ErrWriteNeeded) {
+			t.Errorf("the first pass client writes: %v", err)
+		}
+		return nil
+	})
+	if err != nil || calls != 1 {
+		t.Errorf("err %v after %d calls, want nil after 1", err, calls)
+	}
+}
+
+func TestUnderLockWrites(t *testing.T) {
+	nb := &netbox.Client{URL: "http://netbox.invalid", Token: "t"}
+	var seen []*netbox.Client
+	waits := lockWaits(t)
+	err := underLock(context.Background(), nb, func(ctx context.Context, c *netbox.Client) error {
+		seen = append(seen, c)
+		if len(seen) == 1 {
+			wrapped := fmt.Errorf("PATCH ipam/ip-ranges/1/: %w", netbox.ErrWriteNeeded)
+			return fmt.Errorf("range a: %w", retryLater(v1alpha1.ReasonRangeInUse, wrapped))
+		}
+		if netBoxWrites.TryLock() {
+			netBoxWrites.Unlock()
+			t.Error("netBoxWrites is free in the second pass")
+		}
+		if dl, ok := ctx.Deadline(); !ok || time.Until(dl) > netBoxWriteTimeout {
+			t.Errorf("deadline %v, ok %t, want within %s", dl, ok, netBoxWriteTimeout)
+		}
+		return nil
+	})
+	if err != nil || len(seen) != 2 || seen[0] == nb || seen[1] != nb {
+		t.Errorf("err %v, %d calls, first on nb %t, second on nb %t; want nil, 2, false, true", err, len(seen), len(seen) > 0 && seen[0] == nb, len(seen) > 1 && seen[1] == nb)
+	}
+	if !lockFree() {
+		t.Error("netBoxWrites is still held after the section")
+	}
+	if got := lockWaits(t); got <= waits {
+		t.Errorf("%d waits observed, want more than %d", got, waits)
+	}
+}
+
+func TestUnderLockError(t *testing.T) {
+	boom := errors.New("boom")
+	calls := 0
+	err := underLock(context.Background(), &netbox.Client{URL: "http://netbox.invalid", Token: "t"}, func(context.Context, *netbox.Client) error {
+		calls++
+		return withReason(v1alpha1.ReasonDuplicate, boom)
+	})
+	if !errors.Is(err, boom) || calls != 1 {
+		t.Errorf("err %v after %d calls, want boom after 1", err, calls)
 	}
 }

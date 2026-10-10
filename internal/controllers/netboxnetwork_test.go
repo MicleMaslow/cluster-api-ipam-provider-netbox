@@ -18,10 +18,16 @@ package controllers
 
 import (
 	"encoding/json"
+	"fmt"
+	"io"
+	"maps"
+	"net/http"
+	"net/http/httptest"
 	"net/netip"
 	"net/url"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -30,6 +36,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/tools/events"
 	"k8s.io/utils/ptr"
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -194,7 +201,7 @@ func TestNetworkPrefixNotFound(t *testing.T) {
 	nw := newNetwork(ns, "default")
 	g.Expect(k8s.Create(ctx, nw)).To(Succeed())
 	waitReady(g, nw)
-	g.Expect(admin.Delete(ctx, netbox.Prefixes, nw.Status.PrefixID, "test: deleted by hand")).To(Succeed())
+	g.Expect(admin.Delete(ctx, netbox.Prefixes, nw.Status.PrefixID, "", "test: deleted by hand")).To(Succeed())
 
 	touch(g, nw)
 	waitCondition(g, nw, metav1.ConditionFalse, v1alpha1.ReasonPrefixNotFound)
@@ -278,19 +285,54 @@ func TestNetworkParentNotFound(t *testing.T) {
 	waitTypedCondition(g, nw, v1alpha1.MetadataSyncedCondition, metav1.ConditionUnknown, v1alpha1.ReasonWaitingForPrefix)
 }
 
-func TestNetworkSkipsPausedCluster(t *testing.T) {
+func TestNetworkPausedCondition(t *testing.T) {
 	g := newG(t)
 	ns := newEnv(t, nil)
 	setPaused(t, ns, true)
 	nw := newNetwork(ns, "default")
 	g.Expect(k8s.Create(ctx, nw)).To(Succeed())
+	waitTypedCondition(g, nw, clusterv1.PausedCondition, metav1.ConditionTrue, clusterv1.PausedReason)
 	g.Consistently(func(g Gomega) {
 		g.Expect(k8s.Get(ctx, client.ObjectKeyFromObject(nw), nw)).To(Succeed())
 		g.Expect(nw.Status.Prefix).To(BeEmpty())
 	}).Should(Succeed())
 
 	setPaused(t, ns, false)
+	waitTypedCondition(g, nw, clusterv1.PausedCondition, metav1.ConditionFalse, clusterv1.NotPausedReason)
 	waitReady(g, nw)
+}
+
+// A Paused condition that only lags the generation, as after a spec edit, is written, not dropped.
+func TestNetworkPausedObservedGeneration(t *testing.T) {
+	g := NewWithT(t)
+	scheme := runtime.NewScheme()
+	g.Expect(v1alpha1.AddToScheme(scheme)).To(Succeed())
+	g.Expect(clusterv1.AddToScheme(scheme)).To(Succeed())
+	nw := newNetwork("ns", "default")
+	nw.Generation = 2
+	nw.Finalizers = []string{networkFinalizer}
+	nw.Status.Conditions = []metav1.Condition{{Type: clusterv1.PausedCondition, Status: metav1.ConditionFalse, Reason: clusterv1.NotPausedReason, ObservedGeneration: 1}}
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(nw).WithStatusSubresource(nw).Build()
+	r := &NetBoxNetworkReconciler{Client: c}
+
+	_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(nw)})
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(c.Get(ctx, client.ObjectKeyFromObject(nw), nw)).To(Succeed())
+	g.Expect(nw.Generation).To(Equal(int64(2)))
+	g.Expect(meta.FindStatusCondition(nw.Status.Conditions, clusterv1.PausedCondition).ObservedGeneration).To(Equal(int64(2)))
+}
+
+// The manager in the tests has no watch filter: Reconcile itself must skip a network without the label.
+func TestNetworkWatchFilter(t *testing.T) {
+	g := NewWithT(t)
+	nw := newNetwork("ns", "default")
+	c := claimClient(nw)
+	r := &NetBoxNetworkReconciler{Client: c, WatchFilterValue: "x"}
+
+	g.Expect(r.Reconcile(ctx, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(nw)})).To(Equal(ctrl.Result{}))
+	g.Expect(c.Get(ctx, client.ObjectKeyFromObject(nw), nw)).To(Succeed())
+	g.Expect(nw.Finalizers).To(BeEmpty())
+	g.Expect(nw.Status.Conditions).To(BeEmpty())
 }
 
 func TestNetworkRefusesPrefixHeldByAnotherNetwork(t *testing.T) {
@@ -446,6 +488,10 @@ func TestHeldBy(t *testing.T) {
 		"held":                        {prefix("NetBoxNetwork/ns/b", "active"), "NetBoxNetwork/ns/b"},
 		"deprecated, same namespace":  {prefix("NetBoxNetwork/ns/b", "deprecated"), ""},
 		"deprecated, other namespace": {prefix("NetBoxNetwork/other/a", "deprecated"), "NetBoxNetwork/other/a"},
+		"retired, ours":               {prefix(ref+"/retired", "deprecated"), ""},
+		"retired, same namespace":     {prefix("NetBoxNetwork/ns/b/retired", "deprecated"), ""},
+		"retired, other namespace":    {prefix("NetBoxNetwork/other/a/retired", "deprecated"), "NetBoxNetwork/other/a/retired"},
+		"retired, active":             {prefix("NetBoxNetwork/ns/b/retired", "active"), "NetBoxNetwork/ns/b/retired"},
 	} {
 		if got := heldBy(tc.obj, ref); got != tc.want {
 			t.Errorf("%s: heldBy = %q, want %q", name, got, tc.want)
@@ -488,6 +534,61 @@ func TestNetworkCustomFields(t *testing.T) {
 	o, _, err := admin.Get(ctx, netbox.Prefixes, nw.Status.PrefixID)
 	g.Expect(err).NotTo(HaveOccurred())
 	g.Expect(cfString(o, netbox.FieldRef)).To(Equal("NetBoxNetwork/"+ns+"/default"), "patching custom fields keeps the bookkeeping fields")
+}
+
+// TestMetadataSteadyState checks that NetBox's form of select, multiselect, object, multi-object, url and date
+// values is not taken for a change: a reconcile of a synced network writes nothing.
+func TestMetadataSteadyState(t *testing.T) {
+	g := newG(t)
+	ns := newEnv(t, nil)
+	for _, name := range []string{"site_tier", "vlan"} {
+		g.Expect(admin.List(ctx, "extras/custom-fields/", url.Values{"name": {name}})).To(HaveLen(1), "custom field %s is not seeded: run hack/dev/seed.sh", name)
+	}
+	sets, err := admin.List(ctx, "extras/custom-field-choice-sets/", url.Values{"name": {"site-tiers"}})
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(sets).To(HaveLen(1), "choice set site-tiers is not seeded: run hack/dev/seed.sh")
+
+	vlan1 := byHand(t, g, "ipam/vlans/", map[string]any{"vid": 3901, "name": ns + "-1"})
+	vlan2 := byHand(t, g, "ipam/vlans/", map[string]any{"vid": 3902, "name": ns + "-2"})
+	field := func(suffix, typ string, extra map[string]any) string {
+		name := strings.ReplaceAll(ns, "-", "_") + "_" + suffix
+		fields := map[string]any{"name": name, "label": name, "type": typ, "object_types": []string{"ipam.prefix"}}
+		maps.Copy(fields, extra)
+		byHand(t, g, "extras/custom-fields/", fields)
+		return name
+	}
+	tiers := field("tiers", "multiselect", map[string]any{"choice_set": sets[0].ID})
+	vlans := field("vlans", "multiobject", map[string]any{"related_object_type": "ipam.vlan"})
+	link := field("link", "url", nil)
+	day := field("day", "date", nil)
+
+	raw := func(s string, args ...any) apiextensionsv1.JSON {
+		return apiextensionsv1.JSON{Raw: fmt.Appendf(nil, s, args...)}
+	}
+	nw := newNetwork(ns, "default")
+	nw.Spec.CustomFields = map[string]apiextensionsv1.JSON{
+		"site_tier": raw(`"standard"`),
+		"vlan":      raw(`%d`, vlan1.ID),
+		tiers:       raw(`["premium","standard"]`),
+		vlans:       raw(`[%d,%d]`, vlan2.ID, vlan1.ID),
+		link:        raw(`"https://example.com/a b?x=1"`),
+		day:         raw(`"2026-01-02"`),
+	}
+	g.Expect(k8s.Create(ctx, nw)).To(Succeed())
+	waitReady(g, nw)
+	waitTypedCondition(g, nw, v1alpha1.MetadataSyncedCondition, metav1.ConditionTrue, v1alpha1.ReasonSynced)
+
+	prefix := func() netbox.Object {
+		o, _, err := admin.Get(ctx, netbox.Prefixes, nw.Status.PrefixID)
+		g.Expect(err).NotTo(HaveOccurred())
+		return o
+	}
+	o := prefix()
+	for field := range nw.Spec.CustomFields {
+		g.Expect(string(o.CustomFields[field])).NotTo(Or(BeEmpty(), Equal("null")), "custom field %s", field)
+	}
+	touch(g, nw)
+	g.Consistently(func() string { return prefix().LastUpdated }, "5s").Should(Equal(o.LastUpdated))
 }
 
 func TestNetworkRejectsBookkeepingCustomFields(t *testing.T) {
@@ -551,6 +652,7 @@ func TestNetworkDeleteForbidden(t *testing.T) {
 	nw.Spec.DeletionPolicy = v1alpha1.DeletionPolicyDelete
 	nw.Finalizers = []string{networkFinalizer}
 	nw.DeletionTimestamp = &metav1.Time{Time: time.Now()}
+	nw.Status.Conditions = []metav1.Condition{{Type: clusterv1.PausedCondition, Status: metav1.ConditionFalse, Reason: clusterv1.NotPausedReason}}
 	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(nw).WithStatusSubresource(nw).Build()
 	r := &NetBoxNetworkReconciler{Client: c, NetBox: forbiddenNetBox(t)}
 
@@ -715,18 +817,95 @@ func TestNetworkVIPRetainDeprecatesAndReclaims(t *testing.T) {
 	g.Expect(vips[0].Status.Value).To(Equal("active"))
 }
 
-func TestNetworkVIPDeletedWithNetwork(t *testing.T) {
+// Under deletionPolicy Delete the VIP is not deleted while a Cluster has it as its endpoint.
+func TestNetworkDeleteWaitsForClusterOnVIP(t *testing.T) {
 	g := newG(t)
 	ns := newEnv(t, nil)
 	nw := vipNetwork(ns, "default")
 	nw.Spec.DeletionPolicy = v1alpha1.DeletionPolicyDelete
 	g.Expect(k8s.Create(ctx, nw)).To(Succeed())
-	waitReady(g, nw)
+	waitTypedCondition(g, nw, v1alpha1.ControlPlaneEndpointReadyCondition, metav1.ConditionTrue, v1alpha1.ReasonReady)
+	g.Expect(clusterEndpointOf(g, ns).Host).To(Equal(nw.Status.ControlPlaneEndpoint.Host))
+
+	g.Expect(k8s.Delete(ctx, nw)).To(Succeed())
+	waitCondition(g, nw, metav1.ConditionFalse, v1alpha1.ReasonWaitingForCluster)
 	g.Expect(vipsOf(g, ns, "default")).To(HaveLen(1))
+
+	deleteCluster(t, g, ns)
+	g.Eventually(gone(nw)).Should(BeTrue())
+	g.Expect(vipsOf(g, ns, "default")).To(BeEmpty())
+}
+
+// Under Retain the VIP stays deprecated and is never handed out, so the deletion does not wait for the Cluster.
+func TestNetworkDeleteRetainNoWait(t *testing.T) {
+	g := newG(t)
+	ns := newEnv(t, nil)
+	nw := vipNetwork(ns, "default")
+	g.Expect(k8s.Create(ctx, nw)).To(Succeed())
+	waitTypedCondition(g, nw, v1alpha1.ControlPlaneEndpointReadyCondition, metav1.ConditionTrue, v1alpha1.ReasonReady)
+	vip := nw.Status.ControlPlaneEndpoint.Host
 
 	g.Expect(k8s.Delete(ctx, nw)).To(Succeed())
 	g.Eventually(gone(nw)).Should(BeTrue())
-	g.Expect(vipsOf(g, ns, "default")).To(BeEmpty())
+	g.Expect(clusterEndpointOf(g, ns).Host).To(Equal(vip))
+	vips := vipsOf(g, ns, "default")
+	g.Expect(vips).To(HaveLen(1))
+	g.Expect(vips[0].Status.Value).To(Equal("deprecated"))
+}
+
+// A network that lost its status finds its VIP but not its prefix: the prefix is reported lost, not carved again.
+func TestPrefixNotFoundViaVIP(t *testing.T) {
+	g := newG(t)
+	ns := newEnv(t, nil)
+	nw := vipNetwork(ns, "default")
+	g.Expect(k8s.Create(ctx, nw)).To(Succeed())
+	waitReady(g, nw)
+	g.Expect(admin.Delete(ctx, netbox.Prefixes, nw.Status.PrefixID, "", "test: deleted by hand")).To(Succeed())
+	forget(g, nw)
+
+	again := vipNetwork(ns, "default")
+	g.Expect(k8s.Create(ctx, again)).To(Succeed())
+	waitCondition(g, again, metav1.ConditionFalse, v1alpha1.ReasonPrefixNotFound)
+	g.Consistently(func() ([]netbox.Object, error) {
+		return admin.List(ctx, netbox.Prefixes, owner.ByRef("NetBoxNetwork/"+ns+"/default"))
+	}).Should(BeEmpty())
+}
+
+// A retained prefix and VIP that do not fit the spec of the new network are re-keyed, and new ones are made.
+func TestRetainedMismatchRetired(t *testing.T) {
+	g := newG(t)
+	ns := newEnv(t, nil)
+	ref := "NetBoxNetwork/" + ns + "/default"
+	nw := vipNetwork(ns, "default")
+	g.Expect(k8s.Create(ctx, nw)).To(Succeed())
+	waitReady(g, nw)
+	oldPrefix, oldVIP := nw.Status.PrefixID, vipsOf(g, ns, "default")[0]
+	g.Expect(k8s.Delete(ctx, nw)).To(Succeed())
+	g.Eventually(gone(nw)).Should(BeTrue())
+
+	again := vipNetwork(ns, "default")
+	again.Spec.PrefixLength = 27
+	g.Expect(k8s.Create(ctx, again)).To(Succeed())
+	waitReady(g, again)
+	g.Expect(netip.MustParsePrefix(again.Status.Prefix).Bits()).To(Equal(27))
+	g.Expect(again.Status.PrefixID).NotTo(Equal(oldPrefix))
+	g.Expect(netip.MustParsePrefix(again.Status.Prefix).Contains(netip.MustParseAddr(again.Status.ControlPlaneEndpoint.Host))).To(BeTrue())
+
+	for path, id := range map[string]int64{netbox.Prefixes: oldPrefix, netbox.IPAddresses: oldVIP.ID} {
+		old, _, err := admin.Get(ctx, path, id)
+		g.Expect(err).NotTo(HaveOccurred(), path)
+		g.Expect(old.Status.Value).To(Equal("deprecated"), path)
+		g.Expect(cfString(old, netbox.FieldCluster)).To(Equal(ns), path)
+	}
+	old, _, _ := admin.Get(ctx, netbox.Prefixes, oldPrefix)
+	g.Expect(cfString(old, netbox.FieldRef)).To(Equal(retiredRef(ref)))
+	old, _, _ = admin.Get(ctx, netbox.IPAddresses, oldVIP.ID)
+	g.Expect(cfString(old, netbox.FieldRef)).To(Equal(retiredRef(ref + "/vip")))
+	vips := vipsOf(g, ns, "default")
+	g.Expect(vips).To(HaveLen(1))
+	g.Expect(vips[0].ID).NotTo(Equal(oldVIP.ID))
+	waitEvent(g, ns, "default", "PrefixRetired")
+	waitEvent(g, ns, "default", "VIPRetired")
 }
 
 func TestNetworkVIPAdoptedPrefixDeprecatesVIP(t *testing.T) {
@@ -760,8 +939,8 @@ func TestNetworkVIPLostFromNetBoxKeepsItsAddress(t *testing.T) {
 	g.Expect(nw.Status.ControlPlaneEndpoint.Host).To(Equal("10.10.3.110"))
 
 	// The higher address frees up: a new pick would move the VIP there.
-	g.Expect(admin.Delete(ctx, netbox.IPAddresses, above.ID, "test: freed")).To(Succeed())
-	g.Expect(admin.Delete(ctx, netbox.IPAddresses, vipsOf(g, ns, "default")[0].ID, "test: deleted by hand")).To(Succeed())
+	g.Expect(admin.Delete(ctx, netbox.IPAddresses, above.ID, "", "test: freed")).To(Succeed())
+	g.Expect(admin.Delete(ctx, netbox.IPAddresses, vipsOf(g, ns, "default")[0].ID, "", "test: deleted by hand")).To(Succeed())
 	touch(g, nw)
 	g.Eventually(func(g Gomega) {
 		vips := vipsOf(g, ns, "default")
@@ -770,7 +949,7 @@ func TestNetworkVIPLostFromNetBoxKeepsItsAddress(t *testing.T) {
 	}).Should(Succeed())
 	waitTypedCondition(g, nw, v1alpha1.ControlPlaneEndpointReadyCondition, metav1.ConditionTrue, v1alpha1.ReasonReady)
 
-	g.Expect(admin.Delete(ctx, netbox.IPAddresses, vipsOf(g, ns, "default")[0].ID, "test: deleted by hand")).To(Succeed())
+	g.Expect(admin.Delete(ctx, netbox.IPAddresses, vipsOf(g, ns, "default")[0].ID, "", "test: deleted by hand")).To(Succeed())
 	byHand(t, g, netbox.IPAddresses, map[string]any{"address": "10.10.3.110/22", "status": "active"})
 	touch(g, nw)
 	waitTypedCondition(g, nw, v1alpha1.ControlPlaneEndpointReadyCondition, metav1.ConditionFalse, v1alpha1.ReasonEndpointConflict)
@@ -845,7 +1024,7 @@ func deleteCluster(t *testing.T, g *WithT, ns string) func(clusterv1.APIEndpoint
 	return recreate
 }
 
-// No VIP is picked before the Cluster exists: it may bring an endpoint of its own.
+// Nothing reaches NetBox before the Cluster exists: no prefix, and no VIP, as the Cluster may bring an endpoint of its own.
 func TestNetworkWaitsForCluster(t *testing.T) {
 	g := newG(t)
 	ns := newEnv(t, nil)
@@ -853,11 +1032,13 @@ func TestNetworkWaitsForCluster(t *testing.T) {
 
 	nw := vipNetwork(ns, "default")
 	g.Expect(k8s.Create(ctx, nw)).To(Succeed())
-	waitTypedCondition(g, nw, v1alpha1.ControlPlaneEndpointReadyCondition, metav1.ConditionFalse, v1alpha1.ReasonWaitingForCluster)
-	waitCondition(g, nw, metav1.ConditionTrue, v1alpha1.ReasonReady)
-	g.Consistently(func() []netbox.Object { return vipsOf(g, ns, "default") }, "3s").Should(BeEmpty())
+	waitCondition(g, nw, metav1.ConditionFalse, v1alpha1.ReasonWaitingForCluster)
+	g.Consistently(func() ([]netbox.Object, error) {
+		return admin.List(ctx, netbox.Prefixes, owner.ByRef("NetBoxNetwork/"+ns+"/default"))
+	}, "3s").Should(BeEmpty())
+	g.Expect(vipsOf(g, ns, "default")).To(BeEmpty())
 	g.Expect(k8s.Get(ctx, client.ObjectKeyFromObject(nw), nw)).To(Succeed())
-	g.Expect(nw.Status.ControlPlaneEndpoint).To(BeZero())
+	g.Expect(nw.Status.Prefix).To(BeEmpty())
 
 	g.Expect(recreate(clusterv1.APIEndpoint{})).To(Succeed())
 	waitTypedCondition(g, nw, v1alpha1.ControlPlaneEndpointReadyCondition, metav1.ConditionTrue, v1alpha1.ReasonReady)
@@ -876,7 +1057,7 @@ func TestNetworkTakesEndpointOfLateCluster(t *testing.T) {
 	nw := adoptedNetwork(ns, "10.10.3.96/28")
 	nw.Spec.ControlPlaneEndpoint = &v1alpha1.ControlPlaneEndpoint{}
 	g.Expect(k8s.Create(ctx, nw)).To(Succeed())
-	waitTypedCondition(g, nw, v1alpha1.ControlPlaneEndpointReadyCondition, metav1.ConditionFalse, v1alpha1.ReasonWaitingForCluster)
+	waitCondition(g, nw, metav1.ConditionFalse, v1alpha1.ReasonWaitingForCluster)
 
 	g.Expect(recreate(clusterv1.APIEndpoint{Host: "10.10.3.100", Port: 6443})).To(Succeed())
 	waitTypedCondition(g, nw, v1alpha1.ControlPlaneEndpointReadyCondition, metav1.ConditionTrue, v1alpha1.ReasonReady)
@@ -962,4 +1143,76 @@ func TestNetworkClusterEndpointChanged(t *testing.T) {
 	waitCondition(g, nw, metav1.ConditionTrue, v1alpha1.ReasonReady)
 	g.Expect(nw.Status.ControlPlaneEndpoint).To(Equal(vip))
 	g.Consistently(func() clusterv1.APIEndpoint { return clusterEndpointOf(g, ns) }).Should(Equal(clusterv1.APIEndpoint{Host: "api.example", Port: 6443}))
+}
+
+const (
+	networkPrefix = `{"id":2,"prefix":"10.10.0.16/28","status":{"value":"active"},"custom_fields":{"capi_ref":"NetBoxNetwork/ns/default"}}`
+	networkVIP    = `{"id":3,"address":"10.10.0.31/22","status":{"value":"active"},"custom_fields":{"capi_ref":"NetBoxNetwork/ns/default/vip"}}`
+)
+
+// networkNetBox serves the parent prefix 10.10.0.0/22. Its prefix and VIP are there as long as prefixLookups
+// have not passed the number given; every write is recorded and answered with the prefix and the VIP.
+// The prefix itself cannot be read, so a metadata sync fails.
+func networkNetBox(t *testing.T, prefixLookups int32, writes *[]string) *httptest.Server {
+	t.Helper()
+	var lookups atomic.Int32
+	srv := httptest.NewServer(writesNeedLock(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		switch {
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/available-prefixes/"):
+			*writes = append(*writes, r.URL.Path)
+			_, _ = io.WriteString(w, networkPrefix)
+		case r.Method != http.MethodGet:
+			*writes = append(*writes, r.URL.Path)
+			_, _ = io.WriteString(w, networkVIP)
+		case r.URL.Path == "/api/ipam/prefixes/2/":
+			http.Error(w, "unavailable", http.StatusInternalServerError)
+		case r.URL.Path == "/api/ipam/prefixes/" && q.Has("owner_id") && lookups.Add(1) <= prefixLookups:
+			_, _ = io.WriteString(w, `{"results":[`+networkPrefix+`]}`)
+		case r.URL.Path == "/api/ipam/prefixes/" && q.Get("prefix") == "10.10.0.0/22":
+			_, _ = io.WriteString(w, `{"results":[{"id":1,"prefix":"10.10.0.0/22"}]}`)
+		case r.URL.Path == "/api/ipam/ip-addresses/" && q.Has("owner_id") && prefixLookups > 1:
+			_, _ = io.WriteString(w, `{"results":[`+networkVIP+`]}`)
+		default:
+			_, _ = io.WriteString(w, `{"results":[]}`)
+		}
+	})))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func networkOn(srv *httptest.Server) *NetBoxNetworkReconciler {
+	return &NetBoxNetworkReconciler{Client: claimClient(), NetBox: &netbox.Client{URL: srv.URL, Token: "t"}, Owner: netbox.Owner{ID: 1}, Recorder: events.NewFakeRecorder(10)}
+}
+
+// A prefix and a VIP that are there as they should be are found without the lock.
+func TestNetworkReconcileTakesNoLockWithoutWrites(t *testing.T) {
+	g := NewWithT(t)
+	var writes []string
+	r := networkOn(networkNetBox(t, 1<<30, &writes))
+	nw := vipNetwork("ns", "default")
+	var vipErr, err error
+	g.Expect(returnsWhileLocked(func() { vipErr, err = r.reconcileNormal(ctx, nw, &clusterv1.Cluster{}) })).To(BeTrue(), "waited for netBoxWrites")
+	g.Expect(vipErr).NotTo(HaveOccurred())
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(writes).To(BeEmpty())
+	g.Expect(nw.Status.Prefix).To(Equal("10.10.0.16/28"))
+	g.Expect(nw.Status.ControlPlaneEndpoint.Host).To(Equal("10.10.0.31"))
+}
+
+// The prefix is found in the first pass, which stops at the VIP it must create. The second pass starts from the status
+// the network had, not from the one the first left: now the prefix is gone and is carved again, not reported lost.
+func TestNetworkSecondPassStartsFromOriginalStatus(t *testing.T) {
+	g := NewWithT(t)
+	var writes []string
+	r := networkOn(networkNetBox(t, 1, &writes))
+	nw := vipNetwork("ns", "default")
+	var vipErr, err error
+	g.Expect(returnsWhileLocked(func() { vipErr, err = r.reconcileNormal(ctx, nw, &clusterv1.Cluster{}) })).To(BeFalse(), "did not wait for netBoxWrites")
+	g.Expect(vipErr).NotTo(HaveOccurred())
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(writes).To(Equal([]string{"/api/ipam/prefixes/1/available-prefixes/", "/api/ipam/ip-addresses/"}))
+	g.Expect(nw.Status.Prefix).To(Equal("10.10.0.16/28"))
+	g.Expect(nw.Status.PrefixID).To(Equal(int64(2)))
+	g.Expect(nw.Status.ControlPlaneEndpoint.Host).To(Equal("10.10.0.31"))
 }

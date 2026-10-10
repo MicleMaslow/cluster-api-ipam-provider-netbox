@@ -36,11 +36,15 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/client-go/tools/events"
 	"k8s.io/utils/ptr"
+	"sigs.k8s.io/cluster-api-ipam-provider-in-cluster/pkg/ipamutil"
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	ipamv1 "sigs.k8s.io/cluster-api/api/ipam/v1beta2"
+	"sigs.k8s.io/cluster-api/util/annotations"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 
 	"github.com/MicleMaslow/cluster-api-ipam-provider-netbox/api/v1alpha1"
@@ -58,7 +62,7 @@ func testHandler(url string, rangeIDs ...int64) *claimHandler {
 	}
 	pool.Namespace, pool.Name = "ns", "worker"
 	return &claimHandler{
-		ProviderAdapter: &ProviderAdapter{Client: claimClient(), NetBox: &netbox.Client{URL: url, Token: "t"}, Owner: netbox.Owner{ID: 1}},
+		ProviderAdapter: &ProviderAdapter{Client: claimClient(), NetBox: &netbox.Client{URL: url, Token: "t"}, Owner: netbox.Owner{ID: 1}, Recorder: events.NewFakeRecorder(10)},
 		claim:           &ipamv1.IPAddressClaim{ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "m1"}, Spec: ipamv1.IPAddressClaimSpec{ClusterName: "c1"}},
 		pool:            pool,
 	}
@@ -124,6 +128,7 @@ const (
 	exhausted       = "False/" + ipamv1.IPAddressClaimReadyPoolExhaustedReason
 	failed          = "False/" + ipamv1.IPAddressClaimReadyAllocationFailedReason
 	addressConflict = "False/" + reasonAddressConflict
+	releasing       = "False/" + v1alpha1.ReasonReleasing
 )
 
 func TestEnsureAddressTriesReadyRangesInOrder(t *testing.T) {
@@ -221,7 +226,7 @@ func TestEnsureAddressLeavesAddressEmptyOnFailure(t *testing.T) {
 // It records the POSTs and the PATCHes it gets.
 func recheckNetBox(t *testing.T, byRef, taken string, posts, patches *[]string) *httptest.Server {
 	t.Helper()
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewServer(writesNeedLock(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.Method == http.MethodPost:
 			b, _ := io.ReadAll(r.Body)
@@ -239,7 +244,7 @@ func recheckNetBox(t *testing.T, byRef, taken string, posts, patches *[]string) 
 		default:
 			t.Errorf("unexpected request %s %s", r.Method, r.URL)
 		}
-	}))
+	})))
 	t.Cleanup(srv.Close)
 	return srv
 }
@@ -256,7 +261,7 @@ func TestEnsureAddressRechecksAllocatedAddress(t *testing.T) {
 		posts                    int
 	}{
 		"in NetBox, recorded":     {"m1", ours, none, readyTrue, false, 0},
-		"in NetBox, not recorded": {"", ours, none, allocating, false, 0},
+		"in NetBox, not recorded": {"", ours, none, readyTrue, false, 0}, // as after clusterctl move
 		"deleted, recreated":      {"m1", none, none, readyTrue, false, 1},
 		"deleted, taken":          {"m1", none, foreign, addressConflict, true, 0},
 		"moved":                   {"m1", moved, none, addressConflict, true, 0},
@@ -275,6 +280,9 @@ func TestEnsureAddressRechecksAllocatedAddress(t *testing.T) {
 		if got := readyOf(h.claim); got != tc.ready {
 			t.Errorf("%s: ready %q, want %q", name, got, tc.ready)
 		}
+		if ev := emitted(h.Recorder); len(ev) != tc.posts || tc.posts > 0 && !strings.HasPrefix(ev[0], "Normal AddressRestored ") {
+			t.Errorf("%s: events %q, want %d AddressRestored", name, ev, tc.posts)
+		}
 		if a.Spec.Address != "10.10.1.20" || len(posts) != tc.posts || len(patches) != 0 {
 			t.Errorf("%s: address %q, posts %v, patches %v, want %d posts and no patches", name, a.Spec.Address, posts, patches, tc.posts)
 		}
@@ -285,6 +293,235 @@ func TestEnsureAddressRechecksAllocatedAddress(t *testing.T) {
 				}
 			}
 		}
+	}
+}
+
+// A recheck that finds the address as it should be writes nothing and so never waits for the lock.
+func TestEnsureAddressRecheckTakesNoLock(t *testing.T) {
+	ours := `{"results":[{"id":5,"address":"10.10.1.20/22","dns_name":"m1","description":"c1 worker m1","custom_fields":{"capi_ref":"IPAddressClaim/ns/m1"}}]}`
+	var posts, patches []string
+	srv := recheckNetBox(t, ours, `{"results":[]}`, &posts, &patches)
+	a := &ipamv1.IPAddress{Spec: ipamv1.IPAddressSpec{Address: "10.10.1.20", Prefix: ptr.To(int32(22))}}
+	h := testHandler(srv.URL, 1)
+	h.claim.Status.AddressRef.Name = "m1"
+
+	var err error
+	if !returnsWhileLocked(func() { _, err = h.EnsureAddress(context.Background(), a) }) {
+		t.Error("EnsureAddress waited for netBoxWrites though it had nothing to write")
+	}
+	if got := readyOf(h.claim); err != nil || got != readyTrue {
+		t.Errorf("err %v, ready %q, want nil and %q", err, got, readyTrue)
+	}
+}
+
+// An allocation or a restore runs its writes under the lock, after a first pass without it that leaves no trace.
+func TestEnsureAddressWritesUnderLock(t *testing.T) {
+	none := `{"results":[]}`
+	for _, restore := range []bool{false, true} {
+		var n int
+		var posts, patches []string
+		a := &ipamv1.IPAddress{}
+		var srv *httptest.Server
+		if restore {
+			srv = recheckNetBox(t, none, none, &posts, &patches)
+			a.Spec.Address, a.Spec.Prefix = "10.10.1.20", ptr.To(int32(22))
+		} else {
+			srv = allocNetBox(t, &n, &patches)
+		}
+		h := testHandler(srv.URL, 1)
+		if restore {
+			h.claim.Status.AddressRef.Name = "m1"
+		}
+		withReady(h.claim, metav1.ConditionFalse, ipamv1.IPAddressClaimReadyAllocationFailedReason)
+
+		var err error
+		if returnsWhileLocked(func() { _, err = h.EnsureAddress(context.Background(), a) }) {
+			t.Errorf("restore %t: EnsureAddress did not wait for netBoxWrites", restore)
+		}
+		if err != nil || a.Spec.Address != "10.10.1.20" || len(posts)+n != 1 {
+			t.Errorf("restore %t: err %v, address %q, %d writes, want nil, 10.10.1.20 and 1", restore, err, a.Spec.Address, len(posts)+n)
+		}
+		if c := meta.FindStatusCondition(h.claim.Status.Conditions, ipamv1.IPAddressClaimReadyCondition); c == nil || strings.Contains(c.Message, "write needed") {
+			t.Errorf("restore %t: condition %+v leaks the first pass", restore, c)
+		}
+	}
+}
+
+// A range that is full is a conflict only for a client that writes: the first pass stops at the write, not at the next range.
+func TestAllocateWriteNeededIsNotAConflict(t *testing.T) {
+	var posts int
+	var patches []string
+	h := testHandler(allocNetBox(t, &posts, &patches).URL, 1, 2)
+	h = h.on(h.NetBox.ReadOnly())
+	a := &ipamv1.IPAddress{}
+	if err := h.allocate(context.Background(), a); !errors.Is(err, netbox.ErrWriteNeeded) || errors.Is(err, errPoolExhausted) || a.Spec.Address != "" || posts != 0 {
+		t.Errorf("err %v, address %q, %d posts, want ErrWriteNeeded, no address and no posts", err, a.Spec.Address, posts)
+	}
+}
+
+// A release always runs under the lock, whether or not NetBox holds an address: a hand-back to the claim is serialised with it.
+func TestReleaseAddressRunsUnderLock(t *testing.T) {
+	for _, tc := range []struct {
+		found   string
+		deletes int
+	}{
+		{`{"results":[]}`, 0},
+		{`{"results":[{"id":5,"address":"10.10.1.20/22","custom_fields":{"capi_ref":"IPAddressClaim/ns/m1"}}]}`, 1},
+	} {
+		var deletes int
+		srv := httptest.NewServer(writesNeedLock(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodDelete {
+				deletes++
+				w.WriteHeader(http.StatusNoContent)
+				return
+			}
+			_, _ = io.WriteString(w, tc.found)
+		})))
+		h := testHandler(srv.URL, 1)
+
+		var err error
+		if returnsWhileLocked(func() { _, err = h.ReleaseAddress(context.Background()) }) {
+			t.Errorf("%d deletes: ReleaseAddress did not wait for netBoxWrites", tc.deletes)
+		}
+		if err != nil || deletes != tc.deletes {
+			t.Errorf("err %v, %d deletes, want nil and %d", err, deletes, tc.deletes)
+		}
+		if ev := emitted(h.Recorder); len(ev) != tc.deletes || tc.deletes > 0 && !strings.HasPrefix(ev[0], "Normal AddressReleased ") {
+			t.Errorf("events %q, want %d AddressReleased", ev, tc.deletes)
+		}
+		srv.Close()
+	}
+}
+
+// The wait is read off one clock reading: at or past the release time it is 0, so a release never returns a
+// RequeueAfter that ipamutil would take for a finished release.
+func TestReleaseWait(t *testing.T) {
+	now := time.Now()
+	claim := &ipamv1.IPAddressClaim{ObjectMeta: metav1.ObjectMeta{DeletionTimestamp: &metav1.Time{Time: now.Add(-60 * time.Second)}}}
+	pool := &v1alpha1.NetBoxIPPool{Spec: v1alpha1.NetBoxIPPoolSpec{AddressReuseGracePeriodSeconds: ptr.To(int32(60))}}
+	for name, tc := range map[string]struct {
+		pool *v1alpha1.NetBoxIPPool
+		at   time.Time
+		want time.Duration
+	}{
+		"before":  {pool, now.Add(-time.Nanosecond), time.Nanosecond},
+		"at":      {pool, now, 0},
+		"after":   {pool, now.Add(time.Nanosecond), 0},
+		"no pool": {nil, now.Add(-time.Hour), 0},
+	} {
+		if got := releaseWait(claim, tc.pool, tc.at); got != tc.want {
+			t.Errorf("%s: %s, want %s", name, got, tc.want)
+		}
+	}
+}
+
+// A release waits for the finalizers of others, then for the grace period, which a pool gone or being deleted drops.
+func TestReleaseAddressWaits(t *testing.T) {
+	const vm = "example.com/vm-protection"
+	own := []string{ipamutil.ReleaseAddressFinalizer, metav1.FinalizerDeleteDependents, metav1.FinalizerOrphanDependents}
+	for name, tc := range map[string]struct {
+		finalizers []string
+		grace      *int32
+		pool       string
+		wait       time.Duration
+		message    string
+	}{
+		"own finalizers":       {finalizers: own},
+		"foreign finalizer":    {finalizers: append(own, vm), grace: ptr.To(int32(60)), wait: netBoxRequeueAfter, message: vm},
+		"grace":                {grace: ptr.To(int32(60)), wait: 58 * time.Second, message: "addressReuseGracePeriodSeconds"},
+		"grace over":           {grace: ptr.To(int32(1))},
+		"grace 0":              {grace: ptr.To(int32(0))},
+		"grace, pool deleting": {grace: ptr.To(int32(60)), pool: "deleting"},
+		"grace, no pool":       {grace: ptr.To(int32(60)), pool: "gone"},
+	} {
+		var requests int
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			requests++
+			_, _ = io.WriteString(w, `{"results":[]}`)
+		}))
+		h := testHandler(srv.URL, 1)
+		h.claim.Finalizers = tc.finalizers
+		h.claim.DeletionTimestamp = &metav1.Time{Time: time.Now().Add(-2 * time.Second)}
+		withReady(h.claim, metav1.ConditionTrue, clusterv1.ReadyReason)
+		h.pool.Spec.AddressReuseGracePeriodSeconds = tc.grace
+		switch tc.pool {
+		case "deleting":
+			h.pool.DeletionTimestamp = &metav1.Time{Time: time.Now()}
+		case "gone":
+			h.pool = nil
+		}
+
+		res, err := h.ReleaseAddress(context.Background())
+		if err != nil {
+			t.Errorf("%s: %v", name, err)
+		}
+		if tc.wait == 0 {
+			if res != nil || requests == 0 || readyOf(h.claim) != readyTrue {
+				t.Errorf("%s: result %v, %d requests, ready %q; want a release", name, res, requests, readyOf(h.claim))
+			}
+		} else {
+			if res == nil || res.RequeueAfter > tc.wait || res.RequeueAfter < tc.wait-5*time.Second || requests != 0 {
+				t.Errorf("%s: result %v, %d requests; want a wait of %s without NetBox", name, res, requests, tc.wait)
+			}
+			if readyOf(h.claim) != releasing || !strings.Contains(readyMessage(h.claim), tc.message) {
+				t.Errorf("%s: ready %q (%s), want %q with %q", name, readyOf(h.claim), readyMessage(h.claim), releasing, tc.message)
+			}
+		}
+		srv.Close()
+	}
+}
+
+func TestReleaseFailedReason(t *testing.T) {
+	h := testHandler("", 1)
+	h.NetBox = forbiddenNetBox(t)
+	h.claim.DeletionTimestamp = &metav1.Time{Time: time.Now()}
+	if _, err := h.ReleaseAddress(context.Background()); !errors.Is(err, netbox.ErrForbidden) {
+		t.Errorf("err %v, want ErrForbidden", err)
+	}
+	if got := readyOf(h.claim); got != "False/"+v1alpha1.ReasonReleaseFailed {
+		t.Errorf("ready %q, want False/%s", got, v1alpha1.ReasonReleaseFailed)
+	}
+}
+
+// A conflict seen by the first pass may be a hand-back to this claim landing between its reads: the locked pass decides.
+func TestEnsureAddressConfirmsConflictUnderLock(t *testing.T) {
+	ours := `{"results":[{"id":5,"address":"10.10.1.20/22","dns_name":"m1","description":"c1 worker m1","custom_fields":{"capi_ref":"IPAddressClaim/ns/m1"}}]}`
+	moved := `{"results":[{"id":5,"address":"10.10.1.21/22","dns_name":"m1","description":"c1 worker m1","custom_fields":{"capi_ref":"IPAddressClaim/ns/m1"}}]}`
+	for name, tc := range map[string]struct {
+		first, later string
+		conflict     bool
+	}{
+		"gone in the locked pass": {moved, ours, false},
+		"still there":             {moved, moved, true},
+	} {
+		var lookups int
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if !r.URL.Query().Has("cf_" + netbox.FieldRef) {
+				t.Errorf("unexpected request %s %s", r.Method, r.URL)
+			}
+			lookups++
+			if lookups == 1 {
+				_, _ = io.WriteString(w, tc.first)
+				return
+			}
+			_, _ = io.WriteString(w, tc.later)
+		}))
+		a := &ipamv1.IPAddress{Spec: ipamv1.IPAddressSpec{Address: "10.10.1.20", Prefix: ptr.To(int32(22))}}
+		h := testHandler(srv.URL, 1)
+		h.claim.Status.AddressRef.Name = "m1"
+
+		var err error
+		if returnsWhileLocked(func() { _, err = h.EnsureAddress(context.Background(), a) }) {
+			t.Errorf("%s: the conflict was reported without the lock", name)
+		}
+		want := readyTrue
+		if tc.conflict {
+			want = addressConflict
+		}
+		if errors.Is(err, errAddressConflict) != tc.conflict || lookups != 2 || readyOf(h.claim) != want {
+			t.Errorf("%s: err %v, %d lookups, ready %q, want conflict %t, 2 lookups, %q", name, err, lookups, readyOf(h.claim), tc.conflict, want)
+		}
+		srv.Close()
 	}
 }
 
@@ -458,7 +695,7 @@ func TestEnsureAddressKeepsReadyOnNetBoxError(t *testing.T) {
 // allocNetBox allocates addresses 10.10.1.20, .21, ... from range 1 and records the PATCHes of addresses.
 func allocNetBox(t *testing.T, posts *int, patches *[]string) *httptest.Server {
 	t.Helper()
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewServer(writesNeedLock(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.Method == http.MethodGet:
 			_, _ = io.WriteString(w, `{"results":[]}`)
@@ -473,7 +710,7 @@ func allocNetBox(t *testing.T, posts *int, patches *[]string) *httptest.Server {
 		default:
 			t.Errorf("unexpected request %s %s", r.Method, r.URL)
 		}
-	}))
+	})))
 	t.Cleanup(srv.Close)
 	return srv
 }
@@ -491,6 +728,9 @@ func TestEnsureAddressHandsBackAddressHeldByOtherClaim(t *testing.T) {
 	}
 	if a.Spec.Address != "10.10.1.21" || posts != 2 {
 		t.Errorf("address %q after %d allocations, want 10.10.1.21 after 2", a.Spec.Address, posts)
+	}
+	if ev := emitted(h.Recorder); len(ev) != 1 || !strings.HasPrefix(ev[0], "Normal AddressHandedBack ") {
+		t.Errorf("events %q, want one AddressHandedBack", ev)
 	}
 	if len(patches) != 1 {
 		t.Fatalf("patches %v, want one", patches)
@@ -687,6 +927,30 @@ func TestClaimGetsAddress(t *testing.T) {
 	}).Should(Equal(int32(2)))
 }
 
+// The first pass of a claim runs without the lock and must not leave a trace of the write it stops at.
+func TestClaimAllocatesThroughReadOnlyPass(t *testing.T) {
+	g := newG(t)
+	ns := newEnv(t, nil)
+	readyPool(g, ns, v1alpha1.IPPoolRange{NetworkName: "default", Start: 2, End: 4})
+	claim := newClaim(ns, "m1", "worker")
+	g.Expect(k8s.Create(ctx, claim)).To(Succeed())
+
+	var seen []string
+	g.Eventually(func() string {
+		_ = k8s.Get(ctx, client.ObjectKeyFromObject(claim), claim)
+		if c := meta.FindStatusCondition(claim.Status.Conditions, ipamv1.IPAddressClaimReadyCondition); c != nil {
+			seen = append(seen, c.Message)
+		}
+		return readyOf(claim)
+	}).WithPolling(10 * time.Millisecond).Should(Equal(readyTrue))
+	for _, m := range seen {
+		g.Expect(m).NotTo(ContainSubstring("write needed"))
+	}
+	ips, err := admin.List(ctx, netbox.IPAddresses, owner.ByRef("IPAddressClaim/"+ns+"/m1"))
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(ips).To(HaveLen(1))
+}
+
 func TestClaimReleaseDeletesNetBoxAddress(t *testing.T) {
 	g := newG(t)
 	ns := newEnv(t, nil)
@@ -700,6 +964,93 @@ func TestClaimReleaseDeletesNetBoxAddress(t *testing.T) {
 		return admin.List(ctx, netbox.IPAddresses, owner.ByRef("IPAddressClaim/"+ns+"/m1"))
 	}).Should(BeEmpty())
 	g.Eventually(noAddress(claim)).Should(BeTrue())
+}
+
+// readyMessage is the message of the claim's Ready condition.
+func readyMessage(claim *ipamv1.IPAddressClaim) string {
+	if c := meta.FindStatusCondition(claim.Status.Conditions, ipamv1.IPAddressClaimReadyCondition); c != nil {
+		return c.Message
+	}
+	return ""
+}
+
+func setGrace(g *WithT, pool *v1alpha1.NetBoxIPPool, seconds int32) {
+	eventually(g, pool, func(g Gomega) {
+		pool.Spec.AddressReuseGracePeriodSeconds = ptr.To(seconds)
+		g.Expect(k8s.Update(ctx, pool)).To(Succeed())
+	})
+}
+
+func TestReleaseWaitsForForeignFinalizers(t *testing.T) {
+	const vm = "example.com/vm-protection"
+	g := newG(t)
+	ns := newEnv(t, nil)
+	claim, _ := allocatedClaim(g, ns)
+	eventually(g, claim, func(g Gomega) {
+		controllerutil.AddFinalizer(claim, vm)
+		g.Expect(k8s.Update(ctx, claim)).To(Succeed())
+	})
+
+	g.Expect(k8s.Delete(ctx, claim)).To(Succeed())
+	g.Eventually(func() string { return claimReady(g, claim) }).Should(Equal(releasing))
+	g.Expect(readyMessage(claim)).To(ContainSubstring(vm))
+	g.Consistently(ownedIPs(ns, "m1")).Should(HaveLen(1))
+
+	eventually(g, claim, func(g Gomega) {
+		controllerutil.RemoveFinalizer(claim, vm)
+		g.Expect(k8s.Update(ctx, claim)).To(Succeed())
+	})
+	g.Eventually(ownedIPs(ns, "m1")).Should(BeEmpty())
+	g.Eventually(gone(claim)).Should(BeTrue())
+}
+
+func TestReleaseGracePeriod(t *testing.T) {
+	g := newG(t)
+	ns := newEnv(t, nil)
+	_, pool := readyPool(g, ns, v1alpha1.IPPoolRange{NetworkName: "default", Start: 2, End: 4})
+	setGrace(g, pool, 5)
+	m1 := newClaim(ns, "m1", "worker")
+	g.Expect(k8s.Create(ctx, m1)).To(Succeed())
+	held := address(g, m1).Spec.Address
+	g.Eventually(func() string { return claimReady(g, m1) }).Should(Equal(readyTrue))
+
+	g.Expect(k8s.Delete(ctx, m1)).To(Succeed())
+	deleted := time.Now()
+	g.Expect(ownedIPs(ns, "m1")()).To(HaveLen(1))
+	g.Eventually(func() string { return claimReady(g, m1) }).Should(Equal(releasing))
+	g.Expect(readyMessage(m1)).To(ContainSubstring("addressReuseGracePeriodSeconds"))
+
+	m2 := newClaim(ns, "m2", "worker")
+	g.Expect(k8s.Create(ctx, m2)).To(Succeed())
+	g.Expect(address(g, m2).Spec.Address).NotTo(Equal(held))
+
+	g.Eventually(ownedIPs(ns, "m1"), "15s").Should(BeEmpty())
+	// deletionTimestamp has whole seconds: it may be up to 1s before deleted.
+	g.Expect(time.Since(deleted)).To(BeNumerically(">=", 4*time.Second))
+	g.Eventually(gone(m1)).Should(BeTrue())
+}
+
+// The grace period keeps no address of a pool being deleted, nor of one whose deletion starts while the claim waits.
+func TestReleaseGraceSkippedForDeletingPool(t *testing.T) {
+	g := newG(t)
+	ns := newEnv(t, nil)
+	_, pool := readyPool(g, ns, v1alpha1.IPPoolRange{NetworkName: "default", Start: 2, End: 4})
+	setGrace(g, pool, 300)
+	m1, m2 := newClaim(ns, "m1", "worker"), newClaim(ns, "m2", "worker")
+	g.Expect(k8s.Create(ctx, m1)).To(Succeed())
+	g.Expect(k8s.Create(ctx, m2)).To(Succeed())
+	address(g, m1)
+	address(g, m2)
+
+	g.Expect(k8s.Delete(ctx, m1)).To(Succeed())
+	g.Eventually(func() string { return claimReady(g, m1) }).Should(Equal(releasing))
+	g.Expect(k8s.Delete(ctx, pool)).To(Succeed())
+	g.Eventually(ownedIPs(ns, "m1")).Should(BeEmpty())
+	g.Eventually(gone(m1)).Should(BeTrue())
+
+	g.Expect(k8s.Delete(ctx, m2)).To(Succeed())
+	g.Eventually(ownedIPs(ns, "m2")).Should(BeEmpty())
+	g.Eventually(gone(pool)).Should(BeTrue())
 }
 
 func TestClaimWaitsForFreeAddress(t *testing.T) {
@@ -763,11 +1114,34 @@ func allocatedClaim(g *WithT, ns string) (*ipamv1.IPAddressClaim, netbox.Object)
 	return claim, ips[0]
 }
 
+// clusterctl move drops the claim's status: the recheck of its address keeps it ready, never Allocating.
+func TestRecheckNoAllocatingAfterMove(t *testing.T) {
+	g := newG(t)
+	ns := newEnv(t, nil)
+	claim, _ := allocatedClaim(g, ns)
+	before := meta.FindStatusCondition(claim.Status.Conditions, ipamv1.IPAddressClaimReadyCondition).LastTransitionTime
+	time.Sleep(1100 * time.Millisecond) // a flip would move the second-granular lastTransitionTime
+
+	eventually(g, claim, func(g Gomega) {
+		claim.Status.AddressRef = ipamv1.IPAddressReference{}
+		g.Expect(k8s.Status().Update(ctx, claim)).To(Succeed())
+	})
+	var seen []string
+	g.Eventually(func() string {
+		g.Expect(k8s.Get(ctx, client.ObjectKeyFromObject(claim), claim)).To(Succeed())
+		seen = append(seen, readyOf(claim))
+		return claim.Status.AddressRef.Name + " " + readyOf(claim)
+	}).WithPolling(10 * time.Millisecond).Should(Equal("m1 " + readyTrue))
+	g.Expect(seen).NotTo(ContainElement(allocating))
+	after := meta.FindStatusCondition(claim.Status.Conditions, ipamv1.IPAddressClaimReadyCondition).LastTransitionTime
+	g.Expect(after.Time).To(BeTemporally("==", before.Time))
+}
+
 func TestClaimRestoresDeletedAddress(t *testing.T) {
 	g := newG(t)
 	ns := newEnv(t, nil)
 	claim, ip := allocatedClaim(g, ns)
-	g.Expect(admin.Delete(ctx, netbox.IPAddresses, ip.ID, "test: deleted by hand")).To(Succeed())
+	g.Expect(admin.Delete(ctx, netbox.IPAddresses, ip.ID, "", "test: deleted by hand")).To(Succeed())
 
 	touch(g, claim)
 	g.Eventually(ownedIPs(ns, "m1")).Should(HaveLen(1))
@@ -778,16 +1152,17 @@ func TestClaimRestoresDeletedAddress(t *testing.T) {
 	g.Expect(cfString(ips[0], netbox.FieldRef)).To(Equal("IPAddressClaim/" + ns + "/m1"))
 	g.Expect(cfString(ips[0], netbox.FieldCluster)).To(Equal(ns))
 	g.Expect(claimReady(g, claim)).To(Equal(readyTrue))
+	waitEvent(g, ns, "m1", "AddressRestored")
 }
 
 func TestClaimAddressConflict(t *testing.T) {
 	g := newG(t)
 	ns := newEnv(t, nil)
 	claim, ip := allocatedClaim(g, ns)
-	g.Expect(admin.Delete(ctx, netbox.IPAddresses, ip.ID, "test: deleted by hand")).To(Succeed())
+	g.Expect(admin.Delete(ctx, netbox.IPAddresses, ip.ID, "", "test: deleted by hand")).To(Succeed())
 	foreign, err := admin.Create(ctx, netbox.IPAddresses, map[string]any{"address": ip.Address, "status": "active", "description": "someone else's"})
 	g.Expect(err).NotTo(HaveOccurred())
-	t.Cleanup(func() { _ = admin.Delete(ctx, netbox.IPAddresses, foreign.ID, "test cleanup") })
+	t.Cleanup(func() { _ = admin.Delete(ctx, netbox.IPAddresses, foreign.ID, "", "test cleanup") })
 
 	touch(g, claim)
 	g.Eventually(func() string { return claimReady(g, claim) }).Should(Equal(addressConflict))
@@ -802,7 +1177,7 @@ func TestClaimDoesNotTakeDeletedAddress(t *testing.T) {
 	g := newG(t)
 	ns := newEnv(t, nil)
 	first, ip := allocatedClaim(g, ns)
-	g.Expect(admin.Delete(ctx, netbox.IPAddresses, ip.ID, "test: deleted by hand")).To(Succeed())
+	g.Expect(admin.Delete(ctx, netbox.IPAddresses, ip.ID, "", "test: deleted by hand")).To(Succeed())
 
 	second := newClaim(ns, "m2", "worker")
 	g.Expect(k8s.Create(ctx, second)).To(Succeed())
@@ -854,6 +1229,55 @@ func TestClaimSkipsPausedCluster(t *testing.T) {
 
 	setPaused(t, ns, false)
 	address(g, claim)
+}
+
+func setAnnotation(g *WithT, obj client.Object, key string, on bool) {
+	eventually(g, obj, func(g Gomega) {
+		a := obj.GetAnnotations()
+		if on {
+			annotations.AddAnnotations(obj, map[string]string{key: ""})
+		} else {
+			delete(a, key)
+		}
+		g.Expect(k8s.Update(ctx, obj)).To(Succeed())
+	})
+}
+
+// A paused claim is left alone even when its pool wakes it.
+func TestPausedClaimSkipped(t *testing.T) {
+	g := newG(t)
+	ns := newEnv(t, nil)
+	nw := newNetwork(ns, "default")
+	g.Expect(k8s.Create(ctx, nw)).To(Succeed())
+	waitReady(g, nw)
+	claim := newClaim(ns, "m1", "worker")
+	claim.Annotations = map[string]string{clusterv1.PausedAnnotation: ""}
+	g.Expect(k8s.Create(ctx, claim)).To(Succeed())
+
+	pool := newPool(ns, "worker", v1alpha1.IPPoolRange{NetworkName: "default", Start: 2, End: 4})
+	g.Expect(k8s.Create(ctx, pool)).To(Succeed())
+	waitReady(g, pool)
+	g.Consistently(noAddress(claim)).Should(BeTrue())
+	g.Expect(ownedIPs(ns, "m1")()).To(BeEmpty())
+
+	setAnnotation(g, claim, clusterv1.PausedAnnotation, false)
+	address(g, claim)
+}
+
+// ipamutil skips the claims of a paused pool: they wake when the pause is lifted.
+func TestPoolUnpausedWakesClaims(t *testing.T) {
+	g := newG(t)
+	ns := newEnv(t, nil)
+	_, pool := readyPool(g, ns, v1alpha1.IPPoolRange{NetworkName: "default", Start: 2, End: 4})
+	setAnnotation(g, pool, clusterv1.PausedAnnotation, true)
+	waitTypedCondition(g, pool, clusterv1.PausedCondition, metav1.ConditionTrue, clusterv1.PausedReason)
+	claim := newClaim(ns, "m1", "worker")
+	g.Expect(k8s.Create(ctx, claim)).To(Succeed())
+	g.Consistently(noAddress(claim)).Should(BeTrue())
+
+	setAnnotation(g, pool, clusterv1.PausedAnnotation, false)
+	address(g, claim)
+	g.Eventually(func() string { return claimReady(g, claim) }).Should(Equal(readyTrue))
 }
 
 func TestClaimAddressFields(t *testing.T) {

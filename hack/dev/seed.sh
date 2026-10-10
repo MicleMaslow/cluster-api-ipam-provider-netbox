@@ -14,11 +14,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Seeds a fresh dev NetBox with what the provider expects and writes hack/dev/.env.
+# Seeds a fresh dev NetBox with what the provider expects and writes hack/dev/.env (NETBOX_ENV_FILE for another file).
 set -euo pipefail
 cd "$(dirname "$0")"
 
 NB=${NETBOX_URL:-http://localhost:18000}
+ENV_FILE=${NETBOX_ENV_FILE:-.env}
 ADMIN_TOKEN=nbt_devadmin0001.0123456789abcdef0123456789abcdef01234567
 OWNER=capi-mgmt-dev
 
@@ -44,13 +45,26 @@ containers() {
   done
 }
 
+# The choice set and the VLAN the select and object custom fields point to; also added to a NetBox seeded before them.
+choices() {
+  if [ "$(api GET 'extras/custom-field-choice-sets/?name=site-tiers' | jq .count)" = 0 ]; then
+    api POST extras/custom-field-choice-sets/ '{"name":"site-tiers","extra_choices":[["standard","Standard"],["premium","Premium"]]}' >/dev/null
+  fi
+  if [ "$(api GET 'ipam/vlans/?vid=100' | jq .count)" = 0 ]; then
+    api POST ipam/vlans/ '{"vid":100,"name":"dev-vlan"}' >/dev/null
+  fi
+}
+
 # Prefix custom fields of each type for the metadata examples, plus those of custom-fields.local.json
 # (a list of POST /api/extras/custom-fields/ bodies); also added to a NetBox seeded before them.
 custom_fields() {
+  choices
   local fields='[
     {"name":"team","label":"Team","type":"text","object_types":["ipam.prefix"],"ui_visible":"if-set"},
     {"name":"priority","label":"Priority","type":"integer","object_types":["ipam.prefix"],"ui_visible":"if-set"},
-    {"name":"monitored","label":"Monitored","type":"boolean","object_types":["ipam.prefix"],"ui_visible":"if-set"}
+    {"name":"monitored","label":"Monitored","type":"boolean","object_types":["ipam.prefix"],"ui_visible":"if-set"},
+    {"name":"site_tier","label":"Site tier","type":"select","choice_set":{"name":"site-tiers"},"object_types":["ipam.prefix"],"ui_visible":"if-set"},
+    {"name":"vlan","label":"VLAN","type":"object","related_object_type":"ipam.vlan","object_types":["ipam.prefix"],"ui_visible":"if-set"}
   ]'
   [ -f custom-fields.local.json ] && fields=$(jq -s add <(echo "$fields") custom-fields.local.json)
   while read -r f; do
@@ -63,7 +77,7 @@ custom_fields() {
 until curl -sf -o /dev/null "$NB/login/"; do sleep 5; done
 
 if [ "$(api GET "users/owners/?name=$OWNER" | jq .count)" != 0 ]; then
-  [ -f .env ] || { echo "NetBox is seeded but hack/dev/.env is gone: run make netbox-down netbox-up" >&2; exit 1; }
+  [ -f "$ENV_FILE" ] || { echo "NetBox is seeded but $ENV_FILE is gone: run make netbox-down netbox-up" >&2; exit 1; }
   other_owner
   containers
   custom_fields
@@ -100,11 +114,11 @@ token=$(api POST users/tokens/ "{\"user\":$user,\"version\":2}")
 group=$(api POST users/owner-groups/ '{"name":"capi"}' | jq .id)
 api POST users/owners/ "{\"name\":\"$OWNER\",\"group\":$group}" >/dev/null
 
-cat > .env <<EOF
+cat > "$ENV_FILE" <<EOF
 NETBOX_URL=$NB
 NETBOX_TOKEN=nbt_$(jq -r .key <<<"$token").$(jq -r .token <<<"$token")
 NETBOX_ADMIN_TOKEN=$ADMIN_TOKEN
 NETBOX_OWNER=$OWNER
 EOF
 other_owner
-echo "NetBox seeded, wrote hack/dev/.env"
+echo "NetBox seeded, wrote $ENV_FILE"

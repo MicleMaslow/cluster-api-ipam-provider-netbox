@@ -24,6 +24,7 @@ import (
 	"net/url"
 	"slices"
 	"strings"
+	"time"
 
 	utilversion "k8s.io/apimachinery/pkg/util/version"
 )
@@ -31,9 +32,15 @@ import (
 // minVersion is the oldest NetBox the provider supports (conditional updates need ETag/If-Match).
 var minVersion = utilversion.MustParseGeneric("4.6.0")
 
+const customFields = "extras/custom-fields/"
+
+// preflightBackoff is the wait between preflight attempts: it starts at Initial and doubles up to Max.
+var preflightBackoff = struct{ Initial, Max time.Duration }{time.Second, time.Minute}
+
 var requiredObjectTypes = []string{"ipam.prefix", "ipam.iprange", "ipam.ipaddress"}
 
 // Preflight checks that NetBox is new enough and set up as the provider expects, then resolves the Owner.
+// A setup the provider cannot work with is ErrMisconfigured; any other error may be transient.
 func (c *Client) Preflight(ctx context.Context, ownerName string) (Owner, error) {
 	var status struct {
 		Version string `json:"netbox-version"`
@@ -43,42 +50,81 @@ func (c *Client) Preflight(ctx context.Context, ownerName string) (Owner, error)
 	}
 	v, err := utilversion.ParseGeneric(status.Version)
 	if err != nil {
-		return Owner{}, fmt.Errorf("netbox: version %q: %w", status.Version, err)
+		return Owner{}, fmt.Errorf("%w: version %q: %w", ErrMisconfigured, status.Version, err)
 	}
 	if !v.AtLeast(minVersion) {
-		return Owner{}, fmt.Errorf("netbox: version %s: NetBox ≥ 4.6 required", status.Version)
+		return Owner{}, fmt.Errorf("%w: version %s: NetBox ≥ 4.6 required", ErrMisconfigured, status.Version)
 	}
-	for _, name := range []string{FieldRef, FieldCluster} {
-		if err := c.checkField(ctx, name); err != nil {
-			return Owner{}, err
-		}
+	refID, err := c.checkField(ctx, FieldRef)
+	if err != nil {
+		return Owner{}, err
+	}
+	if _, err := c.checkField(ctx, FieldCluster); err != nil {
+		return Owner{}, err
+	}
+	// Owners have no last_updated and so no ETag; a custom field stands for the objects the provider updates.
+	if etag, err := c.do(ctx, http.MethodGet, objectPath(customFields, refID), nil, "", nil, nil); err != nil {
+		return Owner{}, fmt.Errorf("custom field %s: %w", FieldRef, err)
+	} else if etag == "" {
+		return Owner{}, fmt.Errorf("%w: NetBox answers without ETag (a proxy strips it?); conditional updates need it", ErrMisconfigured)
 	}
 	return c.LookupOwner(ctx, ownerName)
 }
 
-func (c *Client) checkField(ctx context.Context, name string) error {
+// WaitPreflight runs Preflight until it passes, fails with ErrMisconfigured or ctx ends.
+// retry is called with the error and the wait before each new attempt.
+func (c *Client) WaitPreflight(ctx context.Context, ownerName string, retry func(err error, after time.Duration)) (Owner, error) {
+	wait := preflightBackoff.Initial
+	for {
+		o, err := c.Preflight(ctx, ownerName)
+		if err == nil || errors.Is(err, ErrMisconfigured) {
+			return o, err
+		}
+		if ctx.Err() != nil {
+			return Owner{}, ctx.Err()
+		}
+		retry(err, wait)
+		select {
+		case <-ctx.Done():
+			return Owner{}, ctx.Err()
+		case <-time.After(wait):
+		}
+		wait = min(2*wait, preflightBackoff.Max)
+	}
+}
+
+func (c *Client) checkField(ctx context.Context, name string) (int64, error) {
 	var page struct {
 		Results []struct {
+			ID          int64    `json:"id"`
 			Type        Choice   `json:"type"`
 			FilterLogic Choice   `json:"filter_logic"`
+			Status      Choice   `json:"status"` // NetBox ≥ 4.7
 			ObjectTypes []string `json:"object_types"`
 		} `json:"results"`
 	}
-	if _, err := c.do(ctx, http.MethodGet, "extras/custom-fields/", url.Values{"name": {name}}, "", nil, &page); err != nil {
+	if _, err := c.do(ctx, http.MethodGet, customFields, url.Values{"name": {name}}, "", nil, &page); err != nil {
 		if errors.Is(err, ErrForbidden) {
 			err = fmt.Errorf("%w (the token needs view on extras.customfield)", err)
 		}
-		return fmt.Errorf("custom field %s: %w", name, err)
+		return 0, fmt.Errorf("custom field %s: %w", name, err)
 	}
 	if len(page.Results) != 1 {
-		return fmt.Errorf("custom field %s: not found", name)
+		return 0, fmt.Errorf("%w: custom field %s: not found", ErrMisconfigured, name)
 	}
 	f := page.Results[0]
 	if f.Type.Value != "text" {
-		return fmt.Errorf("custom field %s: type is %s, want text", name, f.Type.Value)
+		return 0, fmt.Errorf("%w: custom field %s: type is %s, want text", ErrMisconfigured, name, f.Type.Value)
 	}
 	if f.FilterLogic.Value != "exact" {
-		return fmt.Errorf("custom field %s: filter_logic is %s, want exact", name, f.FilterLogic.Value)
+		return 0, fmt.Errorf("%w: custom field %s: filter_logic is %s, want exact", ErrMisconfigured, name, f.FilterLogic.Value)
+	}
+	switch f.Status.Value {
+	case "", "active":
+	case "provisioning": // NetBox brings the field live by itself
+		return 0, fmt.Errorf("custom field %s: status is provisioning, waiting for active", name)
+	default:
+		return 0, fmt.Errorf("%w: custom field %s: status is %s, want active", ErrMisconfigured, name, f.Status.Value)
 	}
 	var missing []string
 	for _, t := range requiredObjectTypes {
@@ -87,7 +133,7 @@ func (c *Client) checkField(ctx context.Context, name string) error {
 		}
 	}
 	if len(missing) > 0 {
-		return fmt.Errorf("custom field %s: not enabled for %s", name, strings.Join(missing, ", "))
+		return 0, fmt.Errorf("%w: custom field %s: not enabled for %s", ErrMisconfigured, name, strings.Join(missing, ", "))
 	}
-	return nil
+	return f.ID, nil
 }

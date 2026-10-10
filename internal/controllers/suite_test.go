@@ -99,7 +99,7 @@ func run(m *testing.M) int {
 	mgrCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	if err := Setup(mgrCtx, mgr, Options{
-		NetBox: nb, Owner: owner,
+		NetBox: nb, Owner: owner, Recorder: mgr.GetEventRecorder("netbox-ipam"),
 		NetworkConcurrency: DefaultConcurrency, PoolConcurrency: DefaultConcurrency, ClaimConcurrency: DefaultConcurrency,
 	}); err != nil {
 		panic(err)

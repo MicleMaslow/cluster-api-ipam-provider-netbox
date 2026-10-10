@@ -38,7 +38,7 @@ func (c *Client) LookupOwner(ctx context.Context, name string) (Owner, error) {
 		return Owner{}, err
 	}
 	if len(objs) != 1 {
-		return Owner{}, fmt.Errorf("netbox: want one owner %q, found %d", name, len(objs))
+		return Owner{}, fmt.Errorf("%w: want one owner %q, found %d", ErrMisconfigured, name, len(objs))
 	}
 	return Owner{ID: objs[0].ID}, nil
 }

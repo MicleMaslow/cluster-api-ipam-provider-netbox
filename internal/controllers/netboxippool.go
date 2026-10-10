@@ -31,12 +31,15 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	kerrors "k8s.io/apimachinery/pkg/util/errors"
+	"k8s.io/client-go/tools/events"
 	"k8s.io/klog/v2"
+	"k8s.io/utils/ptr"
 	ipampredicates "sigs.k8s.io/cluster-api-ipam-provider-in-cluster/pkg/predicates"
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	ipamv1 "sigs.k8s.io/cluster-api/api/ipam/v1beta2"
 	"sigs.k8s.io/cluster-api/util/labels"
 	"sigs.k8s.io/cluster-api/util/patch"
+	"sigs.k8s.io/cluster-api/util/paused"
 	"sigs.k8s.io/cluster-api/util/predicates"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
@@ -61,6 +64,7 @@ type NetBoxIPPoolReconciler struct {
 	NetBox           *netbox.Client
 	Owner            netbox.Owner
 	WatchFilterValue string
+	Recorder         events.EventRecorder
 }
 
 // +kubebuilder:rbac:groups=ipam.cluster.x-k8s.io,resources=netboxippools,verbs=get;list;watch;update;patch
@@ -154,6 +158,7 @@ func poolNetworks(pool *v1alpha1.NetBoxIPPool) []string {
 	return names
 }
 
+// clusterToPools wakes the pools of a Cluster: those with its label and those with a range in one of its networks.
 func (r *NetBoxIPPoolReconciler) clusterToPools(ctx context.Context, o client.Object) []reconcile.Request {
 	pools := &v1alpha1.NetBoxIPPoolList{}
 	if err := r.List(ctx, pools, client.InNamespace(o.GetNamespace()), client.MatchingLabels{clusterv1.ClusterNameLabel: o.GetName()}); err != nil {
@@ -163,7 +168,51 @@ func (r *NetBoxIPPoolReconciler) clusterToPools(ctx context.Context, o client.Ob
 	for i := range pools.Items {
 		reqs = append(reqs, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(&pools.Items[i])})
 	}
-	return reqs
+	networks := &v1alpha1.NetBoxNetworkList{}
+	if err := r.List(ctx, networks, client.InNamespace(o.GetNamespace()), client.MatchingFields{clusterNameField: o.GetName()}); err != nil {
+		return reqs
+	}
+	names := make([]string, 0, len(networks.Items))
+	for _, nw := range networks.Items {
+		names = append(names, nw.Name)
+	}
+	return append(reqs, r.poolsIn(ctx, o.GetNamespace(), names...)...)
+}
+
+// pauseCluster returns the Cluster for the pool's Paused condition: the first paused one of its label and its
+// networks, else the Cluster of its label, nil without one.
+func (r *NetBoxIPPoolReconciler) pauseCluster(ctx context.Context, pool *v1alpha1.NetBoxIPPool) (*clusterv1.Cluster, error) {
+	names := []string{pool.Labels[clusterv1.ClusterNameLabel]}
+	for _, n := range poolNetworks(pool) {
+		nw := &v1alpha1.NetBoxNetwork{}
+		if err := r.Get(ctx, client.ObjectKey{Namespace: pool.Namespace, Name: n}, nw); err != nil {
+			if !apierrors.IsNotFound(err) {
+				return nil, err
+			}
+			continue
+		}
+		names = append(names, nw.Spec.ClusterName)
+	}
+	var labeled *clusterv1.Cluster
+	for i, name := range names {
+		if name == "" {
+			continue
+		}
+		cluster := &clusterv1.Cluster{}
+		if err := r.Get(ctx, client.ObjectKey{Namespace: pool.Namespace, Name: name}, cluster); err != nil {
+			if !apierrors.IsNotFound(err) {
+				return nil, err
+			}
+			continue
+		}
+		if ptr.Deref(cluster.Spec.Paused, false) {
+			return cluster, nil
+		}
+		if i == 0 {
+			labeled = cluster
+		}
+	}
+	return labeled, nil
 }
 
 // Reconcile reconciles a NetBoxIPPool.
@@ -175,11 +224,16 @@ func (r *NetBoxIPPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	if r.WatchFilterValue != "" && !labels.HasWatchLabel(pool, r.WatchFilterValue) {
 		return ctrl.Result{}, nil
 	}
-	if paused, err := isPaused(ctx, r.Client, pool, pool.Labels[clusterv1.ClusterNameLabel]); err != nil || paused {
+	cluster, err := r.pauseCluster(ctx, pool)
+	if err != nil {
 		return ctrl.Result{}, err
 	}
+	// The helper comes first: a Paused condition that only lags the generation is set in memory, for it to write.
 	helper, err := patch.NewHelper(pool, r.Client)
 	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if isPaused, requeue, err := paused.EnsurePausedCondition(ctx, r.Client, cluster, pool); err != nil || isPaused || requeue {
 		return ctrl.Result{}, err
 	}
 	defer func() {
@@ -311,6 +365,9 @@ func (r *NetBoxIPPoolReconciler) reconcileNormal(ctx context.Context, pool *v1al
 	pool.Status.IPAddresses = &v1alpha1.NetBoxIPPoolStatusIPAddresses{Total: int32(total), Used: int32(used), Free: int32(total - used)}
 	if head != nil {
 		pool.Status.Gateway, pool.Status.AddressPrefixLength = gw.String(), int32(l2.Bits())
+	}
+	if ptr.Deref(pool.Spec.OmitGateway, false) {
+		pool.Status.Gateway = ""
 	}
 	return foldErrors(errs)
 }
@@ -473,9 +530,20 @@ func (r *NetBoxIPPoolReconciler) reconcileRange(ctx context.Context, pool *v1alp
 		}
 		return notReady(last), err
 	}
+	var rs *v1alpha1.IPPoolRangeStatus
+	err = underLock(ctx, r.NetBox, func(ctx context.Context, nb *netbox.Client) (err error) {
+		rr := *r
+		rr.NetBox = nb
+		rs, err = rr.syncRange(ctx, pool, nw, last, start, end, l2.Bits(), addrs)
+		return err
+	})
+	return rs, err
+}
+
+// syncRange finds the NetBox range under ref and resizes it to start-end, or creates it. It is the section of
+// reconcileRange that underLock runs.
+func (r *NetBoxIPPoolReconciler) syncRange(ctx context.Context, pool *v1alpha1.NetBoxIPPool, nw *v1alpha1.NetBoxNetwork, last *v1alpha1.IPPoolRangeStatus, start, end netip.Addr, bits int, addrs []netip.Addr) (*v1alpha1.IPPoolRangeStatus, error) {
 	ref := rangeRef(pool, nw.Name)
-	netBoxWrites.Lock()
-	defer netBoxWrites.Unlock()
 	found, err := r.NetBox.FindByRef(ctx, netbox.IPRanges, r.Owner, ref)
 	switch {
 	case err != nil:
@@ -483,7 +551,7 @@ func (r *NetBoxIPPoolReconciler) reconcileRange(ctx context.Context, pool *v1alp
 	case len(found) > 1:
 		return notReady(last), retryLater(v1alpha1.ReasonDuplicate, fmt.Errorf("%d NetBox IP ranges carry %s", len(found), ref))
 	case len(found) == 1:
-		return r.resizeRange(ctx, nw, ref, found[0], start, end, l2.Bits(), addrs)
+		return r.resizeRange(ctx, pool, nw, ref, found[0], start, end, bits, addrs)
 	}
 	// A range over the VIP must not appear: new ranges wait for it, existing ones go on serving.
 	if nw.Spec.ControlPlaneEndpoint != nil && nw.Status.ControlPlaneEndpoint.Host == "" {
@@ -493,9 +561,9 @@ func (r *NetBoxIPPoolReconciler) reconcileRange(ctx context.Context, pool *v1alp
 		return nil, err
 	}
 	var obj netbox.Object
-	err = r.clearingDeprecated(ctx, nw, ref, start, end, 0, func() (err error) {
+	err = r.clearingDeprecated(ctx, pool, nw, ref, start, end, 0, func() (err error) {
 		obj, err = r.NetBox.Create(ctx, netbox.IPRanges, r.Owner.Managed(ref, nw.Spec.ClusterName, "capi: range "+ref, map[string]any{
-			"start_address": netip.PrefixFrom(start, l2.Bits()).String(), "end_address": netip.PrefixFrom(end, l2.Bits()).String(),
+			"start_address": netip.PrefixFrom(start, bits).String(), "end_address": netip.PrefixFrom(end, bits).String(),
 			"status": "active", "description": "CAPI pool " + pool.Name,
 		}))
 		return err
@@ -503,6 +571,8 @@ func (r *NetBoxIPPoolReconciler) reconcileRange(ctx context.Context, pool *v1alp
 	if err != nil {
 		return nil, err
 	}
+	ctrl.LoggerFrom(ctx).Info("Created the NetBox range", "pool", klog.KObj(pool), "network", nw.Name, "id", obj.ID, "range", start.String()+"-"+end.String())
+	normalEvent(r.Recorder, pool, "RangeCreated", "Created the NetBox range %s-%s in network %s", start, end, nw.Name)
 	return &v1alpha1.IPPoolRangeStatus{NetworkName: nw.Name, ID: obj.ID, StartAddress: start.String(), EndAddress: end.String(), Ready: true}, nil
 }
 
@@ -519,7 +589,7 @@ func rangeStatus(network string, o netbox.Object) (*v1alpha1.IPPoolRangeStatus, 
 // resizeRange brings the NetBox range cur to start-end, active and open to allocation. While addresses are allocated
 // outside start-end, or NetBox refuses the change, the range keeps its bounds and serves unless deprecated;
 // addresses still allocated take a deprecated range back.
-func (r *NetBoxIPPoolReconciler) resizeRange(ctx context.Context, nw *v1alpha1.NetBoxNetwork, ref string, cur netbox.Object, start, end netip.Addr, bits int, addrs []netip.Addr) (*v1alpha1.IPPoolRangeStatus, error) {
+func (r *NetBoxIPPoolReconciler) resizeRange(ctx context.Context, pool *v1alpha1.NetBoxIPPool, nw *v1alpha1.NetBoxNetwork, ref string, cur netbox.Object, start, end netip.Addr, bits int, addrs []netip.Addr) (*v1alpha1.IPPoolRangeStatus, error) {
 	have, from, to, err := rangeStatus(nw.Name, cur)
 	if err != nil || from == start && to == end && have.Ready && !cur.MarkPopulated {
 		return have, err
@@ -542,7 +612,7 @@ func (r *NetBoxIPPoolReconciler) resizeRange(ctx context.Context, nw *v1alpha1.N
 		if !have.Ready {
 			message = "capi: reclaimed by " + ref
 		}
-		err = r.clearingDeprecated(ctx, nw, ref, start, end, cur.ID, func() error {
+		err = r.clearingDeprecated(ctx, pool, nw, ref, start, end, cur.ID, func() error {
 			_, err := r.NetBox.Patch(ctx, netbox.IPRanges, cur.ID, etag, map[string]any{
 				"start_address": netip.PrefixFrom(start, bits).String(), "end_address": netip.PrefixFrom(end, bits).String(),
 				"status": "active", "mark_populated": false, "changelog_message": message,
@@ -551,7 +621,8 @@ func (r *NetBoxIPPoolReconciler) resizeRange(ctx context.Context, nw *v1alpha1.N
 		})
 	}
 	if err == nil {
-		ctrl.LoggerFrom(ctx).Info("Updated the NetBox range", "ref", ref, "id", cur.ID, "from", from.String()+"-"+to.String(), "to", start.String()+"-"+end.String())
+		ctrl.LoggerFrom(ctx).Info("Updated the NetBox range", "pool", klog.KObj(pool), "ref", ref, "id", cur.ID, "from", from.String()+"-"+to.String(), "to", start.String()+"-"+end.String())
+		normalEvent(r.Recorder, pool, "RangeUpdated", "Updated the NetBox range %s-%s to %s-%s in network %s", from, to, start, end, nw.Name)
 		return &v1alpha1.IPPoolRangeStatus{NetworkName: nw.Name, ID: cur.ID, StartAddress: start.String(), EndAddress: end.String(), Ready: true}, nil
 	}
 	if errReason(err) == v1alpha1.ReasonRangeInUse {
@@ -571,7 +642,7 @@ func (r *NetBoxIPPoolReconciler) resizeRange(ctx context.Context, nw *v1alpha1.N
 // fence closes the NetBox range cur to allocation (mark_populated) once no address in it but those keep accepts
 // is allocated, and checks again: from there none can appear until the caller acts with the returned ETag.
 // It reports whether it closed the range. Allocated addresses are RangeInUse, explained by why; found on the
-// second check, they open the range again. The caller holds netBoxWrites, so no allocation of ours lands in between.
+// second check, they open the range again. It writes only under netBoxWrites, so no allocation of ours lands in between.
 func (r *NetBoxIPPoolReconciler) fence(ctx context.Context, cur netbox.Object, etag string, addrs []netip.Addr, keep func(netip.Addr) bool, why string) (string, bool, error) {
 	from, to, err := netBoxBounds(cur)
 	if err != nil {
@@ -605,7 +676,7 @@ func (r *NetBoxIPPoolReconciler) fence(ctx context.Context, cur netbox.Object, e
 
 // clearingDeprecated runs write. When NetBox finds start-end overlapping another range, our deprecated ranges
 // in the way that hold no addresses are deleted and write runs once more; a range still in the way is RangeOverlap.
-func (r *NetBoxIPPoolReconciler) clearingDeprecated(ctx context.Context, nw *v1alpha1.NetBoxNetwork, ref string, start, end netip.Addr, self int64, write func() error) error {
+func (r *NetBoxIPPoolReconciler) clearingDeprecated(ctx context.Context, pool *v1alpha1.NetBoxIPPool, nw *v1alpha1.NetBoxNetwork, ref string, start, end netip.Addr, self int64, write func() error) error {
 	err := write()
 	if !errors.Is(err, netbox.ErrOverlap) {
 		return err
@@ -628,10 +699,11 @@ func (r *NetBoxIPPoolReconciler) clearingDeprecated(ctx context.Context, nw *v1a
 		if len(held) > 0 {
 			continue
 		}
-		if err := r.NetBox.Delete(ctx, netbox.IPRanges, o.ID, "capi: replaced by "+ref); err != nil {
+		if err := r.NetBox.Delete(ctx, netbox.IPRanges, o.ID, "", "capi: replaced by "+ref); err != nil {
 			return err
 		}
-		ctrl.LoggerFrom(ctx).Info("Deleted a deprecated NetBox range in the way", "ref", ref, "id", o.ID, "range", from.String()+"-"+to.String())
+		ctrl.LoggerFrom(ctx).Info("Deleted a deprecated NetBox range in the way", "pool", klog.KObj(pool), "ref", ref, "id", o.ID, "range", from.String()+"-"+to.String())
+		normalEvent(r.Recorder, pool, "RangeReleased", "Deleted the deprecated NetBox range %s-%s that was in the way", from, to)
 	}
 	if err := write(); errors.Is(err, netbox.ErrOverlap) {
 		return retryLater(v1alpha1.ReasonRangeOverlap, err)
@@ -704,31 +776,37 @@ func (r *NetBoxIPPoolReconciler) releaseRange(ctx context.Context, pool *v1alpha
 	if policy == v1alpha1.DeletionPolicyRetain && o.Status.Value == "deprecated" {
 		return nil
 	}
-	netBoxWrites.Lock()
-	defer netBoxWrites.Unlock()
-	cur, etag, err := r.NetBox.Get(ctx, netbox.IPRanges, o.ID)
-	if errors.Is(err, netbox.ErrNotFound) {
+	return underLock(ctx, r.NetBox, func(ctx context.Context, nb *netbox.Client) error {
+		rr := *r
+		rr.NetBox = nb
+		cur, etag, err := nb.Get(ctx, netbox.IPRanges, o.ID)
+		if errors.Is(err, netbox.ErrNotFound) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if etag, _, err = rr.fence(ctx, cur, etag, addrs, nil, "kept while addresses in it are allocated"); err != nil {
+			return err
+		}
+		released := "capi: released by " + refOf("NetBoxIPPool", pool)
+		if policy == v1alpha1.DeletionPolicyDelete {
+			err = nb.Delete(ctx, netbox.IPRanges, cur.ID, etag, released)
+		} else {
+			_, err = nb.Patch(ctx, netbox.IPRanges, cur.ID, etag, map[string]any{
+				"status": "deprecated", "mark_populated": true, "changelog_message": released,
+			})
+		}
+		switch {
+		case errors.Is(err, netbox.ErrNotFound):
+			return nil
+		case err != nil:
+			return err
+		}
+		ctrl.LoggerFrom(ctx).Info("Released the NetBox range of the pool", "pool", klog.KObj(pool), "network", network, "id", cur.ID, "policy", policy)
+		normalEvent(r.Recorder, pool, "RangeReleased", "Released the NetBox range of network %s (deletionPolicy %s)", network, policy)
 		return nil
-	}
-	if err != nil {
-		return err
-	}
-	if etag, _, err = r.fence(ctx, cur, etag, addrs, nil, "kept while addresses in it are allocated"); err != nil {
-		return err
-	}
-	released := "capi: released by " + refOf("NetBoxIPPool", pool)
-	if policy == v1alpha1.DeletionPolicyDelete {
-		err = r.NetBox.Delete(ctx, netbox.IPRanges, cur.ID, released)
-	} else {
-		_, err = r.NetBox.Patch(ctx, netbox.IPRanges, cur.ID, etag, map[string]any{
-			"status": "deprecated", "mark_populated": true, "changelog_message": released,
-		})
-	}
-	if err != nil && !errors.Is(err, netbox.ErrNotFound) {
-		return err
-	}
-	ctrl.LoggerFrom(ctx).Info("Released the NetBox range of the pool", "pool", klog.KObj(pool), "network", network, "id", cur.ID, "policy", policy)
-	return nil
+	})
 }
 
 // poolAddresses returns the addresses of the pool's IPAddresses.

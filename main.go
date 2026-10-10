@@ -18,10 +18,14 @@ limitations under the License.
 package main
 
 import (
+	"context"
+	"errors"
 	"flag"
 	"fmt"
+	"net/http"
 	"os"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/spf13/pflag"
@@ -139,9 +143,13 @@ func main() {
 	// klog.Background will automatically use the right logger.
 	ctrl.SetLogger(klog.Background())
 
-	nbURL, token := os.Getenv("NETBOX_URL"), os.Getenv("NETBOX_TOKEN")
-	if nbURL == "" || token == "" || ownerName == "" {
-		setupLog.Error(nil, "NETBOX_URL, NETBOX_TOKEN and --netbox-owner are required")
+	nbURL, token, tokenFile := os.Getenv("NETBOX_URL"), os.Getenv("NETBOX_TOKEN"), os.Getenv("NETBOX_TOKEN_FILE")
+	if nbURL == "" || ownerName == "" {
+		setupLog.Error(nil, "NETBOX_URL and --netbox-owner are required")
+		os.Exit(1)
+	}
+	if (token == "") == (tokenFile == "") {
+		setupLog.Error(nil, "exactly one of NETBOX_TOKEN and NETBOX_TOKEN_FILE is required")
 		os.Exit(1)
 	}
 	_, metricsOpts, err := flags.GetManagerOptions(managerOptions)
@@ -162,9 +170,9 @@ func main() {
 		setupLog.Error(err, "create NetBox HTTP client")
 		os.Exit(1)
 	}
-	controllerOpts.NetBox = &netbox.Client{URL: nbURL, Token: token, HTTP: httpClient}
-	if controllerOpts.Owner, err = controllerOpts.NetBox.Preflight(ctx, ownerName); err != nil {
-		setupLog.Error(err, "NetBox preflight failed", "url", nbURL, "owner", ownerName)
+	nb := &netbox.Client{URL: nbURL, Token: token, TokenFile: tokenFile, HTTP: httpClient}
+	if err := nb.CheckToken(); err != nil {
+		setupLog.Error(err, "NetBox token")
 		os.Exit(1)
 	}
 
@@ -193,16 +201,45 @@ func main() {
 		setupLog.Error(err, "create manager")
 		os.Exit(1)
 	}
-	if err := controllers.Setup(ctx, mgr, controllerOpts); err != nil {
-		setupLog.Error(err, "set up controllers")
-		os.Exit(1)
-	}
+
+	// The manager serves its probes while NetBox is down: not ready, but alive.
+	var ready atomic.Bool
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
 		setupLog.Error(err, "add healthz")
 		os.Exit(1)
 	}
-	if err := mgr.AddReadyzCheck("readyz", healthz.Ping); err != nil {
+	if err := mgr.AddReadyzCheck("readyz", func(*http.Request) error {
+		if !ready.Load() {
+			return errors.New("waiting for NetBox preflight")
+		}
+		return nil
+	}); err != nil {
 		setupLog.Error(err, "add readyz")
+		os.Exit(1)
+	}
+
+	controllerOpts.NetBox = nb
+	controllerOpts.Recorder = mgr.GetEventRecorder("netbox-ipam")
+	if err := mgr.Add(preflight{run: func(ctx context.Context) error {
+		owner, err := nb.WaitPreflight(ctx, ownerName, func(err error, after time.Duration) {
+			setupLog.Error(err, "NetBox preflight failed, retrying", "after", after)
+		})
+		if ctx.Err() != nil {
+			return nil //nolint:nilerr // stopped while waiting for NetBox
+		}
+		if err != nil {
+			return fmt.Errorf("NetBox preflight (url %s, owner %s): %w", nbURL, ownerName, err)
+		}
+		controllerOpts.Owner = owner
+		if err := controllers.Setup(ctx, mgr, controllerOpts); err != nil {
+			return fmt.Errorf("set up controllers: %w", err)
+		}
+		ready.Store(true)
+		setupLog.Info("NetBox preflight passed")
+		<-ctx.Done()
+		return nil
+	}}); err != nil {
+		setupLog.Error(err, "add preflight")
 		os.Exit(1)
 	}
 
@@ -212,3 +249,11 @@ func main() {
 		os.Exit(1)
 	}
 }
+
+// preflight waits for NetBox and starts the controllers once it passes; it needs no leader election.
+type preflight struct {
+	run func(ctx context.Context) error
+}
+
+func (p preflight) Start(ctx context.Context) error { return p.run(ctx) }
+func (preflight) NeedLeaderElection() bool          { return false }

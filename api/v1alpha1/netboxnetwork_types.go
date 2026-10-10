@@ -207,6 +207,7 @@ type NetBoxNetworkStatus struct {
 // +kubebuilder:subresource:status
 // +kubebuilder:printcolumn:name="Cluster",type="string",JSONPath=".spec.clusterName",description="Cluster the network belongs to"
 // +kubebuilder:printcolumn:name="Prefix",type="string",JSONPath=".status.prefix",description="CIDR held in NetBox"
+// +kubebuilder:printcolumn:name="VIP",type="string",JSONPath=".status.controlPlaneEndpoint.host",description="Control plane VIP"
 // +kubebuilder:printcolumn:name="Ready",type="string",JSONPath=".status.conditions[?(@.type=='Ready')].status",description="Whether the network is reflected in NetBox"
 // +kubebuilder:printcolumn:name="Reason",type="string",JSONPath=".status.conditions[?(@.type=='Ready')].reason",description="Reason of the Ready condition"
 // +kubebuilder:printcolumn:name="Age",type="date",JSONPath=".metadata.creationTimestamp",description="Time duration since creation of NetBoxNetwork"

@@ -95,12 +95,56 @@ func mergeObject(cur json.RawMessage, want map[string]any, owned []string) (map[
 	return obj, changed, nil
 }
 
+// jsonEqual reports whether the value NetBox returned is want, compared in the form want was written in.
 func jsonEqual(raw json.RawMessage, want any) bool {
 	var got any
 	if len(raw) > 0 && json.Unmarshal(raw, &got) != nil {
 		return false
 	}
-	return reflect.DeepEqual(got, want)
+	return reflect.DeepEqual(writtenForm(got, want), want)
+}
+
+// writtenForm turns a value as NetBox returns it into the form it is written in, by the shape of want:
+// an object reference {id,…} into its id, a choice {value,…} (select and multiselect in NetBox 4.7) into its value,
+// a list element by element.
+func writtenForm(got, want any) any {
+	switch w := want.(type) {
+	case float64:
+		if m, ok := got.(map[string]any); ok && m["id"] != nil {
+			return m["id"]
+		}
+	case string:
+		if m, ok := got.(map[string]any); ok && m["value"] != nil {
+			return m["value"]
+		}
+	case []any:
+		l, ok := got.([]any)
+		if !ok {
+			return got
+		}
+		out, refs := make([]any, len(l)), len(l) > 0
+		for i, e := range l {
+			var we any
+			if i < len(w) {
+				we = w[i]
+			}
+			out[i] = writtenForm(e, we)
+			m, isObj := e.(map[string]any)
+			refs = refs && isObj && m["id"] != nil
+		}
+		// Multi-object values come back sorted by id.
+		if refs && sameElements(out, w) {
+			return want
+		}
+		return out
+	}
+	return got
+}
+
+func sameElements(a, b []any) bool {
+	return len(a) == len(b) && !slices.ContainsFunc(a, func(x any) bool {
+		return !slices.ContainsFunc(b, func(y any) bool { return reflect.DeepEqual(x, y) })
+	})
 }
 
 // mergeTags returns the sorted tag slugs the prefix should carry: current ones minus those the provider
