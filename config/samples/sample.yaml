@@ -1,0 +1,57 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: sample
+---
+apiVersion: cluster.x-k8s.io/v1beta2
+kind: Cluster
+metadata:
+  name: sample
+  namespace: sample
+spec:
+  paused: false
+  controlPlaneRef:
+    apiGroup: controlplane.cluster.x-k8s.io
+    kind: KubeadmControlPlane
+    name: sample
+---
+apiVersion: ipam.cluster.x-k8s.io/v1alpha1
+kind: NetBoxNetwork
+metadata:
+  name: sample-default
+  namespace: sample
+spec:
+  clusterName: sample
+  parentPrefix: 10.10.0.0/22
+  gateway: 10.10.0.1
+  prefixLength: 27
+  tags:
+  - capi
+  customFields:
+    labels:
+      cluster: sample
+---
+apiVersion: ipam.cluster.x-k8s.io/v1alpha1
+kind: NetBoxIPPool
+metadata:
+  name: sample-worker
+  namespace: sample
+  labels:
+    cluster.x-k8s.io/cluster-name: sample
+spec:
+  ranges:
+  - networkName: sample-default
+    start: 14
+    end: 30
+---
+apiVersion: ipam.cluster.x-k8s.io/v1beta2
+kind: IPAddressClaim
+metadata:
+  name: sample-claim
+  namespace: sample
+spec:
+  clusterName: sample
+  poolRef:
+    apiGroup: ipam.cluster.x-k8s.io
+    kind: NetBoxIPPool
+    name: sample-worker

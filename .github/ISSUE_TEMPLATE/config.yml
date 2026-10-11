@@ -1,0 +1,4 @@
+contact_links:
+- name: Report a vulnerability
+  url: https://github.com/MicleMaslow/cluster-api-ipam-provider-netbox/security/advisories/new
+  about: Report security issues privately, not in a public issue.

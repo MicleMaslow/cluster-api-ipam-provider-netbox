@@ -1,0 +1,273 @@
+/*
+Copyright 2026 The cluster-api-ipam-provider-netbox Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package controllers
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
+	kerrors "k8s.io/apimachinery/pkg/util/errors"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+	crmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
+
+	"github.com/MicleMaslow/cluster-api-ipam-provider-netbox/api/v1alpha1"
+	"github.com/MicleMaslow/cluster-api-ipam-provider-netbox/internal/netbox"
+)
+
+// objNetBox serves obj at path, found by every list of path and read by its id, and records each request.
+func objNetBox(t *testing.T, path, obj string, reqs *[]string) *netbox.Client {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		*reqs = append(*reqs, r.Method+" "+r.URL.Path+"?"+r.URL.RawQuery)
+		switch {
+		case r.Method == http.MethodDelete:
+			w.WriteHeader(http.StatusNoContent)
+		case r.Method != http.MethodGet:
+			_, _ = io.WriteString(w, obj)
+		case r.URL.Path == "/api/"+path:
+			_, _ = io.WriteString(w, `{"results":[`+obj+`]}`)
+		case strings.HasPrefix(r.URL.Path, "/api/"+path):
+			w.Header().Set("ETag", `W/"e1"`)
+			_, _ = io.WriteString(w, obj)
+		default:
+			_, _ = io.WriteString(w, `{"results":[]}`)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return &netbox.Client{URL: srv.URL, Token: "t"}
+}
+
+func TestToResult(t *testing.T) {
+	boom := errors.New("boom")
+	forbidden := fmt.Errorf("DELETE ipam/prefixes/1/: %w", netbox.ErrForbidden)
+	internal := withReason(v1alpha1.ReasonInternalError, boom)
+	for name, tc := range map[string]struct {
+		err     error
+		want    ctrl.Result
+		wantErr error
+		reason  string
+	}{
+		"waitFor":              {waitFor(v1alpha1.ReasonNetworkNotReady, boom), ctrl.Result{}, nil, v1alpha1.ReasonNetworkNotReady},
+		"waitFor wrapped":      {fmt.Errorf("ctx: %w", waitFor(v1alpha1.ReasonWaitingForPools, boom)), ctrl.Result{}, nil, v1alpha1.ReasonWaitingForPools},
+		"retryLater":           {retryLater(v1alpha1.ReasonParentNotFound, boom), ctrl.Result{RequeueAfter: time.Minute}, nil, v1alpha1.ReasonParentNotFound},
+		"invalid spec":         {withReason(v1alpha1.ReasonInvalidSpec, boom), ctrl.Result{}, nil, v1alpha1.ReasonInvalidSpec},
+		"internal error":       {internal, ctrl.Result{}, internal, v1alpha1.ReasonInternalError},
+		"plain error":          {boom, ctrl.Result{}, boom, v1alpha1.ReasonNetBoxError},
+		"forbidden":            {forbidden, ctrl.Result{RequeueAfter: time.Minute}, nil, v1alpha1.ReasonForbidden},
+		"forbidden aggregated": {kerrors.NewAggregate([]error{boom, forbidden}), ctrl.Result{RequeueAfter: time.Minute}, nil, v1alpha1.ReasonForbidden},
+		"nil":                  {nil, ctrl.Result{}, nil, v1alpha1.ReasonReady},
+	} {
+		got, err := toResult(tc.err)
+		if got != tc.want || !errors.Is(err, tc.wantErr) || (tc.wantErr == nil) != (err == nil) {
+			t.Errorf("%s: toResult = %+v, %v; want %+v, %v", name, got, err, tc.want, tc.wantErr)
+		}
+		var conds []metav1.Condition
+		setReady(&conds, 1, tc.err)
+		if c := meta.FindStatusCondition(conds, v1alpha1.ReadyCondition); c == nil || c.Reason != tc.reason {
+			t.Errorf("%s: Ready condition %+v, want reason %s", name, c, tc.reason)
+		}
+	}
+}
+
+func TestSetDeleting(t *testing.T) {
+	for name, tc := range map[string]struct {
+		err    error
+		reason string
+	}{
+		"normal course": {nil, v1alpha1.ReasonDeleting},
+		"blocked":       {waitFor(v1alpha1.ReasonWaitingForAddresses, errors.New("2 addresses")), v1alpha1.ReasonWaitingForAddresses},
+		"forbidden":     {fmt.Errorf("DELETE: %w", netbox.ErrForbidden), v1alpha1.ReasonForbidden},
+	} {
+		conds := []metav1.Condition{{Type: v1alpha1.ReadyCondition, Status: metav1.ConditionTrue, Reason: v1alpha1.ReasonReady}}
+		setDeleting(&conds, 3, tc.err)
+		c := meta.FindStatusCondition(conds, v1alpha1.ReadyCondition)
+		if c.Status != metav1.ConditionFalse || c.Reason != tc.reason || c.ObservedGeneration != 3 {
+			t.Errorf("%s: %+v, want False/%s", name, c, tc.reason)
+		}
+	}
+}
+
+func TestIgnoreGone(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := v1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	boom := errors.New("boom")
+	failing := interceptor.Funcs{
+		Patch: func(context.Context, client.WithWatch, client.Object, client.Patch, ...client.PatchOption) error {
+			return boom
+		},
+		SubResourcePatch: func(context.Context, client.Client, string, client.Object, client.Patch, ...client.SubResourcePatchOption) error {
+			return boom
+		},
+	}
+	deleting := newNetwork("ns", "gone")
+	deleting.DeletionTimestamp = &metav1.Time{Time: time.Now()}
+	raw := client.RawPatch(types.MergePatchType, []byte(`{}`))
+	for name, tc := range map[string]struct {
+		obj   client.Object
+		funcs interceptor.Funcs
+		want  func(error) bool
+	}{
+		"not found, object alive":    {newNetwork("ns", "gone"), interceptor.Funcs{}, apierrors.IsNotFound},
+		"other error":                {newNetwork("ns", "gone"), failing, func(err error) bool { return errors.Is(err, boom) }},
+		"not found, object deleting": {deleting, interceptor.Funcs{}, func(err error) bool { return err == nil }},
+	} {
+		c := ignoreGone{fake.NewClientBuilder().WithScheme(scheme).WithInterceptorFuncs(tc.funcs).Build()}
+		if err := c.Patch(context.Background(), tc.obj, raw); !tc.want(err) {
+			t.Errorf("%s: Patch: %v", name, err)
+		}
+		if err := c.Status().Patch(context.Background(), tc.obj, raw); !tc.want(err) {
+			t.Errorf("%s: Status().Patch: %v", name, err)
+		}
+	}
+}
+
+func TestNetworkUsable(t *testing.T) {
+	cond := func(status metav1.ConditionStatus, reason string) []metav1.Condition {
+		return []metav1.Condition{{Type: v1alpha1.ReadyCondition, Status: status, Reason: reason}}
+	}
+	for name, tc := range map[string]struct {
+		prefix   string
+		conds    []metav1.Condition
+		deleting bool
+		want     bool
+	}{
+		"ready":                    {"10.10.0.0/28", cond(metav1.ConditionTrue, v1alpha1.ReasonReady), false, true},
+		"ready without prefix":     {"", cond(metav1.ConditionTrue, v1alpha1.ReasonReady), false, false},
+		"no condition":             {"10.10.0.0/28", nil, false, false},
+		"not ready":                {"10.10.0.0/28", cond(metav1.ConditionFalse, v1alpha1.ReasonParentNotFound), false, false},
+		"deleting, blocked":        {"10.10.0.0/28", cond(metav1.ConditionFalse, v1alpha1.ReasonWaitingForPools), true, true},
+		"deleting, stale ready":    {"10.10.0.0/28", cond(metav1.ConditionTrue, v1alpha1.ReasonReady), true, false},
+		"deleting, going":          {"10.10.0.0/28", cond(metav1.ConditionFalse, v1alpha1.ReasonDeleting), true, false},
+		"deleting, no prefix":      {"", cond(metav1.ConditionFalse, v1alpha1.ReasonWaitingForPools), true, false},
+		"deleting, forbidden":      {"10.10.0.0/28", cond(metav1.ConditionFalse, v1alpha1.ReasonForbidden), true, false},
+		"blocked reason, not gone": {"10.10.0.0/28", cond(metav1.ConditionFalse, v1alpha1.ReasonWaitingForPools), false, false},
+	} {
+		nw := newNetwork("ns", "n")
+		nw.Status.Prefix, nw.Status.Conditions = tc.prefix, tc.conds
+		if tc.deleting {
+			nw.DeletionTimestamp = &metav1.Time{Time: time.Now()}
+		}
+		if got := networkUsable(nw); got != tc.want {
+			t.Errorf("%s: networkUsable = %t, want %t", name, got, tc.want)
+		}
+	}
+}
+
+// lockFree reports whether netBoxWrites can be taken; a controller of the suite may hold it for a moment.
+func lockFree() bool {
+	for range 200 {
+		if netBoxWrites.TryLock() {
+			netBoxWrites.Unlock()
+			return true
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return false
+}
+
+// lockWaits is the number of waits for netBoxWrites that the metric has seen.
+func lockWaits(t *testing.T) uint64 {
+	t.Helper()
+	families, err := crmetrics.Registry.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range families {
+		if f.GetName() == "netbox_ipam_write_lock_wait_seconds" {
+			return f.GetMetric()[0].GetHistogram().GetSampleCount()
+		}
+	}
+	t.Fatal("netbox_ipam_write_lock_wait_seconds is not registered")
+	return 0
+}
+
+func TestUnderLockReadOnly(t *testing.T) {
+	nb := &netbox.Client{URL: "http://netbox.invalid", Token: "t"}
+	calls := 0
+	err := underLock(context.Background(), nb, func(ctx context.Context, c *netbox.Client) error {
+		calls++
+		if !lockFree() {
+			t.Error("netBoxWrites is held while the section only reads")
+		}
+		if _, err := c.Patch(ctx, netbox.Prefixes, 1, "", nil); !errors.Is(err, netbox.ErrWriteNeeded) {
+			t.Errorf("the first pass client writes: %v", err)
+		}
+		return nil
+	})
+	if err != nil || calls != 1 {
+		t.Errorf("err %v after %d calls, want nil after 1", err, calls)
+	}
+}
+
+func TestUnderLockWrites(t *testing.T) {
+	nb := &netbox.Client{URL: "http://netbox.invalid", Token: "t"}
+	var seen []*netbox.Client
+	waits := lockWaits(t)
+	err := underLock(context.Background(), nb, func(ctx context.Context, c *netbox.Client) error {
+		seen = append(seen, c)
+		if len(seen) == 1 {
+			wrapped := fmt.Errorf("PATCH ipam/ip-ranges/1/: %w", netbox.ErrWriteNeeded)
+			return fmt.Errorf("range a: %w", retryLater(v1alpha1.ReasonRangeInUse, wrapped))
+		}
+		if netBoxWrites.TryLock() {
+			netBoxWrites.Unlock()
+			t.Error("netBoxWrites is free in the second pass")
+		}
+		if dl, ok := ctx.Deadline(); !ok || time.Until(dl) > netBoxWriteTimeout {
+			t.Errorf("deadline %v, ok %t, want within %s", dl, ok, netBoxWriteTimeout)
+		}
+		return nil
+	})
+	if err != nil || len(seen) != 2 || seen[0] == nb || seen[1] != nb {
+		t.Errorf("err %v, %d calls, first on nb %t, second on nb %t; want nil, 2, false, true", err, len(seen), len(seen) > 0 && seen[0] == nb, len(seen) > 1 && seen[1] == nb)
+	}
+	if !lockFree() {
+		t.Error("netBoxWrites is still held after the section")
+	}
+	if got := lockWaits(t); got <= waits {
+		t.Errorf("%d waits observed, want more than %d", got, waits)
+	}
+}
+
+func TestUnderLockError(t *testing.T) {
+	boom := errors.New("boom")
+	calls := 0
+	err := underLock(context.Background(), &netbox.Client{URL: "http://netbox.invalid", Token: "t"}, func(context.Context, *netbox.Client) error {
+		calls++
+		return withReason(v1alpha1.ReasonDuplicate, boom)
+	})
+	if !errors.Is(err, boom) || calls != 1 {
+		t.Errorf("err %v after %d calls, want boom after 1", err, calls)
+	}
+}

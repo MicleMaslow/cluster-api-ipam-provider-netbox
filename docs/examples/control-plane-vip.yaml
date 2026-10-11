@@ -1,0 +1,25 @@
+# Fragment of a KubeadmControlPlane: one preKubeadmCommands entry that puts the control plane VIP into the
+# configuration of the load balancer. Add it to the existing list; the other fields are left out.
+#
+# A NetBoxNetwork with controlPlaneEndpoint reserves the VIP and writes it to Cluster.spec.controlPlaneEndpoint
+# before Cluster API renders the bootstrap data. Cluster API puts the endpoint into the kubeadm config on the node:
+# controlPlaneEndpoint in /run/kubeadm/kubeadm.yaml (first control plane machine), apiServerEndpoint in
+# /run/kubeadm/kubeadm-join-config.yaml (other control plane machines); with Ignition both are in /etc/kubeadm.yml.
+#
+# The command reads host and port from the first of these files that exists and fails without an address. It
+# replaces __CONTROL_PLANE_ENDPOINT__ and __CONTROL_PLANE_PORT__ in the file f, the first line of the command: the
+# kube-vip manifest here, or /etc/keepalived/keepalived.conf and the like. The file comes from the template
+# (kubeadmConfigSpec.files) with the two placeholders in it. The node needs GNU sed.
+apiVersion: controlplane.cluster.x-k8s.io/v1beta2
+kind: KubeadmControlPlane
+metadata:
+  name: demo
+spec:
+  kubeadmConfigSpec:
+    preKubeadmCommands:
+    - >-
+      f=/etc/kubernetes/manifests/kube-vip.yaml;
+      for k in /run/kubeadm/kubeadm.yaml /run/kubeadm/kubeadm-join-config.yaml /etc/kubeadm.yml; do if [ -f "$k" ]; then break; fi; done;
+      a=$(sed -nE 's/^ *(controlPlaneEndpoint|apiServerEndpoint): *"?([^:"]+):([0-9]+)"?$/\2 \3/p' "$k" | head -1);
+      [ -n "$a" ] || { echo "no control plane endpoint in $k" >&2; exit 1; };
+      sed -i "s/__CONTROL_PLANE_ENDPOINT__/${a% *}/g; s/__CONTROL_PLANE_PORT__/${a#* }/g" "$f"

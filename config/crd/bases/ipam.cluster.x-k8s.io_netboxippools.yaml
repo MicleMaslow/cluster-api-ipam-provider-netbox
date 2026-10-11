@@ -1,0 +1,344 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.22.0
+  name: netboxippools.ipam.cluster.x-k8s.io
+spec:
+  group: ipam.cluster.x-k8s.io
+  names:
+    categories:
+    - cluster-api
+    kind: NetBoxIPPool
+    listKind: NetBoxIPPoolList
+    plural: netboxippools
+    singular: netboxippool
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - description: Count of addresses in the pool
+      jsonPath: .status.ipAddresses.total
+      name: Total
+      type: integer
+    - description: Count of allocated addresses in the pool
+      jsonPath: .status.ipAddresses.used
+      name: Used
+      type: integer
+    - description: Count of unallocated addresses in the pool
+      jsonPath: .status.ipAddresses.free
+      name: Free
+      type: integer
+    - description: Whether the pool is reflected in NetBox
+      jsonPath: .status.conditions[?(@.type=='Ready')].status
+      name: Ready
+      type: string
+    - description: Reason of the Ready condition
+      jsonPath: .status.conditions[?(@.type=='Ready')].reason
+      name: Reason
+      type: string
+    - description: Time duration since creation of NetBoxIPPool
+      jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: NetBoxIPPool is a pool of addresses held in NetBox.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: spec is the desired state of NetBoxIPPool.
+            properties:
+              addressReuseGracePeriodSeconds:
+                description: |-
+                  addressReuseGracePeriodSeconds keeps the address of a deleted claim in NetBox this long, so that it is not handed
+                  to a new machine while caches of the old one still point at it, at most a day. Not applied while the pool
+                  is being deleted.
+                format: int32
+                maximum: 86400
+                minimum: 0
+                type: integer
+              ipAddress:
+                description: |-
+                  ipAddress sets dns_name, description and comments of the pool's NetBox IP addresses with Go templates, rendered
+                  per claim and kept in sync. Variables: .Owner (first owner of the claim, else the claim), .Claim, .Cluster,
+                  .Namespace, .Pool. dnsName defaults to "{{ .Owner }}", is lowercased and must be a valid DNS name;
+                  description defaults to "{{ .Namespace }}/{{ .Owner }} // {{ .Cluster }} {{ .Pool }}" and is cut to 200 characters;
+                  comments default to "// managed by cluster-api-ipam-provider-netbox, please don't edit it in NetBox unless you know what you're doing".
+                  Results are trimmed; {{ "" }} leaves a field empty. range, define, block and template are not allowed,
+                  and a value is limited to 1024 bytes.
+                minProperties: 1
+                properties:
+                  comments:
+                    description: comments template.
+                    maxLength: 1024
+                    minLength: 1
+                    type: string
+                  description:
+                    description: description template, cut to 200 characters; default
+                      "{{ .Namespace }}/{{ .Owner }} // {{ .Cluster }} {{ .Pool }}".
+                    maxLength: 1024
+                    minLength: 1
+                    type: string
+                  dnsName:
+                    description: dnsName template, lowercased; default "{{ .Owner
+                      }}".
+                    maxLength: 1024
+                    minLength: 1
+                    type: string
+                type: object
+              ipRange:
+                description: |-
+                  ipRange sets description and comments of the pool's NetBox IP ranges with Go templates, kept in sync.
+                  Variables: .Cluster (of the network), .Namespace, .Pool, .Network. description defaults to
+                  "{{ .Namespace }}/{{ .Pool }} // pool of cluster {{ .Cluster }}"; comments and the rules as for ipAddress.
+                minProperties: 1
+                properties:
+                  comments:
+                    description: comments template.
+                    maxLength: 1024
+                    minLength: 1
+                    type: string
+                  description:
+                    description: description template, cut to 200 characters; default
+                      "{{ .Namespace }}/{{ .Pool }} // pool of cluster {{ .Cluster
+                      }}".
+                    maxLength: 1024
+                    minLength: 1
+                    type: string
+                type: object
+              omitGateway:
+                description: |-
+                  omitGateway hands out addresses without a gateway, e.g. for a second NIC whose default route is on the first.
+                  Immutable: an IPAddress never changes, so a change would mix both kinds in the pool.
+                type: boolean
+                x-kubernetes-validations:
+                - message: omitGateway is immutable
+                  rule: self == oldSelf
+              ranges:
+                description: |-
+                  ranges are used in order. A range can be changed or removed; a change that would leave
+                  allocated addresses outside the range waits until they are released.
+                items:
+                  description: IPPoolRange is a span of a NetBoxNetwork given as offsets
+                    from its first address.
+                  properties:
+                    end:
+                      description: end offset, same rules as start.
+                      format: int32
+                      type: integer
+                    networkName:
+                      description: networkName is a NetBoxNetwork in the pool's namespace.
+                      maxLength: 63
+                      minLength: 1
+                      type: string
+                    start:
+                      description: start offset; a negative one counts back from the
+                        last address, -1 is the last one.
+                      format: int32
+                      type: integer
+                  required:
+                  - end
+                  - networkName
+                  - start
+                  type: object
+                maxItems: 16
+                minItems: 1
+                type: array
+                x-kubernetes-list-type: atomic
+                x-kubernetes-validations:
+                - message: one range per network
+                  rule: self.all(r, self.exists_one(o, o.networkName == r.networkName))
+                - message: start must not be after end
+                  rule: self.all(r, (r.start >= 0) != (r.end >= 0) || r.start <= r.end)
+            required:
+            - ranges
+            type: object
+            x-kubernetes-validations:
+            - message: omitGateway cannot be added or removed
+              rule: has(self.omitGateway) == has(oldSelf.omitGateway)
+          status:
+            description: status is the observed state of NetBoxIPPool.
+            minProperties: 1
+            properties:
+              addressPrefixLength:
+                description: addressPrefixLength is the mask length (that of the L2
+                  network) handed to every address of the pool.
+                format: int32
+                maximum: 128
+                minimum: 1
+                type: integer
+              conditions:
+                description: |-
+                  conditions represents the observations of a NetBoxIPPool's current state.
+                  Known condition types are Ready and RangesReady.
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                maxItems: 32
+                type: array
+                x-kubernetes-list-map-keys:
+                - type
+                x-kubernetes-list-type: map
+              gateway:
+                description: gateway handed to every address of the pool.
+                maxLength: 39
+                minLength: 1
+                type: string
+              ipAddresses:
+                description: ipAddresses reports the count of total, used and free
+                  addresses in the pool.
+                properties:
+                  free:
+                    description: free is the number of addresses not yet used, total
+                      minus used.
+                    format: int32
+                    type: integer
+                  total:
+                    description: total is the number of addresses in the ready ranges
+                      of the pool.
+                    format: int32
+                    type: integer
+                  used:
+                    description: used is the number of IPAddress objects of the pool
+                      in the ready ranges.
+                    format: int32
+                    type: integer
+                required:
+                - free
+                - total
+                - used
+                type: object
+              ranges:
+                description: ranges are the NetBox IP ranges of the pool, in spec
+                  order, then the removed ones that still hold addresses.
+                items:
+                  description: IPPoolRangeStatus is one range of a NetBoxIPPool as
+                    it is in NetBox.
+                  properties:
+                    endAddress:
+                      description: endAddress is the last address of the NetBox IP
+                        range.
+                      maxLength: 39
+                      minLength: 1
+                      type: string
+                    id:
+                      description: id is the NetBox ID of the IP range.
+                      format: int64
+                      minimum: 1
+                      type: integer
+                    message:
+                      description: message is a human readable explanation of reason.
+                      maxLength: 32768
+                      minLength: 1
+                      type: string
+                    networkName:
+                      description: networkName is the NetBoxNetwork the range lies
+                        in.
+                      maxLength: 63
+                      minLength: 1
+                      type: string
+                    ready:
+                      description: ready is true when claims get addresses from the
+                        range.
+                      type: boolean
+                    reason:
+                      description: reason is why the range is not ready or not as
+                        the spec asks.
+                      maxLength: 1024
+                      minLength: 1
+                      type: string
+                    startAddress:
+                      description: startAddress is the first address of the NetBox
+                        IP range.
+                      maxLength: 39
+                      minLength: 1
+                      type: string
+                  required:
+                  - endAddress
+                  - id
+                  - networkName
+                  - ready
+                  - startAddress
+                  type: object
+                maxItems: 32
+                type: array
+                x-kubernetes-list-map-keys:
+                - networkName
+                x-kubernetes-list-type: map
+            type: object
+        required:
+        - spec
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

@@ -1,0 +1,43 @@
+version: 2
+updates:
+- package-ecosystem: "github-actions"
+  directory: "/"
+  schedule:
+    interval: "weekly"
+  groups:
+    all-github-actions:
+      patterns: [ "*" ]
+  commit-message:
+    prefix: ":seedling:"
+
+- package-ecosystem: "gomod"
+  directory: "/"
+  schedule:
+    interval: "weekly"
+    day: "monday"
+  groups:
+    all-go-mod-patch-and-minor:
+      patterns: [ "*" ]
+      update-types: [ "patch", "minor" ]
+  ignore:
+  # Bumped manually together with Cluster API and controller-runtime.
+  - dependency-name: "k8s.io/*"
+    update-types: [ "version-update:semver-major", "version-update:semver-minor" ]
+  - dependency-name: "sigs.k8s.io/*"
+    update-types: [ "version-update:semver-major", "version-update:semver-minor" ]
+  commit-message:
+    prefix: ":seedling:"
+
+- package-ecosystem: "docker"
+  directory: "/"
+  schedule:
+    interval: "weekly"
+  groups:
+    all-docker:
+      patterns: [ "*" ]
+  ignore:
+  # The Go version follows go.mod.
+  - dependency-name: "golang"
+    update-types: [ "version-update:semver-major", "version-update:semver-minor" ]
+  commit-message:
+    prefix: ":seedling:"

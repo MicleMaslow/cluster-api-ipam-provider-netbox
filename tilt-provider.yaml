@@ -1,0 +1,10 @@
+name: ipam-netbox
+config:
+  image: ghcr.io/miclemaslow/cluster-api-ipam-provider-netbox
+  live_reload_deps:
+  - main.go
+  - go.mod
+  - go.sum
+  - api
+  - internal
+  label: IPAM-NETBOX

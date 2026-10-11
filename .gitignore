@@ -1,0 +1,6 @@
+hack/tools/bin/
+hack/dev/.env
+hack/dev/kubeconfig
+hack/dev/*.local.*
+out/
+cover.out

@@ -1,0 +1,14 @@
+# Merge patch of the NetBoxNetwork of a vcsim cluster: tags and custom fields of its NetBox prefix.
+# ${CLUSTER_NAME} is substituted. Copy to vcsim-network.local.yaml (git-ignored) for your own;
+# custom fields it needs go into custom-fields.local.json, created by make netbox-up.
+spec:
+  tags: [capi, k8s]
+  customFields:
+    team: platform      # text
+    priority: 2         # integer
+    monitored: true     # boolean
+    site_tier: standard # select
+    vlan: 1             # object, the id of the VLAN dev-vlan from seed.sh (1 on a fresh NetBox)
+    labels:             # json, merged key by key
+      cluster: ${CLUSTER_NAME}
+      env: dev

@@ -1,0 +1,7 @@
+# Only what the build needs.
+*
+!go.mod
+!go.sum
+!main.go
+!api/
+!internal/

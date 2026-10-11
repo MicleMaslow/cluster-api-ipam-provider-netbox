@@ -1,0 +1,9 @@
+# clusterctl config of the dev stand, used instead of the user's global one.
+# The provider comes from the local repository written by make release; run clusterctl from the repository root.
+# NETBOX_URL and NETBOX_TOKEN are taken from the environment, and so are the optional NETBOX_INSTANCE (default none)
+# and NETBOX_REF_FIELD (default capi_ref).
+providers:
+- name: netbox
+  type: IPAMProvider
+  url: file://${PWD}/out/repo/ipam-netbox/latest/ipam-components.yaml
+CLUSTERCTL_DISABLE_VERSIONCHECK: "true"

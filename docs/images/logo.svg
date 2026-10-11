@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-label="cluster-api-ipam-provider-netbox">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0f172a"/>
+      <stop offset="1" stop-color="#1e3a8a"/>
+    </linearGradient>
+  </defs>
+  <rect width="256" height="256" rx="56" fill="url(#bg)"/>
+  <!-- parent prefix -->
+  <rect x="36" y="44" width="184" height="38" rx="9" fill="#334155"/>
+  <!-- carved subnets -->
+  <rect x="36" y="90" width="88" height="38" rx="9" fill="#475569"/>
+  <rect x="132" y="90" width="88" height="38" rx="9" fill="#6366f1"/>
+  <!-- pool ranges of the cluster subnet -->
+  <rect x="36" y="136" width="40" height="38" rx="9" fill="#3b4a63"/>
+  <rect x="84" y="136" width="40" height="38" rx="9" fill="#3b4a63"/>
+  <rect x="132" y="136" width="40" height="38" rx="9" fill="#818cf8"/>
+  <rect x="180" y="136" width="40" height="38" rx="9" fill="#818cf8"/>
+  <!-- addresses: allocated and the control-plane VIP -->
+  <rect x="132" y="182" width="16" height="30" rx="5" fill="#22d3ee"/>
+  <rect x="156" y="182" width="16" height="30" rx="5" fill="#22d3ee"/>
+  <rect x="180" y="182" width="16" height="30" rx="5" fill="#22d3ee"/>
+  <rect x="204" y="182" width="16" height="30" rx="5" fill="#fbbf24"/>
+</svg>

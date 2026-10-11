@@ -1,0 +1,9 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+- bases/ipam.cluster.x-k8s.io_netboxnetworks.yaml
+- bases/ipam.cluster.x-k8s.io_netboxippools.yaml
+labels:
+- pairs:
+    cluster.x-k8s.io/v1beta2: v1alpha1
+    clusterctl.cluster.x-k8s.io/move-hierarchy: ""
