@@ -8,7 +8,7 @@ You need the network and pools of [First cluster](../getting-started/first-clust
 
 ## Steps
 
-1. **Create the network and the pool of the second NIC** next to the first ones. A pool takes ranges of one L2 network only (`MixedNetworks`), so the second NIC cannot share the pool of the first:
+1. **Create the network and the pool of the second NIC** next to the first ones. A pool takes pools of networks of one L2 network only (`MixedNetworks`), so the second NIC cannot share the pool of the first:
 
    ```yaml
    apiVersion: ipam.cluster.x-k8s.io/v1alpha1
@@ -19,13 +19,14 @@ You need the network and pools of [First cluster](../getting-started/first-clust
      parentPrefix: 10.20.0.0/22
      gateway: 10.20.0.1
      prefixLength: 26
+     pools: [{name: data, size: rest}]
    ---
    apiVersion: ipam.cluster.x-k8s.io/v1alpha1
    kind: NetBoxIPPool
    metadata: {name: demo-data, namespace: demo, labels: {cluster.x-k8s.io/cluster-name: demo}}
    spec:
      omitGateway: true
-     ranges: [{networkName: demo-data, start: 2, end: -3}]
+     ranges: [{networkName: demo-data, pool: data}]
    ```
 
    `omitGateway` hands out the addresses without a gateway; `status.gateway` of the pool is empty. Set it when you create the pool: it is immutable and cannot be added or removed later, because the `IPAddress` spec is immutable and a change would mix both kinds in the pool. Put `controlPlaneEndpoint` on the network of the first NIC, the one the VIP belongs to.

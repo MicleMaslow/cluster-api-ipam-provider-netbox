@@ -30,11 +30,10 @@ import (
 func TestMoveKeepsNetBoxObjects(t *testing.T) {
 	g := newG(t)
 	ns := newEnv(t, nil)
-	nw := newNetwork(ns, "default")
+	nw := layoutNetwork(ns, "default")
 	nw.Spec.DeletionPolicy = v1alpha1.DeletionPolicyDelete
-	g.Expect(k8s.Create(ctx, nw)).To(Succeed())
-	waitReady(g, nw)
-	pool := newPool(ns, "worker", v1alpha1.IPPoolRange{NetworkName: "default", Start: 2, End: 4})
+	readyLayout(g, nw)
+	pool := newPool(ns, "worker", v1alpha1.IPPoolRange{NetworkName: "default", Pool: "cp"})
 	g.Expect(k8s.Create(ctx, pool)).To(Succeed())
 	waitReady(g, pool)
 	claim := newClaim(ns, "m1", "worker")

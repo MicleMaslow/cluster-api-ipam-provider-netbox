@@ -40,6 +40,7 @@ const (
 	defaultPrefixDescription  = "{{ .Namespace }}/{{ .Name }} // cluster {{ .Cluster }}"
 	defaultVIPDescription     = "{{ .Namespace }}/{{ .Name }} // {{ .Cluster }} control plane endpoint"
 	defaultRangeDescription   = "{{ .Namespace }}/{{ .Pool }} // pool of cluster {{ .Cluster }}"
+	defaultReserveDescription = "{{ .Namespace }}/{{ .Network }} // {{ .Cluster }} {{ .Group }} {{ .Index }}"
 	defaultComments           = "// managed by cluster-api-ipam-provider-netbox, please don't edit it in NetBox unless you know what you're doing"
 )
 
@@ -70,8 +71,14 @@ type addressData struct{ Owner, Claim, Cluster, Namespace, Pool string }
 // networkData are the variables of the prefix and VIP templates.
 type networkData struct{ Cluster, Namespace, Name string }
 
-// rangeData are the variables of the range templates.
-type rangeData struct{ Cluster, Namespace, Pool, Network string }
+// rangeData are the variables of the range texts.
+type rangeData struct{ Cluster, Namespace, Pool string }
+
+// reserveData are the variables of the templates of an address group.
+type reserveData struct {
+	Cluster, Namespace, Network, Group string
+	Index                              int
+}
 
 // texts are the description and comments of a NetBox object.
 type texts struct{ Description, Comments string }
@@ -90,15 +97,21 @@ type ipFields struct {
 
 // addressFields renders the fields of the address claim holds in pool.
 func addressFields(pool *v1alpha1.NetBoxIPPool, claim *ipamv1.IPAddressClaim) (ipFields, error) {
+	return claimFields(pool.Spec.IPAddress, pool.Name, claim)
+}
+
+// claimFields renders t for the address claim holds in pool: .Owner is the first owner of the claim, else the claim.
+func claimFields(t v1alpha1.IPAddressFields, pool string, claim *ipamv1.IPAddressClaim) (ipFields, error) {
 	owner := claim.Name
 	if len(claim.OwnerReferences) > 0 {
 		owner = claim.OwnerReferences[0].Name
 	}
-	return renderFields(pool.Spec.IPAddress, addressData{Owner: owner, Claim: claim.Name, Cluster: clusterOf(claim), Namespace: claim.Namespace, Pool: pool.Name})
+	return renderFields(t, addressData{Owner: owner, Claim: claim.Name, Cluster: clusterOf(claim), Namespace: claim.Namespace, Pool: pool})
 }
 
 // networkTexts are the attributes of the prefix and the VIP of nw: the owner and tenant resolved in its status and
-// the texts of its templates. A template that does not render is InvalidSpec.
+// the texts of its templates. A template that does not render, those of the VIP's dnsName and of the address groups
+// included, is InvalidSpec.
 func networkTexts(nw *v1alpha1.NetBoxNetwork) (prefix, vip netbox.Attrs, err error) {
 	d := networkData{Cluster: nw.Spec.ClusterName, Namespace: nw.Namespace, Name: nw.Name}
 	pt, err := renderTexts(nw.Spec.Description, nw.Spec.Comments, defaultPrefixDescription, d)
@@ -110,13 +123,44 @@ func networkTexts(nw *v1alpha1.NetBoxNetwork) (prefix, vip netbox.Attrs, err err
 	if err != nil {
 		return prefix, vip, withReason(v1alpha1.ReasonInvalidSpec, fmt.Errorf("controlPlaneEndpoint: %w", err))
 	}
+	if _, err := dnsNameOf(nw); err != nil {
+		return prefix, vip, err
+	}
+	for _, g := range nw.Spec.Addresses {
+		for i := 1; i <= int(g.Count); i++ {
+			if _, err := groupFields(nw, g, i); err != nil {
+				return prefix, vip, withReason(v1alpha1.ReasonInvalidSpec, fmt.Errorf("addresses %s: %w", g.Name, err))
+			}
+		}
+	}
 	return pt.on(networkAttrs(nw)), vt.on(networkAttrs(nw)), nil
 }
 
-// rangeTexts renders the texts of the range of pool in nw.
-func rangeTexts(pool *v1alpha1.NetBoxIPPool, nw *v1alpha1.NetBoxNetwork) (texts, error) {
-	return renderTexts(pool.Spec.IPRange.Description, pool.Spec.IPRange.Comments, defaultRangeDescription,
-		rangeData{Cluster: nw.Spec.ClusterName, Namespace: pool.Namespace, Pool: pool.Name, Network: nw.Name})
+// dnsNameOf is the dns_name of the VIP of nw; one that does not render is InvalidSpec.
+func dnsNameOf(nw *v1alpha1.NetBoxNetwork) (string, error) {
+	ep := ptr.Deref(nw.Spec.ControlPlaneEndpoint, v1alpha1.ControlPlaneEndpoint{})
+	dns, err := renderDNSName(ep.DNSName, networkData{Cluster: nw.Spec.ClusterName, Namespace: nw.Namespace, Name: nw.Name})
+	if err != nil {
+		return "", withReason(v1alpha1.ReasonInvalidSpec, fmt.Errorf("controlPlaneEndpoint: %w", err))
+	}
+	return dns, nil
+}
+
+// groupFields renders the fields of address index of group g in nw.
+func groupFields(nw *v1alpha1.NetBoxNetwork, g v1alpha1.AddressGroup, index int) (ipFields, error) {
+	d := reserveData{Cluster: nw.Spec.ClusterName, Namespace: nw.Namespace, Network: nw.Name, Group: g.Name, Index: index}
+	dns, err := renderDNSName(g.DNSName, d)
+	if err != nil {
+		return ipFields{}, err
+	}
+	tx, err := renderTexts(g.Description, "", defaultReserveDescription, d)
+	return ipFields{DNSName: dns, texts: tx}, err
+}
+
+// rangeTexts are the texts of the ranges of pool in nw: the defaults, which always render.
+func rangeTexts(nw *v1alpha1.NetBoxNetwork, pool string) texts {
+	t, _ := renderTexts("", "", defaultRangeDescription, rangeData{Cluster: nw.Spec.ClusterName, Namespace: nw.Namespace, Pool: pool})
+	return t
 }
 
 // validatePoolTemplates renders the templates of pool with sample values.
@@ -124,26 +168,31 @@ func validatePoolTemplates(pool *v1alpha1.NetBoxIPPool) error {
 	if _, err := renderFields(pool.Spec.IPAddress, addressData{Owner: "owner", Claim: "claim", Cluster: "cluster", Namespace: "namespace", Pool: "pool"}); err != nil {
 		return fmt.Errorf("ipAddress: %w", err)
 	}
-	r := pool.Spec.IPRange
-	if _, err := renderTexts(r.Description, r.Comments, defaultRangeDescription, rangeData{Cluster: "cluster", Namespace: "namespace", Pool: "pool", Network: "network"}); err != nil {
-		return fmt.Errorf("ipRange: %w", err)
-	}
 	return nil
 }
 
 func renderFields(t v1alpha1.IPAddressFields, d addressData) (ipFields, error) {
-	dns, err := render("dnsName", cmp.Or(t.DNSName, defaultDNSName), d)
+	dns, err := renderDNSName(cmp.Or(t.DNSName, defaultDNSName), d)
 	if err != nil {
 		return ipFields{}, err
-	}
-	if dns != "" && (len(dns) > maxDNSName || !dnsNamePattern.MatchString(dns)) {
-		return ipFields{}, fmt.Errorf("dnsName %q is not a valid DNS name", dns)
 	}
 	tx, err := renderTexts(t.Description, t.Comments, defaultAddressDescription, d)
 	if err != nil {
 		return ipFields{}, err
 	}
-	return ipFields{DNSName: strings.ToLower(dns), texts: tx}, nil // NetBox stores dns_name lowercased
+	return ipFields{DNSName: dns, texts: tx}, nil
+}
+
+// renderDNSName renders the dnsName template src on d, in lower case as NetBox stores it; "" renders "".
+func renderDNSName(src string, d any) (string, error) {
+	dns, err := render("dnsName", src, d)
+	if err != nil {
+		return "", err
+	}
+	if dns != "" && (len(dns) > maxDNSName || !dnsNamePattern.MatchString(dns)) {
+		return "", fmt.Errorf("dnsName %q is not a valid DNS name", dns)
+	}
+	return strings.ToLower(dns), nil
 }
 
 // renderTexts renders the description and comments templates on d, "" taking the default.

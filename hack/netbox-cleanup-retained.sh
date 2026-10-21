@@ -14,9 +14,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Deletes the deprecated NetBox objects the networks and pools of a namespace left under deletionPolicy: Retain:
-# control-plane VIPs, pool IP ranges and prefixes, retired ones (key <key>/retired) included. Lists them unless --yes.
-# An object is the namespace's when its key is [<instance>/]<Kind>/<namespace>/...
+# Deletes the deprecated NetBox objects the networks of a namespace left under deletionPolicy: Retain:
+# addresses (control-plane VIPs and reserved addresses), IP ranges of their pools and prefixes, retired ones
+# (key <key>/retired) included. Lists them unless --yes.
+# An object is the namespace's when its key is [<instance>/]NetBoxNetwork/<namespace>/...
 # Run it when the namespace has no networks left: a live network's adopted prefix kept deprecated is in scope too.
 # --instance is the provider's instance name (NETBOX_INSTANCE); without it only keys without an instance match.
 # --ref-field names the text custom field of the key, as NETBOX_REF_FIELD.
@@ -61,9 +62,7 @@ api() {
 # The server filters may match loosely, so everything is checked again here.
 # Appends "<objects returned> <of them with a key>" to $tmp/stats.
 list() {
-  local off=0 page count len seen=0 keyed=0 n pfx
-  case $1 in ip-ranges) pfx=NetBoxIPPool ;; *) pfx=NetBoxNetwork ;; esac
-  pfx=${instance:+$instance/}$pfx/$ns/
+  local off=0 page count len seen=0 keyed=0 n pfx=${instance:+$instance/}NetBoxNetwork/$ns/
   while :; do
     page=$(api GET "ipam/$1/" --fail-with-body -G --data-urlencode "cf_${ref_field}__isw=$pfx" \
       --data-urlencode status=deprecated --data-urlencode limit=1000 --data-urlencode "offset=$off") || return 1
@@ -73,7 +72,7 @@ list() {
     seen=$((seen + len)) keyed=$((keyed + n))
     jq -r --arg t "$1" --arg pfx "$pfx" --arg rf "$ref_field" '
       .results[] | (.custom_fields[$rf] // "" | tostring) as $ref
-      | select(.status.value == "deprecated" and ($t != "ip-addresses" or .role.value == "vip") and ($ref | startswith($pfx)))
+      | select(.status.value == "deprecated" and ($ref | startswith($pfx)))
       | [$t, .id, (.address // .prefix // "\(.start_address)-\(.end_address)"), $ref] | @tsv' <<<"$page" || return 1
     off=$((off + len))
     [ "$len" -gt 0 ] && [ "$off" -lt "$count" ] || break

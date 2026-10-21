@@ -19,6 +19,7 @@ package v1alpha1
 import (
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/intstr"
 )
 
 // DeletionPolicy says what happens in NetBox when the Kubernetes object goes away.
@@ -32,6 +33,17 @@ const (
 	DeletionPolicyDelete DeletionPolicy = "Delete"
 )
 
+// Allocator says what hands out the addresses of the pools of a network.
+// +kubebuilder:validation:Enum=NetBox;InCluster
+type Allocator string
+
+const (
+	// AllocatorNetBox hands out addresses from the NetBox ranges of the pools, through NetBoxIPPools.
+	AllocatorNetBox Allocator = "NetBox"
+	// AllocatorInCluster hands out addresses through an InClusterIPPool (cluster-api-ipam-provider-in-cluster) per pool.
+	AllocatorInCluster Allocator = "InCluster"
+)
+
 // NetBoxNetworkSpec is one subnet of a cluster: a prefix carved from, or adopted in, parentPrefix.
 // +kubebuilder:validation:XValidation:rule="has(self.prefix) != has(self.prefixLength)",message="exactly one of prefix or prefixLength must be set"
 // +kubebuilder:validation:XValidation:rule="has(self.prefix) == has(oldSelf.prefix)",message="cannot switch between prefix and prefixLength"
@@ -42,6 +54,9 @@ const (
 // +kubebuilder:validation:XValidation:rule="!has(self.prefix) || !isCIDR(self.parentPrefix) || !isCIDR(self.prefix) || cidr(self.parentPrefix).containsCIDR(self.prefix)",message="prefix must be inside parentPrefix"
 // +kubebuilder:validation:XValidation:rule="!has(self.prefixLength) || !isCIDR(self.parentPrefix) || self.prefixLength > cidr(self.parentPrefix).prefixLength()",message="prefixLength must be longer than the parentPrefix mask"
 // +kubebuilder:validation:XValidation:rule="!has(self.prefix) || !has(self.deletionPolicy) || self.deletionPolicy != 'Delete'",message="an adopted prefix cannot use deletionPolicy Delete"
+// +kubebuilder:validation:XValidation:rule="!has(self.pools) || !has(self.addresses) || self.pools.all(p, !self.addresses.exists(a, a.name == p.name))",message="pool and address group names must differ"
+// +kubebuilder:validation:XValidation:rule="has(self.allocator) == has(oldSelf.allocator)",message="allocator cannot be added or removed"
+// +kubebuilder:validation:XValidation:rule="!has(self.pools) || has(self.allocator) && self.allocator == 'InCluster' || self.pools.all(p, !has(p.sync) || !has(p.sync.enabled) || !p.sync.enabled)",message="sync needs allocator InCluster"
 type NetBoxNetworkSpec struct {
 	// clusterName is the CAPI Cluster the network belongs to.
 	// +required
@@ -90,12 +105,41 @@ type NetBoxNetworkSpec struct {
 	IsPool *bool `json:"isPool,omitempty"`
 
 	// controlPlaneEndpoint reserves the cluster's VIP in the prefix: the address of the Cluster's endpoint if that is
-	// inside the prefix, else the highest free address. The VIP is written to Cluster.spec.controlPlaneEndpoint
-	// while that has no host or no port; another endpoint is reported, not changed.
+	// inside the prefix, else the highest free address outside the pools and address groups, which the layout keeps
+	// for it. The VIP is written to Cluster.spec.controlPlaneEndpoint while that has no host or no port; another
+	// endpoint is reported, not changed.
 	// Without it no VIP is reserved; removing it later leaves the VIP in NetBox and in the status.
 	// A VIP that cannot be reserved shows in the ControlPlaneEndpointReady condition and leaves Ready alone.
 	// +optional
 	ControlPlaneEndpoint *ControlPlaneEndpoint `json:"controlPlaneEndpoint,omitempty"`
+
+	// allocator hands out the addresses of the pools: NetBox, through NetBoxIPPools over the NetBox ranges of the pools,
+	// or InCluster, through an InClusterIPPool per pool, named as the pool, which the network creates and keeps in sync.
+	// Unset is NetBox. Immutable, cannot be added or removed: another allocator is another network.
+	// +optional
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="allocator is immutable"
+	Allocator Allocator `json:"allocator,omitempty"`
+
+	// pools lay out the prefix: in order, each takes the next free addresses from the start of the prefix.
+	// A free address is not the network, broadcast or gateway of the L2 network, the VIP, nor held by a NetBox
+	// address or range of anything else. The layout is fixed in status.layout and placed again only when the names
+	// or sizes here change; a change that would move an allocated address to another pool is refused as a whole.
+	// Each pool is one or more NetBox IP ranges, which the allocator hands out addresses from.
+	// +optional
+	// +listType=map
+	// +listMapKey=name
+	// +kubebuilder:validation:MaxItems=16
+	// +kubebuilder:validation:XValidation:rule="self.filter(p, type(p.size) == string).size() <= 1",message="at most one pool of size rest"
+	Pools []NetworkPool `json:"pools,omitempty"`
+
+	// addresses are groups of addresses reserved in NetBox at the top of the prefix, under the VIP: each group takes
+	// count free addresses outside the pools, from the top down. Placed addresses stay; a group that grows takes the
+	// highest free ones, one that shrinks gives up its last ones, deleted in NetBox whatever the deletionPolicy.
+	// +optional
+	// +listType=map
+	// +listMapKey=name
+	// +kubebuilder:validation:MaxItems=8
+	Addresses []AddressGroup `json:"addresses,omitempty"`
 
 	// prefix adopts an existing prefix inside parentPrefix instead of carving one.
 	// +optional
@@ -105,7 +149,7 @@ type NetBoxNetworkSpec struct {
 	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="prefix is immutable"
 	Prefix string `json:"prefix,omitempty"`
 
-	// deletionPolicy for the NetBox prefix and the pool ranges inside it.
+	// deletionPolicy for the NetBox prefix, the VIP, the reserved addresses and the pool ranges when the network is deleted.
 	// +optional
 	// +kubebuilder:default=Retain
 	DeletionPolicy DeletionPolicy `json:"deletionPolicy,omitempty"`
@@ -152,6 +196,184 @@ type NetBoxNetworkSpec struct {
 	Comments string `json:"comments,omitempty"`
 }
 
+// NetworkPool is a pool of the network's layout.
+type NetworkPool struct {
+	// name of the pool, which NetBoxIPPool ranges refer to; with allocator InCluster, the name of its InClusterIPPool.
+	// +required
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=63
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`
+	Name string `json:"name,omitempty"`
+
+	// size is the number of free addresses of the pool, or rest: the free addresses the other pools leave.
+	// +required
+	// +kubebuilder:validation:XIntOrString
+	// +kubebuilder:validation:XValidation:rule="type(self) == string ? self == 'rest' : self >= 1 && self <= 65535",message="must be a positive number or rest"
+	Size intstr.IntOrString `json:"size,omitempty"`
+
+	// publish writes the addresses of the pool, under its name, to a Secret.
+	// +optional
+	Publish Publish `json:"publish,omitempty,omitzero"`
+
+	// sync writes each address the InClusterIPPool of the pool hands out (an IPAddress) to NetBox, and deletes it with
+	// the IPAddress. Only with allocator InCluster.
+	// +optional
+	Sync PoolSync `json:"sync,omitempty,omitzero"`
+}
+
+// PoolSync writes the IPAddresses of an InClusterIPPool to NetBox: each an active NetBox address with the mask of the
+// L2 network, the key .../sync/<pool>/<IPAddress>, the fields of ipAddress and the owner and tenant of the network.
+// The NetBox addresses follow the templates and the network; one of someone else at the address of an IPAddress is
+// AddressConflict and is left alone. They are deleted with their IPAddress, when the sync is turned off, and with the
+// network, whatever its deletionPolicy.
+// +kubebuilder:validation:MinProperties=1
+type PoolSync struct {
+	// enabled turns the sync on; unset is false.
+	// +optional
+	Enabled *bool `json:"enabled,omitempty"`
+
+	// ipAddress are the templates of the NetBox addresses, as the ipAddress of a NetBoxIPPool: .Owner is the first
+	// owner of the claim of the IPAddress (the machine), .Pool the name of the pool.
+	// +optional
+	IPAddress IPAddressFields `json:"ipAddress,omitempty,omitzero"`
+}
+
+// Publish writes addresses to the Secret secretName in the namespace of the network, one key per pool or group.
+// The Secret exists while at least one pool or group that publishes in it is enabled, and holds only those.
+// +kubebuilder:validation:MinProperties=1
+// +kubebuilder:validation:XValidation:rule="!has(self.enabled) || !self.enabled || has(self.secretName)",message="enabled needs secretName"
+type Publish struct {
+	// enabled turns publishing on; unset is false.
+	// +optional
+	Enabled *bool `json:"enabled,omitempty"`
+
+	// secretName is the Secret to write to. Several pools and groups of a network may share one, a Secret belongs to
+	// one network: one that exists and is not controlled by it is left alone (SecretConflict).
+	// +optional
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=253
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`
+	SecretName string `json:"secretName,omitempty"`
+}
+
+// AddressGroup is a named group of addresses reserved in NetBox at the top of the prefix.
+type AddressGroup struct {
+	// name of the group; it differs from the name of every pool.
+	// +required
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=63
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`
+	Name string `json:"name,omitempty"`
+
+	// count is the number of addresses of the group.
+	// +required
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=64
+	Count int32 `json:"count,omitempty"`
+
+	// dnsName template of each address, kept in sync; NetBox stores it in lower case. Unset: no dns_name.
+	// Variables: .Cluster, .Namespace, .Network, .Group, .Index (1 for the highest address of the group, counting down).
+	// Rules as for the pool's ipAddress templates.
+	// +optional
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=1024
+	DNSName string `json:"dnsName,omitempty"`
+
+	// description template of each address, kept in sync and cut to 200 characters. Variables as for dnsName.
+	// Default "{{ .Namespace }}/{{ .Network }} // {{ .Cluster }} {{ .Group }} {{ .Index }}".
+	// +optional
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=1024
+	Description string `json:"description,omitempty"`
+
+	// publish writes the addresses of the group, under its name, to a Secret.
+	// +optional
+	Publish Publish `json:"publish,omitempty,omitzero"`
+}
+
+// NetworkLayout is the placement of the pools and address groups of a network in its prefix.
+// +kubebuilder:validation:MinProperties=1
+type NetworkLayout struct {
+	// pools are the placed pools in the order of spec.pools.
+	// +optional
+	// +listType=map
+	// +listMapKey=name
+	// +kubebuilder:validation:MaxItems=16
+	Pools []PoolLayout `json:"pools,omitempty"`
+
+	// addresses are the placed address groups in the order of spec.addresses.
+	// +optional
+	// +listType=map
+	// +listMapKey=name
+	// +kubebuilder:validation:MaxItems=8
+	Addresses []AddressGroupLayout `json:"addresses,omitempty"`
+}
+
+// AddressGroupLayout is an address group placed in the prefix.
+type AddressGroupLayout struct {
+	// name of the group.
+	// +required
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=63
+	Name string `json:"name,omitempty"`
+
+	// count is the count spec.addresses asked for when the group was placed.
+	// +required
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=64
+	Count int32 `json:"count,omitempty"`
+
+	// addresses of the group from the top down: the first has .Index 1.
+	// +required
+	// +listType=atomic
+	// +kubebuilder:validation:MinItems=1
+	// +kubebuilder:validation:MaxItems=64
+	// +kubebuilder:validation:items:MinLength=1
+	// +kubebuilder:validation:items:MaxLength=39
+	Addresses []string `json:"addresses,omitempty"`
+}
+
+// PoolLayout is a pool placed in the prefix.
+type PoolLayout struct {
+	// name of the pool.
+	// +required
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=63
+	Name string `json:"name,omitempty"`
+
+	// size is the size spec.pools asked for when the pool was placed.
+	// +required
+	// +kubebuilder:validation:XIntOrString
+	Size intstr.IntOrString `json:"size,omitempty"`
+
+	// ranges hold the addresses of the pool, ascending; the addresses between them are not the pool's.
+	// +required
+	// +listType=atomic
+	// +kubebuilder:validation:MinItems=1
+	// +kubebuilder:validation:MaxItems=32
+	Ranges []LayoutRange `json:"ranges,omitempty"`
+}
+
+// LayoutRange is one NetBox IP range of a placed pool.
+type LayoutRange struct {
+	// start is the first address of the range.
+	// +required
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=39
+	Start string `json:"start,omitempty"`
+
+	// end is the last address of the range.
+	// +required
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=39
+	End string `json:"end,omitempty"`
+
+	// id is the NetBox ID of the IP range, unset until it is created.
+	// +optional
+	// +kubebuilder:validation:Minimum=1
+	ID int64 `json:"id,omitempty"`
+}
+
 // OwnerRef names a NetBox Owner by name or id.
 // +kubebuilder:validation:XValidation:rule="has(self.name) != has(self.id)",message="set exactly one of name and id"
 type OwnerRef struct {
@@ -194,11 +416,11 @@ type ControlPlaneEndpoint struct {
 	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="port is immutable"
 	Port int32 `json:"port,omitempty"`
 
-	// dnsName of the VIP in NetBox, which stores it in lower case.
+	// dnsName template of the VIP in NetBox, which stores it in lower case. Variables as for spec.description;
+	// a value that is not a DNS name fails Ready with reason InvalidSpec.
 	// +optional
 	// +kubebuilder:validation:MinLength=1
-	// +kubebuilder:validation:MaxLength=255
-	// +kubebuilder:validation:Pattern=`^([0-9A-Za-z_-]+|\*)(\.[0-9A-Za-z_-]+)*\.?$`
+	// +kubebuilder:validation:MaxLength=1024
 	DNSName string `json:"dnsName,omitempty"`
 
 	// description template of the VIP, as spec.description.
@@ -234,7 +456,7 @@ type APIEndpoint struct {
 // +kubebuilder:validation:MinProperties=1
 type NetBoxNetworkStatus struct {
 	// conditions represents the observations of a NetBoxNetwork's current state.
-	// Known condition types are Ready, MetadataSynced and ControlPlaneEndpointReady.
+	// Known condition types are Ready, MetadataSynced, ControlPlaneEndpointReady and LayoutReady.
 	// +optional
 	// +listType=map
 	// +listMapKey=type
@@ -282,6 +504,18 @@ type NetBoxNetworkStatus struct {
 	// +optional
 	// +kubebuilder:validation:Minimum=1
 	TenantID int64 `json:"tenantID,omitempty"`
+
+	// layout is the placement of spec.pools and spec.addresses in the prefix, with the NetBox ranges of the pools.
+	// +optional
+	Layout NetworkLayout `json:"layout,omitempty,omitzero"`
+
+	// publishedSecrets are the Secrets the network has written its addresses to, which it deletes once no enabled
+	// pool or group publishes in them.
+	// +optional
+	// +listType=set
+	// +kubebuilder:validation:MaxItems=16
+	// +kubebuilder:validation:items:MaxLength=253
+	PublishedSecrets []string `json:"publishedSecrets,omitempty"`
 }
 
 // +kubebuilder:object:root=true

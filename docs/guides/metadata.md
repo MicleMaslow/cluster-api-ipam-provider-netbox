@@ -33,15 +33,15 @@ Every NetBox object the provider writes gets a description, for people, and comm
 |---|---|---|---|---|
 | prefix | `NetBoxNetwork.spec.description`, `.comments` | `.Cluster`, `.Namespace`, `.Name` | `{{ .Namespace }}/{{ .Name }} // cluster {{ .Cluster }}` | the comments below |
 | VIP | `NetBoxNetwork.spec.controlPlaneEndpoint.description`, `.comments` | `.Cluster`, `.Namespace`, `.Name` | `{{ .Namespace }}/{{ .Name }} // {{ .Cluster }} control plane endpoint` | the comments below |
-| IP range | `NetBoxIPPool.spec.ipRange.description`, `.comments` | `.Cluster`, `.Namespace`, `.Pool`, `.Network` | `{{ .Namespace }}/{{ .Pool }} // pool of cluster {{ .Cluster }}` | the comments below |
+| IP range of a pool of a network | none: the defaults | `.Cluster`, `.Namespace`, `.Pool` (the name in `spec.pools`) | `{{ .Namespace }}/{{ .Pool }} // pool of cluster {{ .Cluster }}` | the comments below |
 | IP address | `NetBoxIPPool.spec.ipAddress.description`, `.comments` | `.Owner`, `.Claim`, `.Cluster`, `.Namespace`, `.Pool` | `{{ .Namespace }}/{{ .Owner }} // {{ .Cluster }} {{ .Pool }}` | the comments below |
 
 The default comments of every object are `// managed by cluster-api-ipam-provider-netbox, please don't edit it in NetBox unless you know what you're doing`.
 
-- `.Cluster` is the Cluster of the network (`spec.clusterName`), of the claim for an address; `.Name` the network; `.Network` the network of the range; `.Pool` the pool. `.Owner` of an address is the first owner reference of the claim, or the claim itself without one (with CAPV the VSphereVM): a Kubernetes owner, not the NetBox Owner. The `dnsName` of the VIP and of the addresses is set next to them: [Control-plane VIP](control-plane-vip.md), [Pools](pools.md#address-options).
+- `.Cluster` is the Cluster of the network (`spec.clusterName`), of the claim for an address; `.Name` the network; `.Pool` the pool. `.Owner` of an address is the first owner reference of the claim, or the claim itself without one (with CAPV the VSphereVM): a Kubernetes owner, not the NetBox Owner. The `dnsName` of the VIP and of the addresses is set next to them: [Control-plane VIP](control-plane-vip.md), [Pools](pools.md#address-options).
 - A field left out takes its default. `{{ "" }}` leaves the field empty in NetBox.
 - Results are trimmed. The description is cut to 200 characters, the limit of NetBox; comments are not cut. A template may use `if` and `with`, but not `range`, `define`, `block` or `template`; a rendered value is limited to 1024 bytes and may not contain a NUL character.
-- A template that does not render is `InvalidSpec` (a value that fails for one claim only fails that claim: [Pools](pools.md#address-options)). On a network that is `Ready=False InvalidSpec` and its pools take its ranges out of service: new claims wait, allocated ones stay `Ready`. On a pool it is `Ready=False InvalidSpec`, with the same effect on new claims. An `ipRange` template that renders the sample values but fails on those of one range is `RangesReady=False InvalidSpec`: that range keeps serving and keeps its description and comments (a new one is created without them). Fix the spec and it goes on.
+- A template that does not render is `InvalidSpec` (a value that fails for one claim only fails that claim: [Pools](pools.md#address-options)). On a network that is `Ready=False InvalidSpec` and its pools take its ranges out of service: new claims wait, allocated ones stay `Ready`. On a pool it is `Ready=False InvalidSpec`, with the same effect on new claims. Fix the spec and it goes on.
 - A prefix under `spec.prefix` is not synced: an existing one keeps its description and comments, a missing one gets them once, when it is created.
 
 ## Custom fields

@@ -24,7 +24,6 @@ import (
 	"golang.org/x/time/rate"
 	"k8s.io/client-go/tools/events"
 	"k8s.io/client-go/util/workqueue"
-	"sigs.k8s.io/cluster-api-ipam-provider-in-cluster/pkg/ipamutil"
 	ipamv1 "sigs.k8s.io/cluster-api/api/ipam/v1beta2"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -72,18 +71,25 @@ func Setup(ctx context.Context, mgr ctrl.Manager, o Options) error {
 	}); err != nil {
 		return err
 	}
+	inCluster, err := inClusterServed(mgr.GetRESTMapper())
+	if err != nil {
+		return err
+	}
+	if !inCluster {
+		ctrl.LoggerFrom(ctx).Info("InClusterIPPool is not served: networks with allocator InCluster wait for cluster-api-ipam-provider-in-cluster and a restart")
+	}
 	if err := (&NetBoxNetworkReconciler{
 		Client: c, APIReader: mgr.GetAPIReader(), NetBox: o.NetBox, Keys: keys, WatchFilterValue: o.WatchFilterValue, Recorder: o.Recorder,
+		InCluster: inCluster,
 	}).SetupWithManager(ctx, mgr, controller.Options{MaxConcurrentReconciles: o.NetworkConcurrency, RateLimiter: rateLimiter()}); err != nil {
 		return err
 	}
 	if err := (&NetBoxIPPoolReconciler{
-		Client: c, NetBox: o.NetBox, Keys: keys, WatchFilterValue: o.WatchFilterValue, Recorder: o.Recorder,
+		Client: c, WatchFilterValue: o.WatchFilterValue,
 	}).SetupWithManager(ctx, mgr, controller.Options{MaxConcurrentReconciles: o.PoolConcurrency, RateLimiter: rateLimiter()}); err != nil {
 		return err
 	}
-	return (&ipamutil.ClaimReconciler{
-		Client: c, Scheme: mgr.GetScheme(), WatchFilterValue: o.WatchFilterValue,
-		Adapter: &ProviderAdapter{Client: c, NetBox: o.NetBox, Keys: keys, Recorder: o.Recorder, Concurrency: o.ClaimConcurrency},
-	}).SetupWithManager(ctx, mgr)
+	return newClaimReconciler(c, mgr.GetScheme(), o.WatchFilterValue,
+		&ProviderAdapter{Client: c, NetBox: o.NetBox, Keys: keys, Recorder: o.Recorder, Concurrency: o.ClaimConcurrency},
+	).SetupWithManager(ctx, mgr)
 }

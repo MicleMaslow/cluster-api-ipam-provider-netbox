@@ -7,18 +7,19 @@ NetBox IPAM for Cluster API: cluster subnets, node addresses and control-plane V
 > **Alpha.** v0.1 is the first release; the `v1alpha1` API may still change.
 
 - **A subnet per cluster.** `NetBoxNetwork` carves a prefix out of a parent prefix, or adopts an existing one.
-- **Node addresses from NetBox.** `NetBoxIPPool` keeps its ranges as NetBox IP ranges and answers the `IPAddressClaim`s of any infrastructure provider that supports IPAM, such as CAPV.
+- **Pools by size.** The network lays out its prefix in pools of given sizes, one of them the rest, and keeps them as NetBox IP ranges.
+- **Node addresses from NetBox.** `NetBoxIPPool` hands out the addresses of a pool to the `IPAddressClaim`s of any infrastructure provider that supports IPAM, such as CAPV.
 - **Control-plane VIP.** A network can reserve the VIP and set `Cluster.spec.controlPlaneEndpoint`, for infrastructure providers without a load balancer of their own.
 - **NetBox stays the source of truth.** Everything the provider writes carries a key, so it finds its objects again after a restart, `clusterctl move` or pivot.
 - **An ordinary NetBox user.** No superuser and no global setup beyond one text custom field; the permissions of the token limit the provider to its zone. Owner, tenant, description and comments come from the spec.
 
 | Kubernetes | NetBox |
 |---|---|
-| `NetBoxNetwork` | prefix, carved from a parent prefix or adopted; the VIP as an IP address |
-| `NetBoxIPPool` | one IP range per range of the pool |
+| `NetBoxNetwork` | prefix, carved from a parent prefix or adopted; the VIP as an IP address; IP ranges of its pools |
+| `NetBoxIPPool` | nothing of its own: the addresses of its claims, from the ranges of network pools |
 | `IPAddressClaim` pointing at a `NetBoxIPPool` | IP address allocated from a range |
 
-The design is described in [docs/proposals/20261007-netbox-ipam-provider.md](docs/proposals/20261007-netbox-ipam-provider.md).
+How it works is in the [documentation](docs/README.md), from the [overview](docs/getting-started/overview.md) on. The [first proposal](docs/proposals/20261007-netbox-ipam-provider.md) is kept as history: pools placed by the network, the `InCluster` allocator and `publish` came after it.
 
 ## Compatibility
 
@@ -67,12 +68,17 @@ You need a management cluster with Cluster API, a NetBox 4.6 or newer with a par
    apiVersion: ipam.cluster.x-k8s.io/v1alpha1
    kind: NetBoxNetwork
    metadata: {name: sample-default, namespace: sample}
-   spec: {clusterName: sample, parentPrefix: 10.10.0.0/22, gateway: 10.10.0.1, prefixLength: 27}
+   spec:
+     clusterName: sample
+     parentPrefix: 10.10.0.0/22
+     gateway: 10.10.0.1
+     prefixLength: 27
+     pools: [{name: cp, size: 6}, {name: workers, size: rest}]
    ---
    apiVersion: ipam.cluster.x-k8s.io/v1alpha1
    kind: NetBoxIPPool
    metadata: {name: sample-worker, namespace: sample, labels: {cluster.x-k8s.io/cluster-name: sample}}
-   spec: {ranges: [{networkName: sample-default, start: 14, end: 30}]}
+   spec: {ranges: [{networkName: sample-default, pool: workers}]}
    ---
    apiVersion: ipam.cluster.x-k8s.io/v1beta2
    kind: IPAddressClaim
@@ -90,7 +96,7 @@ You need a management cluster with Cluster API, a NetBox 4.6 or newer with a par
    kubectl -n sample get netboxnetwork,netboxippool
    ```
 
-   The prefix and the IP range are now in NetBox, with the key in the key field, a description and comments; delete the `sample` namespace to release the address (the prefix and the range stay as `deprecated`, see [Deletion and retained objects](docs/guides/deletion-and-retained.md)).
+   The prefix and the IP ranges of the pools are now in NetBox, with the key in the key field, a description and comments; delete the `sample` namespace to release the address (the prefix and the ranges stay as `deprecated`, see [Deletion and retained objects](docs/guides/deletion-and-retained.md)).
 
 No NetBox yet? `make dev-all` brings up a dev stand with a seeded NetBox, the provider and two CAPV clusters on a simulated vCenter: [dev stand](docs/development/dev-stand.md).
 

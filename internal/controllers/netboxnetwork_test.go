@@ -45,6 +45,7 @@ import (
 	"k8s.io/client-go/tools/events"
 	"k8s.io/utils/ptr"
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
+	ipamv1 "sigs.k8s.io/cluster-api/api/ipam/v1beta2"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -82,15 +83,15 @@ func TestNetworkLogicalParent(t *testing.T) {
 	byHand(t, g, netbox.Prefixes, map[string]any{"prefix": "10.10.1.0/24", "status": "active", "description": "logical parent"})
 	nw := newNetwork(ns, "default")
 	nw.Spec.ParentPrefix, nw.Spec.AddressPrefixLength, nw.Spec.PrefixLength, nw.Spec.IsPool = "10.10.1.0/24", 22, 28, ptr.To(true)
-	g.Expect(k8s.Create(ctx, nw)).To(Succeed())
-	waitReady(g, nw)
+	nw.Spec.Pools = []v1alpha1.NetworkPool{netPool("all", 0)}
+	readyLayout(g, nw)
 	g.Expect(nw.Status.Prefix).To(Equal("10.10.1.0/28"))
 	g.Expect(nw.Status.AddressPrefixLength).To(Equal(int32(22)))
 	obj, _, err := admin.Get(ctx, netbox.Prefixes, nw.Status.PrefixID)
 	g.Expect(err).NotTo(HaveOccurred())
 	g.Expect(obj.IsPool).To(BeTrue())
 
-	pool := newPool(ns, "worker", v1alpha1.IPPoolRange{NetworkName: "default", Start: 0, End: -1})
+	pool := newPool(ns, "worker", v1alpha1.IPPoolRange{NetworkName: "default", Pool: "all"})
 	g.Expect(k8s.Create(ctx, pool)).To(Succeed())
 	waitReady(g, pool)
 	g.Expect(pool.Status.AddressPrefixLength).To(Equal(int32(22)))
@@ -670,7 +671,7 @@ func TestNetworkRejectsKeyField(t *testing.T) {
 func TestNetworkTags(t *testing.T) {
 	g := newG(t)
 	ns := newEnv(t, nil)
-	nw := newNetwork(ns, "default")
+	nw := layoutNetwork(ns, "default")
 	nw.Spec.Tags = []string{"capi"}
 	g.Expect(k8s.Create(ctx, nw)).To(Succeed())
 	waitReady(g, nw)
@@ -695,7 +696,7 @@ func TestNetworkTags(t *testing.T) {
 	setTags(g, nw, []string{"missing-tag"})
 	waitTypedCondition(g, nw, v1alpha1.MetadataSyncedCondition, metav1.ConditionFalse, v1alpha1.ReasonNetBoxError)
 	waitReady(g, nw)
-	pool := newPool(ns, "worker", v1alpha1.IPPoolRange{NetworkName: "default", Start: 2, End: 5})
+	pool := newPool(ns, "worker", v1alpha1.IPPoolRange{NetworkName: "default", Pool: "cp"})
 	g.Expect(k8s.Create(ctx, pool)).To(Succeed())
 	waitReady(g, pool)
 }
@@ -707,6 +708,7 @@ func TestNetworkDeleteForbidden(t *testing.T) {
 	scheme := runtime.NewScheme()
 	g.Expect(v1alpha1.AddToScheme(scheme)).To(Succeed())
 	g.Expect(clusterv1.AddToScheme(scheme)).To(Succeed())
+	g.Expect(ipamv1.AddToScheme(scheme)).To(Succeed())
 	for _, write := range []int{http.StatusForbidden, http.StatusNotFound} {
 		for _, policy := range []v1alpha1.DeletionPolicy{v1alpha1.DeletionPolicyDelete, v1alpha1.DeletionPolicyRetain} {
 			name := fmt.Sprintf("%d %s", write, policy)
@@ -1225,7 +1227,7 @@ func TestNetworkClusterEndpointOutsidePrefix(t *testing.T) {
 func TestNetworkClusterEndpointTaken(t *testing.T) {
 	g := newG(t)
 	ns := newEnv(t, nil)
-	byHand(t, g, netbox.IPAddresses, map[string]any{"address": "10.10.3.100/22", "status": "active"})
+	byHand(t, g, netbox.IPAddresses, map[string]any{"address": "10.10.3.100/22", "status": "active", "custom_fields": map[string]any{keys.Ref: "elsewhere"}})
 	setClusterEndpoint(t, ns, "10.10.3.100", 6443)
 	nw := adoptedNetwork(ns, "10.10.3.96/28")
 	nw.Spec.ControlPlaneEndpoint = &v1alpha1.ControlPlaneEndpoint{}
@@ -1845,7 +1847,7 @@ func TestNetworkDeleteOutsideConstraint(t *testing.T) {
 	g.Eventually(gone(nw)).Should(BeTrue())
 }
 
-// Deleting a network never resolves its owner or tenant: the prefix and the VIP are found by their keys alone.
+// Deleting a network never resolves its owner or tenant: the ranges, the prefix and the VIP are found by their keys alone.
 func TestNetworkDeleteFindsByKey(t *testing.T) {
 	g := NewWithT(t)
 	scheme := runtime.NewScheme()
@@ -1876,8 +1878,10 @@ func TestNetworkDeleteFindsByKey(t *testing.T) {
 		g.Expect(err).NotTo(HaveOccurred(), name)
 		g.Expect(apierrors.IsNotFound(c.Get(ctx, client.ObjectKeyFromObject(nw), nw))).To(BeTrue(), name+": the finalizer is gone")
 		g.Expect(reqs).To(Equal([]string{
+			"GET /api/ipam/ip-ranges/?cf_capi_ref__isw=NetBoxNetwork%2Fns%2Fdefault%2Fpool%2F&limit=1000&ordering=id",
 			"GET /api/ipam/prefixes/?cf_capi_ref=NetBoxNetwork%2Fns%2Fdefault&limit=1000&ordering=id",
 			"GET /api/ipam/ip-addresses/?cf_capi_ref=NetBoxNetwork%2Fns%2Fdefault%2Fvip&limit=1000&ordering=id",
+			"GET /api/ipam/ip-addresses/?cf_capi_ref__isw=NetBoxNetwork%2Fns%2Fdefault%2Faddresses%2F&limit=1000&ordering=id",
 		}), name)
 	}
 }

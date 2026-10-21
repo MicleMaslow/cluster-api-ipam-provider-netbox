@@ -104,26 +104,6 @@ spec:
                     minLength: 1
                     type: string
                 type: object
-              ipRange:
-                description: |-
-                  ipRange sets description and comments of the pool's NetBox IP ranges with Go templates, kept in sync.
-                  Variables: .Cluster (of the network), .Namespace, .Pool, .Network. description defaults to
-                  "{{ .Namespace }}/{{ .Pool }} // pool of cluster {{ .Cluster }}"; comments and the rules as for ipAddress.
-                minProperties: 1
-                properties:
-                  comments:
-                    description: comments template.
-                    maxLength: 1024
-                    minLength: 1
-                    type: string
-                  description:
-                    description: description template, cut to 200 characters; default
-                      "{{ .Namespace }}/{{ .Pool }} // pool of cluster {{ .Cluster
-                      }}".
-                    maxLength: 1024
-                    minLength: 1
-                    type: string
-                type: object
               omitGateway:
                 description: |-
                   omitGateway hands out addresses without a gateway, e.g. for a second NIC whose default route is on the first.
@@ -134,40 +114,34 @@ spec:
                   rule: self == oldSelf
               ranges:
                 description: |-
-                  ranges are used in order. A range can be changed or removed; a change that would leave
-                  allocated addresses outside the range waits until they are released.
+                  ranges are pools of the networks' layouts, used in order. The NetBox ranges of a pool belong to its network,
+                  which keeps them while addresses in them are allocated; a pool of a network serves one NetBoxIPPool,
+                  the one created first.
                 items:
-                  description: IPPoolRange is a span of a NetBoxNetwork given as offsets
-                    from its first address.
+                  description: IPPoolRange is a pool of a NetBoxNetwork's layout.
                   properties:
-                    end:
-                      description: end offset, same rules as start.
-                      format: int32
-                      type: integer
                     networkName:
                       description: networkName is a NetBoxNetwork in the pool's namespace.
                       maxLength: 63
                       minLength: 1
                       type: string
-                    start:
-                      description: start offset; a negative one counts back from the
-                        last address, -1 is the last one.
-                      format: int32
-                      type: integer
+                    pool:
+                      description: pool is a pool of the network's spec.pools.
+                      maxLength: 63
+                      minLength: 1
+                      type: string
                   required:
-                  - end
                   - networkName
-                  - start
+                  - pool
                   type: object
                 maxItems: 16
                 minItems: 1
                 type: array
                 x-kubernetes-list-type: atomic
                 x-kubernetes-validations:
-                - message: one range per network
-                  rule: self.all(r, self.exists_one(o, o.networkName == r.networkName))
-                - message: start must not be after end
-                  rule: self.all(r, (r.start >= 0) != (r.end >= 0) || r.start <= r.end)
+                - message: one range per network pool
+                  rule: self.all(r, self.exists_one(o, o.networkName == r.networkName
+                    && o.pool == r.pool))
             required:
             - ranges
             type: object
@@ -278,8 +252,8 @@ spec:
                 - used
                 type: object
               ranges:
-                description: ranges are the NetBox IP ranges of the pool, in spec
-                  order, then the removed ones that still hold addresses.
+                description: ranges are the NetBox IP ranges of the pool in spec order,
+                  one entry per NetBox range.
                 items:
                   description: IPPoolRangeStatus is one range of a NetBoxIPPool as
                     it is in NetBox.
@@ -291,7 +265,8 @@ spec:
                       minLength: 1
                       type: string
                     id:
-                      description: id is the NetBox ID of the IP range.
+                      description: id is the NetBox ID of the IP range, unset until
+                        the network creates it.
                       format: int64
                       minimum: 1
                       type: integer
@@ -311,8 +286,7 @@ spec:
                         range.
                       type: boolean
                     reason:
-                      description: reason is why the range is not ready or not as
-                        the spec asks.
+                      description: reason is why the range is not ready.
                       maxLength: 1024
                       minLength: 1
                       type: string
@@ -324,16 +298,13 @@ spec:
                       type: string
                   required:
                   - endAddress
-                  - id
                   - networkName
                   - ready
                   - startAddress
                   type: object
-                maxItems: 32
+                maxItems: 64
                 type: array
-                x-kubernetes-list-map-keys:
-                - networkName
-                x-kubernetes-list-type: map
+                x-kubernetes-list-type: atomic
             type: object
         required:
         - spec

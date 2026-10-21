@@ -1,19 +1,20 @@
 # Pools
 
-Goal: split a [network](networks.md) into pools of addresses and let machines take addresses from them. Every field is in the [API reference](../reference/api.md); `kubectl explain netboxippool.spec` describes them too.
+Goal: let machines take addresses from the pools a [network](networks.md#layout) lays out. Every field is in the [API reference](../reference/api.md); `kubectl explain netboxippool.spec` describes them too.
 
 ## Steps
 
-1. Create a `NetBoxIPPool` with ranges in the networks of one L2 network:
+1. Lay out the network: `spec.pools` of the `NetBoxNetwork` ([Layout](networks.md#layout)).
+2. Create a `NetBoxIPPool` on a pool of it:
 
    ```yaml
    apiVersion: ipam.cluster.x-k8s.io/v1alpha1
    kind: NetBoxIPPool
    metadata: {name: demo-workers, namespace: demo, labels: {cluster.x-k8s.io/cluster-name: demo}}
-   spec: {ranges: [{networkName: demo, start: 16, end: -3}]}
+   spec: {ranges: [{networkName: demo, pool: workers}]}
    ```
 
-2. Point the consumer at the pool. With CAPV that is `addressesFromPools` in the machine template ([First cluster](../getting-started/first-cluster.md)); any `IPAddressClaim` works:
+3. Point the consumer at the pool. With CAPV that is `addressesFromPools` in the machine template ([First cluster](../getting-started/first-cluster.md)); any `IPAddressClaim` works:
 
    ```yaml
    apiVersion: ipam.cluster.x-k8s.io/v1beta2
@@ -26,24 +27,21 @@ Goal: split a [network](networks.md) into pools of addresses and let machines ta
 
 ## Ranges
 
-`ranges` is a list of `{networkName, start, end}`: a span of a `NetBoxNetwork` given as offsets from its first address; a negative offset counts back from the last one (`-1`). Ranges are used in order, one per network, and all networks of a pool share the L2 network (gateway and mask) of the first range's network; until that network exists no range serves. Each range becomes a NetBox IP range; a claim gets an address from it, and the address is deleted from NetBox with the claim. Label the pool with `cluster.x-k8s.io/cluster-name` so that pausing the Cluster pauses the pool.
+`ranges` is a list of `{networkName, pool}`: a pool of the `spec.pools` of a `NetBoxNetwork` in the namespace. Ranges are used in order, each network pool once, and all networks of a `NetBoxIPPool` share the L2 network (gateway and mask) of the first range's network; until that network exists no range serves. The network owns the NetBox IP ranges of its pools and writes them; the `NetBoxIPPool` writes nothing to NetBox but the addresses of its claims, which a claim takes from the ranges and which leave NetBox with the claim. Label the pool with `cluster.x-k8s.io/cluster-name` so that pausing the Cluster pauses the pool.
 
-The range and the addresses taken from it carry the owner and tenant of the network the range lies in, if it has them, so a pool with ranges in networks of different owners and tenants works: each range carries those of its network, and they are kept in sync ([Networks](networks.md#owner-and-tenant)). A range in a network that is not `Ready`, including `OwnerNotFound` and `TenantNotFound`, is out of service (`NetworkNotReady`). A range whose owner or tenant cannot be synced goes on serving; `RangesReady` and the `reason` of the range say why.
+`status.ranges[]` has one entry per NetBox range of the network pools, in spec order (`networkName`, `id`, `startAddress`, `endAddress`, `ready`, `reason`, `message`). Claims get addresses only from ready ranges; the pool is `Ready` while at least one range is, and `RangesReady` says why the others are not:
 
-Every range is reconciled on its own and reported in `status.ranges[]` (`ready`, `reason`, `message`). Claims get addresses only from ready ranges; the pool is `Ready` while at least one range is, and `RangesReady` lists the ranges that are not as the spec asks:
+- `NetworkNotReady`: the network is missing or not `Ready` (including `OwnerNotFound` and `TenantNotFound`), its pool is not in its `spec.pools` and `status.layout` (`pool X is not placed in network Y`), or the network has not created all its NetBox ranges yet.
+- `MixedNetworks`: the network is in another L2 network than the first range's.
+- `Duplicate`: another `NetBoxIPPool` of the namespace takes the same network pool and was created first (of two created in the same second, the one with the lower name). Only that one serves the pool.
 
-- A range that covers the network, broadcast or gateway address of the L2 network or the VIP, or lies outside its network, is `InvalidRange`; one in a network of another L2 is `MixedNetworks`.
-- A range can be changed. The NetBox range is resized in place; a change that would leave allocated addresses outside it waits (`RangeInUse`, the addresses are in the message). A change that waits, overlaps another range (`RangeOverlap`) or is invalid leaves an active range serving with its old bounds, as long as they are still valid.
-- A range can be removed. Its NetBox range is deleted or deprecated as the network's `deletionPolicy` says; while addresses are still allocated in it, it stays in `status.ranges`, not ready (`RangeInUse`). Removed ranges are found in NetBox by the pool's key, not by the status.
-- Once no allocated address is in the way of a shrink, deletion or deprecation, NetBox stops handing out the range's addresses (`mark_populated`) and the allocated addresses are checked again before the change. A removed range that still holds addresses is not closed: claims stop using it once it is not ready, but NetBox would still hand out its free addresses to a direct request. A deprecated range stays closed; NetBox also refuses addresses created by hand inside it.
-- A range that overlaps another NetBox range waits (`RangeOverlap`) and is retried when the other pool shrinks or goes. Deprecated ranges of the provider in the way, with no addresses in them, are deleted (this needs delete on `ipam.iprange`, else the pool reports `Forbidden` until the range is deleted in NetBox). A deprecated range of the same pool and network is taken back and resized.
-- A range that is not in NetBox yet waits (`NetworkNotReady`) until the network has its VIP, if the network reserves one ([Control-plane VIP](control-plane-vip.md)).
+The ranges and the addresses taken from them carry the owner and tenant of their network, if it has them, so a pool over networks of different owners and tenants works ([Networks](networks.md#owner-and-tenant)). A change of a pool of the network (its size, its place) shows in `status.ranges` as soon as the network applies it; a change that would move an allocated address is refused by the network ([Layout](networks.md#layout)).
 
 `status` also holds the `gateway` and `addressPrefixLength` handed to every address and `ipAddresses` (`total`, `used`, `free`), counted over the ready ranges from the pool's `IPAddress` objects. A pool being deleted waits while addresses are allocated from it (`WaitingForAddresses`).
 
-A pool is paused when it has the `cluster.x-k8s.io/paused` annotation, when the Cluster named by its `cluster.x-k8s.io/cluster-name` label has `spec.paused: true`, or when the Cluster of any network it has a range in has: it is skipped and its condition `Paused` is True. `clusterctl move` pauses Clusters only, so label every pool and annotate a pool that several clusters share ([clusterctl move and pivot](move-and-pivot.md)).
+A pool is paused when it has the `cluster.x-k8s.io/paused` annotation, when the Cluster named by its `cluster.x-k8s.io/cluster-name` label has `spec.paused: true`, or when the Cluster of any network of its ranges has: it is skipped and its condition `Paused` is True. `clusterctl move` pauses Clusters only, so label every pool and annotate a pool that several clusters share ([clusterctl move and pivot](move-and-pivot.md)).
 
-NetBox side: other tools must not take addresses with the prefix-level `available-ips` of a cluster prefix. Since NetBox 4.3 it also returns addresses inside IP ranges that are not marked populated, as the pool ranges are.
+NetBox side: other tools must not take addresses with the prefix-level `available-ips` of a cluster prefix. Since NetBox 4.3 it also returns addresses inside IP ranges that are not marked populated, as the ranges of the pools are.
 
 ## Address options
 
@@ -58,7 +56,6 @@ NetBox side: other tools must not take addresses with the prefix-level `availabl
   ```
 
   The fields are written when an address is created in NetBox and compared with the templates at every reconcile of the claim, so a change of `ipAddress` reaches allocated addresses and a value edited in NetBox by hand is overwritten. A template that does not render or gives an invalid DNS name makes the pool `InvalidSpec`: no new addresses are issued, allocated claims stay `Ready`. Values can also fail for one claim only: `{{ .Cluster }}.nodes.example` gives `.nodes.example` for a claim without a cluster. Only a new claim then fails, with `AllocationFailed`; an allocated claim stays `Ready` and retries, and the error is in the controller log. An address restored or handed back to such a claim is still written, with `dns_name`, description and comments empty.
-- **`ipRange`** sets `description` and `comments` of the pool's NetBox IP ranges with templates, kept in sync; the variables are `.Cluster` (of the network), `.Namespace`, `.Pool` and `.Network`. An invalid `ipRange` makes the pool `InvalidSpec` as well.
 
 ## Claims
 
@@ -82,40 +79,38 @@ spec:
   gateway: 10.10.0.1
   prefixLength: 26
   controlPlaneEndpoint: {dnsName: demo-api.example}   # the VIP: the highest free address of the /26
+  pools:
+  - {name: cp, size: 6}
+  - {name: ingress, size: 8}
+  - {name: workers, size: rest}
 ---
 apiVersion: ipam.cluster.x-k8s.io/v1alpha1
 kind: NetBoxIPPool
 metadata: {name: demo-cp, namespace: demo, labels: {cluster.x-k8s.io/cluster-name: demo}}
-spec: {ranges: [{networkName: demo, start: 2, end: 7}]}
+spec: {ranges: [{networkName: demo, pool: cp}]}
 ---
 apiVersion: ipam.cluster.x-k8s.io/v1alpha1
 kind: NetBoxIPPool
 metadata: {name: demo-ingress, namespace: demo, labels: {cluster.x-k8s.io/cluster-name: demo}}
-spec: {ranges: [{networkName: demo, start: 8, end: 15}]}
+spec: {ranges: [{networkName: demo, pool: ingress}]}
 ---
 apiVersion: ipam.cluster.x-k8s.io/v1alpha1
 kind: NetBoxIPPool
 metadata: {name: demo-workers, namespace: demo, labels: {cluster.x-k8s.io/cluster-name: demo}}
-spec: {ranges: [{networkName: demo, start: 16, end: -3}]}
+spec: {ranges: [{networkName: demo, pool: workers}]}
 ```
 
-Later the cluster needs addresses for MetalLB. Shrink the workers and add the new pool in one `kubectl apply`:
+Later the cluster needs eight more addresses at the end. Append a pool to the network: `workers` is `rest`, so it gives up its last eight addresses, as long as no worker holds one of them; otherwise the network refuses the change with `RangeInUse` and the address, and nothing changes until the machine is gone.
 
 ```yaml
-apiVersion: ipam.cluster.x-k8s.io/v1alpha1
-kind: NetBoxIPPool
-metadata: {name: demo-workers, namespace: demo, labels: {cluster.x-k8s.io/cluster-name: demo}}
-spec: {ranges: [{networkName: demo, start: 16, end: -11}]}
----
-apiVersion: ipam.cluster.x-k8s.io/v1alpha1
-kind: NetBoxIPPool
-metadata: {name: demo-metallb, namespace: demo, labels: {cluster.x-k8s.io/cluster-name: demo}}
-spec: {ranges: [{networkName: demo, start: -10, end: -3}]}
+  pools:
+  - {name: cp, size: 6}
+  - {name: ingress, size: 8}
+  - {name: workers, size: rest}
+  - {name: extra, size: 8}
 ```
 
-`demo-metallb` is `RangeOverlap` until the workers range is shrunk, then `Ready`. If a worker still holds an address in the last eight, the workers range shows `RangeInUse` with that address and `demo-metallb` waits until the machine is gone. MetalLB itself is configured with the addresses of `demo-metallb`'s `status.ranges`; the pool only reserves them in NetBox.
-
-[`docs/examples/network-scheme.yaml`](../examples/network-scheme.yaml) holds the resulting scheme with all four pools.
+[`docs/examples/network-scheme.yaml`](../examples/network-scheme.yaml) holds the scheme.
 
 ## Check
 
@@ -125,12 +120,12 @@ kubectl -n demo get netboxippool demo-workers -o jsonpath='{.status.ranges}'
 kubectl get ipaddressclaims.ipam.cluster.x-k8s.io,ipaddresses.ipam.cluster.x-k8s.io -A
 ```
 
-- The pool is `Ready=True`; each range in `status.ranges` is `ready: true`, and `RangesReady` is `True`.
+- The pool is `Ready=True`; each range in `status.ranges` is `ready: true` with the `id` of its NetBox range, and `RangesReady` is `True`.
 - A claim has `status.addressRef`, and the `IPAddress` has the address, `prefix` and `gateway`.
 - A reason on a range or a claim is explained in [Conditions](../reference/conditions.md) and [Troubleshooting](../operations/troubleshooting.md).
 
 ## Next
 
 - [Control-plane VIP](control-plane-vip.md).
-- [Deletion and retained objects](deletion-and-retained.md): what happens to ranges and addresses when a pool or a claim goes.
+- [Deletion and retained objects](deletion-and-retained.md): what happens to ranges and addresses when a network, a pool or a claim goes.
 - Recipes: [second NIC](../recipes/second-nic.md), [a shared VLAN](../recipes/shared-vlan.md).

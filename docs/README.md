@@ -16,7 +16,8 @@ Cluster API IPAM provider backed by NetBox. The pages follow the path of a NetBo
 | Page | You learn |
 |---|---|
 | [Networks](guides/networks.md) | the subnet of a cluster, owner and tenant per network |
-| [Pools](guides/pools.md) | ranges, claims, address options, the network scheme example |
+| [Pools](guides/pools.md) | network pools, claims, address options, the network scheme example |
+| [In-cluster allocator](guides/in-cluster.md) | the pools of a network as `InClusterIPPool`s of in-cluster IPAM, NetBox keeping the layout |
 | [Control-plane VIP](guides/control-plane-vip.md) | reserve the VIP and write it to the Cluster |
 | [Metadata](guides/metadata.md) | description and comments of every object, tags and custom fields on the prefix |
 | [Deletion and retained objects](guides/deletion-and-retained.md) | what stays in NetBox, the cleanup script |

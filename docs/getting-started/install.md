@@ -26,6 +26,8 @@ You need a management cluster with Cluster API ([`clusterctl init`](https://clus
 
 The provider runs as `capi-ipam-netbox-controller-manager` in `capi-ipam-netbox-system`. The image is fixed in the manifests; to pull it from a mirror, use the clusterctl `images:` setting with the key `ipam-netbox`.
 
+Its ClusterRole reaches every namespace, as those of the other Cluster API controllers do. Besides its own kinds, Clusters, `IPAddress`es, `IPAddressClaim`s and `InClusterIPPool`s, it allows `get`, `create`, `update` and `delete` on all Secrets, which `publish` of a network needs ([Published addresses](../guides/networks.md#published-addresses)): the provider can read any Secret of the management cluster, though it touches only those it publishes in.
+
 clusterctl lists the releases through the GitHub API, which allows 60 requests an hour per address without a token. If it hits the rate limit, set `GITHUB_TOKEN` to a GitHub token: in the environment of clusterctl, or as a key of the `configSecret` with the operator.
 
 ### With Cluster API Operator
@@ -67,6 +69,16 @@ spec:
 - Deployment patches (private CA, token file) go into `spec.patches` with `target: {kind: Deployment, name: capi-ipam-netbox-controller-manager}` and the operations of the `kubectl patch` commands below, so the operator keeps them.
 - Upgrade: change `spec.version`. Remove: delete the `IPAMProvider`; the CRDs, ClusterRoles and ClusterRoleBinding stay, as with clusterctl ([Remove](#remove)).
 - Air-gapped: put `ipam-components.yaml` and `metadata.yaml` of the release into a ConfigMap with the keys `components` and `metadata` and the label `provider.cluster.x-k8s.io/version: v0.1.0`, and use `fetchConfig.selector` with its labels instead of `url`.
+
+### In-cluster IPAM
+
+Optional: needed only for networks with `allocator: InCluster` ([In-cluster allocator](../guides/in-cluster.md)). Install [cluster-api-ipam-provider-in-cluster](https://github.com/kubernetes-sigs/cluster-api-ipam-provider-in-cluster) before this provider: `clusterctl init --ipam in-cluster`, then `clusterctl init --ipam netbox`. The provider checks for the `InClusterIPPool` CRD once, at start; without it it logs `InClusterIPPool is not served` and such networks report `AllocatorUnavailable`, while the `NetBox` allocator works. Installed later, in-cluster needs a restart of this provider:
+
+```bash
+kubectl -n capi-ipam-netbox-system rollout restart deployment/capi-ipam-netbox-controller-manager
+```
+
+The ClusterRole of the provider allows `inclusterippools` (get, list, watch, create, update, patch, delete) either way.
 
 ### Variables
 

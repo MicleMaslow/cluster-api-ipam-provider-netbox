@@ -20,13 +20,16 @@ The VLAN is one L2 network: `10.10.0.0/22`, gateway `10.10.0.1`. In NetBox it is
      gateway: 10.10.0.1
      addressPrefixLength: 22
      prefixLength: 26
+     pools:
+     - {name: cp, size: 6}
+     - {name: workers, size: rest}
    ```
 
    The L2 network is `gateway/addressPrefixLength` with the host bits cleared, `10.10.0.0/22`; it has to contain `parentPrefix`, and `addressPrefixLength` cannot be longer than the mask of `parentPrefix`. Addresses get the mask `/22` and the gateway `10.10.0.1`; the network and broadcast address of the VLAN and the gateway are never handed out. `addressPrefixLength` is immutable and cannot be added later.
 
-3. **Give each cluster its pools** as usual ([Pools](../guides/pools.md)). The offsets of a range count from the first address of the cluster's `/26`, not of the VLAN.
+3. **Give each cluster its pools** as usual ([Pools](../guides/pools.md)). The layout counts free addresses of the cluster's `/26`; the network and broadcast address of the VLAN fall outside every `/26` but the first and the last.
 
-4. **To grow a cluster,** add a second network from another logical parent of the same VLAN and a range in the existing pool. The pool stays in one L2 network (`MixedNetworks` compares gateway and mask), so both networks have the same `gateway` and `addressPrefixLength`. They must be in the namespace of the pool, and a pool has one range per network, used in order:
+4. **To grow a cluster,** add a second network from another logical parent of the same VLAN and its pool to the existing `NetBoxIPPool`. The pool stays in one L2 network (`MixedNetworks` compares gateway and mask), so both networks have the same `gateway` and `addressPrefixLength`. They must be in the namespace of the pool; the ranges are used in order:
 
    ```yaml
    apiVersion: ipam.cluster.x-k8s.io/v1alpha1
@@ -38,14 +41,15 @@ The VLAN is one L2 network: `10.10.0.0/22`, gateway `10.10.0.1`. In NetBox it is
      gateway: 10.10.0.1
      addressPrefixLength: 22
      prefixLength: 26
+     pools: [{name: workers, size: rest}]
    ---
    apiVersion: ipam.cluster.x-k8s.io/v1alpha1
    kind: NetBoxIPPool
    metadata: {name: team-a-workers, namespace: team-a, labels: {cluster.x-k8s.io/cluster-name: team-a}}
    spec:
      ranges:
-     - {networkName: team-a, start: 16, end: -3}
-     - {networkName: team-a-2, start: 2, end: -3}
+     - {networkName: team-a, pool: workers}
+     - {networkName: team-a-2, pool: workers}
    ```
 
    Put `controlPlaneEndpoint` on one network of a cluster only.

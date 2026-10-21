@@ -21,17 +21,17 @@ import metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 // NetBoxIPPoolKind is the kind IPAddressClaims reference.
 const NetBoxIPPoolKind = "NetBoxIPPool"
 
-// NetBoxIPPoolSpec is a pool of addresses made of ranges inside NetBoxNetworks of one L2 network.
+// NetBoxIPPoolSpec is a pool of addresses made of pools of NetBoxNetworks of one L2 network.
 // +kubebuilder:validation:XValidation:rule="has(self.omitGateway) == has(oldSelf.omitGateway)",message="omitGateway cannot be added or removed"
 type NetBoxIPPoolSpec struct {
-	// ranges are used in order. A range can be changed or removed; a change that would leave
-	// allocated addresses outside the range waits until they are released.
+	// ranges are pools of the networks' layouts, used in order. The NetBox ranges of a pool belong to its network,
+	// which keeps them while addresses in them are allocated; a pool of a network serves one NetBoxIPPool,
+	// the one created first.
 	// +required
 	// +listType=atomic
 	// +kubebuilder:validation:MinItems=1
 	// +kubebuilder:validation:MaxItems=16
-	// +kubebuilder:validation:XValidation:rule="self.all(r, self.exists_one(o, o.networkName == r.networkName))",message="one range per network"
-	// +kubebuilder:validation:XValidation:rule="self.all(r, (r.start >= 0) != (r.end >= 0) || r.start <= r.end)",message="start must not be after end"
+	// +kubebuilder:validation:XValidation:rule="self.all(r, self.exists_one(o, o.networkName == r.networkName && o.pool == r.pool))",message="one range per network pool"
 	Ranges []IPPoolRange `json:"ranges,omitempty"`
 
 	// ipAddress sets dns_name, description and comments of the pool's NetBox IP addresses with Go templates, rendered
@@ -43,12 +43,6 @@ type NetBoxIPPoolSpec struct {
 	// and a value is limited to 1024 bytes.
 	// +optional
 	IPAddress IPAddressFields `json:"ipAddress,omitempty,omitzero"`
-
-	// ipRange sets description and comments of the pool's NetBox IP ranges with Go templates, kept in sync.
-	// Variables: .Cluster (of the network), .Namespace, .Pool, .Network. description defaults to
-	// "{{ .Namespace }}/{{ .Pool }} // pool of cluster {{ .Cluster }}"; comments and the rules as for ipAddress.
-	// +optional
-	IPRange IPRangeFields `json:"ipRange,omitempty,omitzero"`
 
 	// addressReuseGracePeriodSeconds keeps the address of a deleted claim in NetBox this long, so that it is not handed
 	// to a new machine while caches of the old one still point at it, at most a day. Not applied while the pool
@@ -87,23 +81,7 @@ type IPAddressFields struct {
 	Comments string `json:"comments,omitempty"`
 }
 
-// IPRangeFields are Go templates of NetBox IP range fields.
-// +kubebuilder:validation:MinProperties=1
-type IPRangeFields struct {
-	// description template, cut to 200 characters; default "{{ .Namespace }}/{{ .Pool }} // pool of cluster {{ .Cluster }}".
-	// +optional
-	// +kubebuilder:validation:MinLength=1
-	// +kubebuilder:validation:MaxLength=1024
-	Description string `json:"description,omitempty"`
-
-	// comments template.
-	// +optional
-	// +kubebuilder:validation:MinLength=1
-	// +kubebuilder:validation:MaxLength=1024
-	Comments string `json:"comments,omitempty"`
-}
-
-// IPPoolRange is a span of a NetBoxNetwork given as offsets from its first address.
+// IPPoolRange is a pool of a NetBoxNetwork's layout.
 type IPPoolRange struct {
 	// networkName is a NetBoxNetwork in the pool's namespace.
 	// +required
@@ -111,13 +89,11 @@ type IPPoolRange struct {
 	// +kubebuilder:validation:MaxLength=63
 	NetworkName string `json:"networkName,omitempty"`
 
-	// start offset; a negative one counts back from the last address, -1 is the last one.
+	// pool is a pool of the network's spec.pools.
 	// +required
-	Start int32 `json:"start"`
-
-	// end offset, same rules as start.
-	// +required
-	End int32 `json:"end"`
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=63
+	Pool string `json:"pool,omitempty"`
 }
 
 // NetBoxIPPoolStatus is the observed state of a NetBoxIPPool.
@@ -131,11 +107,10 @@ type NetBoxIPPoolStatus struct {
 	// +kubebuilder:validation:MaxItems=32
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
 
-	// ranges are the NetBox IP ranges of the pool, in spec order, then the removed ones that still hold addresses.
+	// ranges are the NetBox IP ranges of the pool in spec order, one entry per NetBox range.
 	// +optional
-	// +listType=map
-	// +listMapKey=networkName
-	// +kubebuilder:validation:MaxItems=32
+	// +listType=atomic
+	// +kubebuilder:validation:MaxItems=64
 	Ranges []IPPoolRangeStatus `json:"ranges,omitempty"`
 
 	// gateway handed to every address of the pool.
@@ -163,8 +138,8 @@ type IPPoolRangeStatus struct {
 	// +kubebuilder:validation:MaxLength=63
 	NetworkName string `json:"networkName,omitempty"`
 
-	// id is the NetBox ID of the IP range.
-	// +required
+	// id is the NetBox ID of the IP range, unset until the network creates it.
+	// +optional
 	// +kubebuilder:validation:Minimum=1
 	ID int64 `json:"id,omitempty"`
 
@@ -184,7 +159,7 @@ type IPPoolRangeStatus struct {
 	// +required
 	Ready bool `json:"ready"`
 
-	// reason is why the range is not ready or not as the spec asks.
+	// reason is why the range is not ready.
 	// +optional
 	// +kubebuilder:validation:MinLength=1
 	// +kubebuilder:validation:MaxLength=1024

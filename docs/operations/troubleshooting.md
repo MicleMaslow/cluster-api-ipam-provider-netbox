@@ -8,7 +8,7 @@ Goal: go from a symptom to the cause and the fix. Every reason a condition can s
 kubectl get netboxnetworks,netboxippools -A
 kubectl get ipaddressclaims.ipam.cluster.x-k8s.io,ipaddresses.ipam.cluster.x-k8s.io -A
 kubectl -n <ns> get netboxippool <pool> -o jsonpath='{.status.ranges}'
-kubectl -n <ns> get netboxnetwork <network> -o jsonpath='{.status.controlPlaneEndpoint} {.status.conditions}'
+kubectl -n <ns> get netboxnetwork <network> -o jsonpath='{.status.controlPlaneEndpoint} {.status.layout} {.status.conditions}'
 kubectl -n <ns> events --for netboxnetwork/<network>
 kubectl -n capi-ipam-netbox-system logs deployment/capi-ipam-netbox-controller-manager
 ```
@@ -25,6 +25,7 @@ kubectl -n capi-ipam-netbox-system logs deployment/capi-ipam-netbox-controller-m
 | `PrefixNotFound` | [A prefix is gone](#a-prefix-is-gone) |
 | `Forbidden` | [Forbidden](#forbidden) |
 | `NetBoxError` | [NetBoxError](#netboxerror) |
+| `LayoutReady=False` on a network | [Layout](#layout) |
 | a pool has no ready range, or a claim is `PoolNotReady`, `PoolExhausted`, `AllocationFailed` | [Pools and claims](#pools-and-claims) |
 | a deleted object left something in NetBox | [Log lines that explain a leftover](#log-lines-that-explain-a-leftover), [Deletion and retained objects](../guides/deletion-and-retained.md) |
 
@@ -82,14 +83,13 @@ If the token may not view owners or tenants (403), an id is accepted as given an
 
 ## Attributes are not synced
 
-The owner, tenant, description or comments of an existing object differ from the spec, or `MetadataSynced` of the network or `RangesReady` of the pool is `False`. A failed sync stops no allocation: the message says which object and why, for example `attributes of the prefix 10.10.0.0/26: ... forbidden`.
+The owner, tenant, description or comments of an existing object differ from the spec, or `MetadataSynced` or `LayoutReady` of the network is `False`. A failed sync stops no allocation: the message says which object and why, for example `attributes of the prefix 10.10.0.0/26: ... forbidden`.
 
 - `Forbidden`: a constraint of the write permission does not allow the value, for example another tenant than the permission is limited to. Change the spec or the permission ([NetBox access](../getting-started/netbox-access.md#permissions)).
 - `HTTP 400`: NetBox refuses the value, for example an owner id it does not have.
-- `InvalidSpec` on `RangesReady`: an `ipRange` template fails on the values of that range (`attributes of the range ...: ipRange: ...`); the range keeps serving and its texts. Fix the template.
 - A claim's address: a failed sync stays out of the claim's status. The claim stays `Ready`, with no condition and no Event; the error shows only in the controller log and as a reconcile error of the claim (`Reconciler error`, retried with backoff).
 - Not synced by design: a field the spec leaves out (an owner or tenant is never cleared), and a prefix under `spec.prefix` after its creation.
-- A synced change is an Event `AttributesSynced` on the network, pool or claim and a changelog message `capi: attributes of ...` or `capi: address fields for ...` in NetBox. A value edited in NetBox by hand is overwritten at the next reconcile.
+- A synced change is an Event `AttributesSynced` on the network or claim and a changelog message `capi: attributes of ...` or `capi: address fields for ...` in NetBox. A value edited in NetBox by hand is overwritten at the next reconcile.
 
 ## A prefix is gone
 
@@ -109,7 +109,7 @@ The token lacks a permission, or a constraint of the permission does not match w
 
 - Compare the request with the table in [NetBox access](../getting-started/netbox-access.md#permissions): add, change and delete per object type.
 - A constraint such as `tenant__slug: platform` needs the provider to write that tenant, and `owner__name` the owner: an object without it fails the constraint. A network without `spec.tenant` or `spec.owner` writes none: check them on the network.
-- Delete on prefixes and ranges is only for `deletionPolicy: Delete` and for deprecated ranges in the way of a new range. A network or pool in deletion with no delete keeps its finalizer until an admin removes the objects ([Deletion and retained objects](../guides/deletion-and-retained.md#permissions)).
+- Delete on ranges is needed when the layout changes (the range of a pool that moved or left `spec.pools`), for deprecated ranges in the way and for `deletionPolicy: Delete`; on prefixes only for `Delete`. A network in deletion with no delete keeps its finalizer until an admin removes the objects ([Deletion and retained objects](../guides/deletion-and-retained.md#permissions)).
 
 ## NetBoxError
 
@@ -126,6 +126,17 @@ Any other NetBox error; the message has the request and the answer. The common o
 | `x509: certificate signed by unknown authority` | add the CA ([Install](../getting-started/install.md#tls)) |
 | `dial tcp`, `no such host`, timeout | NetBox is unreachable from the pod; the requests have a 30 second timeout |
 
+## Layout
+
+```bash
+kubectl -n <ns> get netboxnetwork <network> -o jsonpath='{.status.layout}'
+```
+
+- `InvalidSpec`: the pools do not fit in the free addresses of the prefix, and the message has the numbers (`cp 20, workers at least 1 need 21 free addresses, 16 are free from ...`). Shrink the pools or free addresses in NetBox. After `clusterctl move` or a restore, `sizes must be those found: ...` means `spec.pools` do not match the ranges in NetBox: put the sizes found back, and change them once the network has its layout again.
+- `RangeInUse`: the change would move the listed allocated addresses to another pool, or reserve them for a group (an `IPAddress` of a pool the layout does not have). Keep the pools in front of them as they are and change the tail, or wait until those machines are gone. The layout and the ranges stay as they were.
+- `RangeOverlap`: a range of a pool overlaps a NetBox range the layout did not see; remove or shrink that range.
+- `SecretConflict`: a Secret that `publish` names exists and the network does not control it (`kubectl -n <ns> get secret <name> -o jsonpath='{.metadata.ownerReferences}'`). Delete it, or name another `secretName`; the network never changes it.
+
 ## Pools and claims
 
 ```bash
@@ -134,6 +145,8 @@ kubectl -n <ns> get ipaddressclaim <claim> -o jsonpath='{.status.conditions}'
 ```
 
 - A range is out of service (`NetworkNotReady`) while its network is not `Ready`, which includes `OwnerNotFound`, `TenantNotFound` and an `InvalidSpec` of the network. Fix the network. A new claim is `PoolNotReady` meanwhile if the pool has no other ready range; allocated claims stay `Ready`.
+- `pool X is not placed in network Y`: `ranges[].pool` names no pool of the network's `spec.pools`, or the network has not placed it (see its `LayoutReady`).
+- `Duplicate`: another `NetBoxIPPool` of the namespace, created first, serves the same network pool. One `NetBoxIPPool` per network pool.
 - On a claim, a NetBox error, a 403 or a template of the pool that does not render for this claim during allocation shows as `AllocationFailed` with the message. An allocated address deleted in NetBox by hand is created again with the same address, or the claim reports `AddressConflict` if NetBox gave it to another object.
 - A claim stuck in deletion, for example without delete on `ipam.ipaddress`, is `ReleaseFailed` with the error: the claim, its `IPAddress` and the NetBox address stay (CAPV still finishes deleting the Machine), and deleting the pool waits with `WaitingForAddresses`.
 - A claim whose `spec.clusterName` or `cluster.x-k8s.io/cluster-name` label names a Cluster that does not exist is skipped without a condition; the provider logs it at Info level.

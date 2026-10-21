@@ -81,9 +81,9 @@ linters:
       linters:
         - kubeapilinter
 
-    ## Required fields with a valid zero value (offsets, counters) stay plain and are always serialized.
+    ## Required counters with a valid zero value stay plain and are always serialized.
     - path: "api/v1alpha1/"
-      text: "requiredfields: field (Start|End|Total|Used|Free) (has a valid zero value|should have the omitempty tag)"
+      text: "requiredfields: field (Total|Used|Free) (has a valid zero value|should have the omitempty tag)"
       linters:
         - kubeapilinter
 
@@ -104,6 +104,12 @@ linters:
     ## isPool mirrors the is_pool flag of a NetBox prefix.
     - path: "api/v1alpha1/netboxnetwork_types.go"
       text: "nobools: field IsPool pointer should not use a bool"
+      linters:
+        - kubeapilinter
+
+    ## publish.enabled is a plain switch, unset is false, as isPool.
+    - path: "api/v1alpha1/netboxnetwork_types.go"
+      text: "nobools: field Enabled pointer should not use a bool"
       linters:
         - kubeapilinter
 

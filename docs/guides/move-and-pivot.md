@@ -2,7 +2,7 @@
 
 Goal: move a cluster between management clusters (`clusterctl move`, pivot) without touching its NetBox objects: the target finds them again.
 
-`clusterctl move` leaves the NetBox objects alone. The target cluster finds the prefix, VIP, ranges and addresses by their key, so the status is rebuilt there, including removed ranges that still hold addresses; the endpoint of the moved Cluster already is the VIP. The ids of the owner and tenant of a network are resolved again from its `spec.owner` and `spec.tenant`.
+`clusterctl move` leaves the NetBox objects alone. The target cluster finds the prefix, VIP, ranges and addresses by their key, so the status is rebuilt there, the layout of a network from the ranges of its pools; the endpoint of the moved Cluster already is the VIP. The ids of the owner and tenant of a network are resolved again from its `spec.owner` and `spec.tenant`.
 
 ## Before you move
 

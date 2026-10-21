@@ -8,7 +8,8 @@ Goal: know the objects you work with and what each one becomes in NetBox, before
 |---|---|---|
 | `NetBoxNetwork` | prefix | the subnet of one cluster inside an L2 network, carved from a parent prefix or adopted |
 | `NetBoxNetwork` with `controlPlaneEndpoint` | IP address with role `vip` | the control-plane VIP of the cluster |
-| `NetBoxIPPool` | one IP range per range of the pool | spans of a network, given as offsets, that machines take addresses from |
+| `NetBoxNetwork` with `pools` | one or more IP ranges per pool | the layout of the prefix: pools of given sizes, placed in order |
+| `NetBoxIPPool` | nothing of its own | hands out the addresses of pools of networks |
 | `IPAddressClaim` pointing at a `NetBoxIPPool` | IP address | allocated from a range of the pool, deleted with the claim |
 
 Both kinds are namespaced, in `ipam.cluster.x-k8s.io/v1alpha1`. They live in the namespace of the Cluster they serve.
@@ -16,7 +17,7 @@ Both kinds are namespaced, in `ipam.cluster.x-k8s.io/v1alpha1`. They live in the
 With an infrastructure provider that consumes `IPAddressClaim`s, for example CAPV with `addressesFromPools`:
 
 1. A `NetBoxNetwork` names the Cluster and a parent prefix. The provider carves a prefix for the cluster out of it.
-2. `NetBoxIPPool`s split that prefix into ranges: control plane, ingress, workers. Each range becomes an IP range in NetBox.
+2. The network lays the prefix out in pools of the sizes its spec asks for: control plane, ingress, workers. Each pool becomes IP ranges in NetBox. A `NetBoxIPPool` per pool hands out its addresses.
 3. The machine template points at a pool. The infrastructure provider creates an `IPAddressClaim` per machine.
 4. The provider allocates an address from the range in NetBox and answers with an `IPAddress`: the address, the mask of the L2 network and its gateway.
 5. Optionally the network also reserves the VIP of the control plane and writes it to the Cluster.
@@ -29,7 +30,7 @@ NetBox stays the source of truth. An object in NetBox is the provider's when a c
 |---|---|
 | prefix | `[<instance>/]NetBoxNetwork/<namespace>/<network>` |
 | VIP | `[<instance>/]NetBoxNetwork/<namespace>/<network>/vip` |
-| IP range | `[<instance>/]NetBoxIPPool/<namespace>/<pool>/<network>` |
+| IP range of a pool | `[<instance>/]NetBoxNetwork/<namespace>/<network>/pool/<pool>` |
 | IP address | `[<instance>/]IPAddressClaim/<namespace>/<claim>` |
 
 - The key lives in a text custom field, `capi_ref` by default, set up by the NetBox admin once ([NetBox access](netbox-access.md#the-key)); an existing text field can be reused ([Reusing a custom field](../recipes/reuse-custom-field.md)).

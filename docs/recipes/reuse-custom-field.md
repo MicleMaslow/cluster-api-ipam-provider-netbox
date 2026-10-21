@@ -2,7 +2,7 @@
 
 Goal: keep the key of the provider in a text custom field NetBox already has, when you cannot or do not want to add `capi_ref`. Typically that is a field another tool created, for example the one netbox-operator keeps its restoration hash in (`netboxOperatorRestorationHash` by default). The provider takes every name NetBox does (letters, digits and `_` in any case, without `__`), so that field works as it is.
 
-The provider calls an object its own only when the field holds exactly its key, so a value another tool wrote there never matches; and it writes the key only to objects of its own networks, pools and claims. Choose the field before the first network: the provider does not migrate keys between fields ([Upgrade](../operations/upgrade.md#the-key-does-not-move)).
+The provider calls an object its own only when the field holds exactly its key, so a value another tool wrote there never matches; and it writes the key only to objects of its own networks and claims. Choose the field before the first network: the provider does not migrate keys between fields ([Upgrade](../operations/upgrade.md#the-key-does-not-move)).
 
 ## Steps
 

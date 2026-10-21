@@ -23,7 +23,6 @@ import (
 	"net/netip"
 	"net/url"
 	"slices"
-	"strings"
 
 	"k8s.io/klog/v2"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -58,15 +57,6 @@ func pickVIP(prefix, l2 netip.Prefix, gw netip.Addr, taken []netip.Addr, ranges 
 		}
 	}
 	return netip.Addr{}, false
-}
-
-// reservedOf are the addresses of nw's prefix that a pool range must not cover: the gateway and the VIP.
-func reservedOf(nw *v1alpha1.NetBoxNetwork, gw netip.Addr) []netip.Addr {
-	reserved := []netip.Addr{gw}
-	if vip, err := netip.ParseAddr(nw.Status.ControlPlaneEndpoint.Host); err == nil {
-		reserved = append(reserved, vip)
-	}
-	return reserved
 }
 
 // reserveVIP returns the VIP of nw in prefix, creating it in NetBox if it is not there yet.
@@ -117,11 +107,15 @@ func (r *NetBoxNetworkReconciler) reserveVIP(ctx context.Context, nw *v1alpha1.N
 		return netip.Addr{}, retryLater(v1alpha1.ReasonEndpointConflict, fmt.Errorf("NetBox address %s of %s is not the VIP %s; move it back in NetBox", p.Addr(), ref, want))
 	}
 	nwRef := r.Keys.Key("NetBoxNetwork", nw)
+	dns, err := dnsNameOf(nw)
+	if err != nil {
+		return netip.Addr{}, err
+	}
 	fields := map[string]any{}
 	if ip.Status.Value == "deprecated" {
 		fields["status"], fields["changelog_message"] = "active", "capi: reclaimed by "+nwRef
 	}
-	if dns := dnsNameOf(nw); ip.DNSName != dns {
+	if ip.DNSName != dns {
 		fields["dns_name"] = dns
 		if _, ok := fields["changelog_message"]; !ok {
 			fields["changelog_message"] = "capi: dns_name of " + nwRef
@@ -141,20 +135,22 @@ func (r *NetBoxNetworkReconciler) reserveVIP(ctx context.Context, nw *v1alpha1.N
 	return p.Addr(), attrsFailed("the VIP "+ip.Address, err)
 }
 
-// dnsNameOf is the dns_name of the VIP; NetBox stores it in lower case.
-func dnsNameOf(nw *v1alpha1.NetBoxNetwork) string {
-	if nw.Spec.ControlPlaneEndpoint == nil {
-		return ""
-	}
-	return strings.ToLower(nw.Spec.ControlPlaneEndpoint.DNSName)
-}
-
 // beforeVIPCreate runs between the pick of the VIP address and its create; a test seam.
 var beforeVIPCreate = func() {}
 
-// createVIP creates the VIP in NetBox: preferred if it is valid, else the highest usable address of prefix.
+// createVIP creates the VIP in NetBox: preferred if it is valid, else the highest usable address of prefix. A preferred
+// address, the Cluster's endpoint, held only by a NetBox address without a key is the VIP of a running cluster: that
+// one is adopted (adoptVIP).
 func (r *NetBoxNetworkReconciler) createVIP(ctx context.Context, nw *v1alpha1.NetBoxNetwork, prefix netip.Prefix, preferred netip.Addr) (netbox.Object, error) {
 	l2, gw, err := l2Of(nw)
+	if err != nil {
+		return netbox.Object{}, err
+	}
+	_, attrs, err := networkTexts(nw)
+	if err != nil {
+		return netbox.Object{}, err
+	}
+	dns, err := dnsNameOf(nw)
 	if err != nil {
 		return netbox.Object{}, err
 	}
@@ -162,26 +158,51 @@ func (r *NetBoxNetworkReconciler) createVIP(ctx context.Context, nw *v1alpha1.Ne
 	if err != nil {
 		return netbox.Object{}, err
 	}
-	vip := preferred
-	if vip.IsValid() {
-		if !vipUsable(vip, prefix, l2, gw, taken, ranges) {
-			return netbox.Object{}, retryLater(v1alpha1.ReasonEndpointConflict,
-				fmt.Errorf("%s cannot be the VIP: it is outside %s, a service address of %s, or used in NetBox", vip, prefix, l2))
-		}
-	} else {
-		var ok bool
-		if vip, ok = pickVIP(prefix, l2, gw, taken, ranges); !ok {
-			return netbox.Object{}, retryLater(v1alpha1.ReasonExhausted, fmt.Errorf("no free address for the VIP in %s", prefix))
+	// Reserves and ranges placed in the layout are taken before they are created.
+	var planned []netip.Addr
+	for _, g := range nw.Status.Layout.Addresses {
+		for _, s := range g.Addresses {
+			if a, err := netip.ParseAddr(s); err == nil {
+				planned = append(planned, a)
+			}
 		}
 	}
-	_, attrs, err := networkTexts(nw)
-	if err != nil {
-		return netbox.Object{}, err
+	for _, p := range nw.Status.Layout.Pools {
+		for _, lr := range p.Ranges {
+			from, ferr := netip.ParseAddr(lr.Start)
+			to, terr := netip.ParseAddr(lr.End)
+			if ferr == nil && terr == nil {
+				ranges = append(ranges, [2]netip.Addr{from, to})
+			}
+		}
+	}
+	taken = append(taken, planned...)
+	vip := preferred
+	switch {
+	case !vip.IsValid():
+		// Nor is an allocated address outside them, of a pool that is not the network's.
+		addrs, err := r.ipAddresses(ctx, nw.Namespace)
+		if err != nil {
+			return netbox.Object{}, err
+		}
+		var ok bool
+		if vip, ok = pickVIP(prefix, l2, gw, append(taken, addrs...), ranges); !ok {
+			return netbox.Object{}, retryLater(v1alpha1.ReasonExhausted, fmt.Errorf("no free address for the VIP in %s", prefix))
+		}
+	case !vipUsable(vip, prefix, l2, gw, taken, ranges):
+		// A VIP the status has is never adopted: the address of a lost one was taken.
+		if nw.Status.ControlPlaneEndpoint.Host == "" && vipUsable(vip, prefix, l2, gw, planned, ranges) {
+			if ip, ok, err := r.adoptVIP(ctx, nw, vip, attrs, dns); ok || err != nil {
+				return ip, err
+			}
+		}
+		return netbox.Object{}, retryLater(v1alpha1.ReasonEndpointConflict,
+			fmt.Errorf("%s cannot be the VIP: it is outside %s, a service address of %s, or used in NetBox", vip, prefix, l2))
 	}
 	beforeVIPCreate()
 	nwRef := r.Keys.Key("NetBoxNetwork", nw)
 	ip, err := r.NetBox.Create(ctx, netbox.IPAddresses, r.Keys.Managed(attrs, vipRef(r.Keys, nw), "capi: VIP for "+nwRef, map[string]any{
-		"address": netip.PrefixFrom(vip, l2.Bits()).String(), "role": "vip", "status": "active", "dns_name": dnsNameOf(nw),
+		"address": netip.PrefixFrom(vip, l2.Bits()).String(), "role": "vip", "status": "active", "dns_name": dns,
 	}))
 	if err != nil {
 		return ip, err
@@ -192,6 +213,32 @@ func (r *NetBoxNetworkReconciler) createVIP(ctx context.Context, nw *v1alpha1.Ne
 		return netbox.Object{}, err
 	}
 	return ip, nil
+}
+
+// adoptVIP makes the NetBox address at a, if it is the only one there and carries no key, the VIP of nw: it gets the
+// key, dns_name and attributes of one. It reports false for any other.
+func (r *NetBoxNetworkReconciler) adoptVIP(ctx context.Context, nw *v1alpha1.NetBoxNetwork, a netip.Addr, attrs netbox.Attrs, dns string) (netbox.Object, bool, error) {
+	o, ok, err := r.keylessAt(ctx, a)
+	if err != nil || !ok {
+		return netbox.Object{}, false, err
+	}
+	fields := r.Keys.Managed(attrs, vipRef(r.Keys, nw), "capi: adopted by "+r.Keys.Key("NetBoxNetwork", nw), map[string]any{"dns_name": dns})
+	if _, err := r.NetBox.Patch(ctx, netbox.IPAddresses, o.ID, "", fields); err != nil {
+		return netbox.Object{}, false, err
+	}
+	ctrl.LoggerFrom(ctx).Info("Adopted the control plane VIP", "network", klog.KObj(nw), "address", o.Address, "id", o.ID)
+	normalEvent(r.Recorder, nw, "VIPAdopted", "Adopted the NetBox address %s as the control plane VIP", o.Address)
+	ip, _, err := r.NetBox.Get(ctx, netbox.IPAddresses, o.ID)
+	return ip, true, err
+}
+
+// keylessAt returns the global-VRF NetBox address at a if it is the only one there and carries no key.
+func (r *NetBoxNetworkReconciler) keylessAt(ctx context.Context, a netip.Addr) (netbox.Object, bool, error) {
+	same, err := r.NetBox.List(ctx, netbox.IPAddresses, url.Values{"address": {a.String()}, "vrf_id": {"null"}})
+	if err != nil || len(same) != 1 || r.Keys.RefOf(same[0]) != "" {
+		return netbox.Object{}, false, err
+	}
+	return same[0], true, nil
 }
 
 // dropDuplicate deletes ip, the VIP of nw, when an older global-VRF NetBox address holds its address too:
@@ -226,11 +273,20 @@ func (r *NetBoxNetworkReconciler) dropDuplicate(ctx context.Context, nw *v1alpha
 	return nil
 }
 
-// occupied returns the global-VRF addresses NetBox holds inside prefix and the IP ranges inside l2.
+// netBoxIn returns the global-VRF addresses NetBox holds inside prefix and the IP ranges inside l2.
 // NetBox's parent filter finds a range only when it lies wholly inside the parent, so a range that
-// reaches past prefix is found through l2.
+// reaches past prefix is found through l2; ranges that cross the boundary of l2 are not seen.
+func (r *NetBoxNetworkReconciler) netBoxIn(ctx context.Context, prefix, l2 netip.Prefix) (ips, ranges []netbox.Object, err error) {
+	if ips, err = r.NetBox.List(ctx, netbox.IPAddresses, url.Values{"parent": {prefix.Masked().String()}, "vrf_id": {"null"}}); err != nil {
+		return nil, nil, err
+	}
+	ranges, err = r.NetBox.List(ctx, netbox.IPRanges, url.Values{"parent": {l2.String()}})
+	return ips, ranges, err
+}
+
+// occupied returns the addresses and the bounds of the ranges of netBoxIn.
 func (r *NetBoxNetworkReconciler) occupied(ctx context.Context, prefix, l2 netip.Prefix) ([]netip.Addr, [][2]netip.Addr, error) {
-	ips, err := r.NetBox.List(ctx, netbox.IPAddresses, url.Values{"parent": {prefix.Masked().String()}, "vrf_id": {"null"}})
+	ips, objs, err := r.netBoxIn(ctx, prefix, l2)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -241,11 +297,6 @@ func (r *NetBoxNetworkReconciler) occupied(ctx context.Context, prefix, l2 netip
 			return nil, nil, err
 		}
 		taken = append(taken, p.Addr())
-	}
-	// Ranges that cross the boundary of l2 are not seen.
-	objs, err := r.NetBox.List(ctx, netbox.IPRanges, url.Values{"parent": {l2.String()}})
-	if err != nil {
-		return nil, nil, err
 	}
 	ranges := make([][2]netip.Addr, 0, len(objs))
 	for _, o := range objs {
@@ -258,27 +309,35 @@ func (r *NetBoxNetworkReconciler) occupied(ctx context.Context, prefix, l2 netip
 	return taken, ranges, nil
 }
 
-// releaseVIP lets go of the VIP of nw: deleted under deletionPolicy Delete, otherwise deprecated.
+// releaseVIP lets go of the VIP of nw (releaseIP).
 func (r *NetBoxNetworkReconciler) releaseVIP(ctx context.Context, nw *v1alpha1.NetBoxNetwork) error {
 	found, err := r.NetBox.FindByRef(ctx, r.Keys, netbox.IPAddresses, vipRef(r.Keys, nw))
 	if err != nil {
 		return err
 	}
-	released := "capi: released by " + r.Keys.Key("NetBoxNetwork", nw)
 	for _, ip := range found {
-		if nw.Spec.DeletionPolicy == v1alpha1.DeletionPolicyDelete {
-			err = r.NetBox.Delete(ctx, netbox.IPAddresses, ip.ID, "", released)
-		} else {
-			_, err = r.NetBox.Patch(ctx, netbox.IPAddresses, ip.ID, "", map[string]any{"status": "deprecated", "changelog_message": released})
-		}
-		if errors.Is(err, netbox.ErrNotFound) {
-			continue
-		}
-		if err != nil {
+		if released, err := r.releaseIP(ctx, nw, ip); err != nil {
 			return err
+		} else if released {
+			ctrl.LoggerFrom(ctx).Info("Released the control plane VIP", "network", klog.KObj(nw), "address", ip.Address, "policy", nw.Spec.DeletionPolicy)
+			normalEvent(r.Recorder, nw, "VIPReleased", "Released the control plane VIP %s (deletionPolicy %s)", ip.Address, nw.Spec.DeletionPolicy)
 		}
-		ctrl.LoggerFrom(ctx).Info("Released the control plane VIP", "network", klog.KObj(nw), "address", ip.Address, "policy", nw.Spec.DeletionPolicy)
-		normalEvent(r.Recorder, nw, "VIPReleased", "Released the control plane VIP %s (deletionPolicy %s)", ip.Address, nw.Spec.DeletionPolicy)
 	}
 	return nil
+}
+
+// releaseIP lets go of ip, an address of nw: deleted under deletionPolicy Delete, otherwise deprecated.
+// It reports false for one already gone.
+func (r *NetBoxNetworkReconciler) releaseIP(ctx context.Context, nw *v1alpha1.NetBoxNetwork, ip netbox.Object) (bool, error) {
+	released := "capi: released by " + r.Keys.Key("NetBoxNetwork", nw)
+	var err error
+	if nw.Spec.DeletionPolicy == v1alpha1.DeletionPolicyDelete {
+		err = r.NetBox.Delete(ctx, netbox.IPAddresses, ip.ID, "", released)
+	} else {
+		_, err = r.NetBox.Patch(ctx, netbox.IPAddresses, ip.ID, "", map[string]any{"status": "deprecated", "changelog_message": released})
+	}
+	if errors.Is(err, netbox.ErrNotFound) {
+		return false, nil
+	}
+	return err == nil, err
 }
