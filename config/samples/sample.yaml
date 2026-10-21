@@ -25,6 +25,9 @@ spec:
   parentPrefix: 10.10.0.0/22
   gateway: 10.10.0.1
   prefixLength: 27
+  pools:
+  - {name: cp, size: 6}
+  - {name: workers, size: rest}
   tags:
   - capi
   customFields:
@@ -41,8 +44,7 @@ metadata:
 spec:
   ranges:
   - networkName: sample-default
-    start: 14
-    end: 30
+    pool: workers
 ---
 apiVersion: ipam.cluster.x-k8s.io/v1beta2
 kind: IPAddressClaim

@@ -77,6 +77,84 @@ spec:
                 x-kubernetes-validations:
                 - message: addressPrefixLength is immutable
                   rule: self == oldSelf
+              addresses:
+                description: |-
+                  addresses are groups of addresses reserved in NetBox at the top of the prefix, under the VIP: each group takes
+                  count free addresses outside the pools, from the top down. Placed addresses stay; a group that grows takes the
+                  highest free ones, one that shrinks gives up its last ones, deleted in NetBox whatever the deletionPolicy.
+                items:
+                  description: AddressGroup is a named group of addresses reserved
+                    in NetBox at the top of the prefix.
+                  properties:
+                    count:
+                      description: count is the number of addresses of the group.
+                      format: int32
+                      maximum: 64
+                      minimum: 1
+                      type: integer
+                    description:
+                      description: |-
+                        description template of each address, kept in sync and cut to 200 characters. Variables as for dnsName.
+                        Default "{{ .Namespace }}/{{ .Network }} // {{ .Cluster }} {{ .Group }} {{ .Index }}".
+                      maxLength: 1024
+                      minLength: 1
+                      type: string
+                    dnsName:
+                      description: |-
+                        dnsName template of each address, kept in sync; NetBox stores it in lower case. Unset: no dns_name.
+                        Variables: .Cluster, .Namespace, .Network, .Group, .Index (1 for the highest address of the group, counting down).
+                        Rules as for the pool's ipAddress templates.
+                      maxLength: 1024
+                      minLength: 1
+                      type: string
+                    name:
+                      description: name of the group; it differs from the name of
+                        every pool.
+                      maxLength: 63
+                      minLength: 1
+                      pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                      type: string
+                    publish:
+                      description: publish writes the addresses of the group, under
+                        its name, to a Secret.
+                      minProperties: 1
+                      properties:
+                        enabled:
+                          description: enabled turns publishing on; unset is false.
+                          type: boolean
+                        secretName:
+                          description: |-
+                            secretName is the Secret to write to. Several pools and groups of a network may share one, a Secret belongs to
+                            one network: one that exists and is not controlled by it is left alone (SecretConflict).
+                          maxLength: 253
+                          minLength: 1
+                          pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
+                          type: string
+                      type: object
+                      x-kubernetes-validations:
+                      - message: enabled needs secretName
+                        rule: '!has(self.enabled) || !self.enabled || has(self.secretName)'
+                  required:
+                  - count
+                  - name
+                  type: object
+                maxItems: 8
+                type: array
+                x-kubernetes-list-map-keys:
+                - name
+                x-kubernetes-list-type: map
+              allocator:
+                description: |-
+                  allocator hands out the addresses of the pools: NetBox, through NetBoxIPPools over the NetBox ranges of the pools,
+                  or InCluster, through an InClusterIPPool per pool, named as the pool, which the network creates and keeps in sync.
+                  Unset is NetBox. Immutable, cannot be added or removed: another allocator is another network.
+                enum:
+                - NetBox
+                - InCluster
+                type: string
+                x-kubernetes-validations:
+                - message: allocator is immutable
+                  rule: self == oldSelf
               clusterName:
                 description: clusterName is the CAPI Cluster the network belongs to.
                 maxLength: 63
@@ -95,8 +173,9 @@ spec:
               controlPlaneEndpoint:
                 description: |-
                   controlPlaneEndpoint reserves the cluster's VIP in the prefix: the address of the Cluster's endpoint if that is
-                  inside the prefix, else the highest free address. The VIP is written to Cluster.spec.controlPlaneEndpoint
-                  while that has no host or no port; another endpoint is reported, not changed.
+                  inside the prefix, else the highest free address outside the pools and address groups, which the layout keeps
+                  for it. The VIP is written to Cluster.spec.controlPlaneEndpoint while that has no host or no port; another
+                  endpoint is reported, not changed.
                   Without it no VIP is reserved; removing it later leaves the VIP in NetBox and in the status.
                   A VIP that cannot be reserved shows in the ControlPlaneEndpointReady condition and leaves Ready alone.
                 properties:
@@ -113,11 +192,11 @@ spec:
                     minLength: 1
                     type: string
                   dnsName:
-                    description: dnsName of the VIP in NetBox, which stores it in
-                      lower case.
-                    maxLength: 255
+                    description: |-
+                      dnsName template of the VIP in NetBox, which stores it in lower case. Variables as for spec.description;
+                      a value that is not a DNS name fails Ready with reason InvalidSpec.
+                    maxLength: 1024
                     minLength: 1
-                    pattern: ^([0-9A-Za-z_-]+|\*)(\.[0-9A-Za-z_-]+)*\.?$
                     type: string
                   port:
                     description: |-
@@ -146,8 +225,8 @@ spec:
                 type: object
               deletionPolicy:
                 default: Retain
-                description: deletionPolicy for the NetBox prefix and the pool ranges
-                  inside it.
+                description: deletionPolicy for the NetBox prefix, the VIP, the reserved
+                  addresses and the pool ranges when the network is deleted.
                 enum:
                 - Retain
                 - Delete
@@ -211,6 +290,101 @@ spec:
                   rule: '!isCIDR(self) || cidr(self).ip().family() == 4'
                 - message: parentPrefix is immutable
                   rule: self == oldSelf
+              pools:
+                description: |-
+                  pools lay out the prefix: in order, each takes the next free addresses from the start of the prefix.
+                  A free address is not the network, broadcast or gateway of the L2 network, the VIP, nor held by a NetBox
+                  address or range of anything else. The layout is fixed in status.layout and placed again only when the names
+                  or sizes here change; a change that would move an allocated address to another pool is refused as a whole.
+                  Each pool is one or more NetBox IP ranges, which the allocator hands out addresses from.
+                items:
+                  description: NetworkPool is a pool of the network's layout.
+                  properties:
+                    name:
+                      description: name of the pool, which NetBoxIPPool ranges refer
+                        to; with allocator InCluster, the name of its InClusterIPPool.
+                      maxLength: 63
+                      minLength: 1
+                      pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                      type: string
+                    publish:
+                      description: publish writes the addresses of the pool, under
+                        its name, to a Secret.
+                      minProperties: 1
+                      properties:
+                        enabled:
+                          description: enabled turns publishing on; unset is false.
+                          type: boolean
+                        secretName:
+                          description: |-
+                            secretName is the Secret to write to. Several pools and groups of a network may share one, a Secret belongs to
+                            one network: one that exists and is not controlled by it is left alone (SecretConflict).
+                          maxLength: 253
+                          minLength: 1
+                          pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
+                          type: string
+                      type: object
+                      x-kubernetes-validations:
+                      - message: enabled needs secretName
+                        rule: '!has(self.enabled) || !self.enabled || has(self.secretName)'
+                    size:
+                      anyOf:
+                      - type: integer
+                      - type: string
+                      description: 'size is the number of free addresses of the pool,
+                        or rest: the free addresses the other pools leave.'
+                      x-kubernetes-int-or-string: true
+                      x-kubernetes-validations:
+                      - message: must be a positive number or rest
+                        rule: 'type(self) == string ? self == ''rest'' : self >= 1
+                          && self <= 65535'
+                    sync:
+                      description: |-
+                        sync writes each address the InClusterIPPool of the pool hands out (an IPAddress) to NetBox, and deletes it with
+                        the IPAddress. Only with allocator InCluster.
+                      minProperties: 1
+                      properties:
+                        enabled:
+                          description: enabled turns the sync on; unset is false.
+                          type: boolean
+                        ipAddress:
+                          description: |-
+                            ipAddress are the templates of the NetBox addresses, as the ipAddress of a NetBoxIPPool: .Owner is the first
+                            owner of the claim of the IPAddress (the machine), .Pool the name of the pool.
+                          minProperties: 1
+                          properties:
+                            comments:
+                              description: comments template.
+                              maxLength: 1024
+                              minLength: 1
+                              type: string
+                            description:
+                              description: description template, cut to 200 characters;
+                                default "{{ .Namespace }}/{{ .Owner }} // {{ .Cluster
+                                }} {{ .Pool }}".
+                              maxLength: 1024
+                              minLength: 1
+                              type: string
+                            dnsName:
+                              description: dnsName template, lowercased; default "{{
+                                .Owner }}".
+                              maxLength: 1024
+                              minLength: 1
+                              type: string
+                          type: object
+                      type: object
+                  required:
+                  - name
+                  - size
+                  type: object
+                maxItems: 16
+                type: array
+                x-kubernetes-list-map-keys:
+                - name
+                x-kubernetes-list-type: map
+                x-kubernetes-validations:
+                - message: at most one pool of size rest
+                  rule: self.filter(p, type(p.size) == string).size() <= 1
               prefix:
                 description: prefix adopts an existing prefix inside parentPrefix
                   instead of carving one.
@@ -296,6 +470,15 @@ spec:
             - message: an adopted prefix cannot use deletionPolicy Delete
               rule: '!has(self.prefix) || !has(self.deletionPolicy) || self.deletionPolicy
                 != ''Delete'''
+            - message: pool and address group names must differ
+              rule: '!has(self.pools) || !has(self.addresses) || self.pools.all(p,
+                !self.addresses.exists(a, a.name == p.name))'
+            - message: allocator cannot be added or removed
+              rule: has(self.allocator) == has(oldSelf.allocator)
+            - message: sync needs allocator InCluster
+              rule: '!has(self.pools) || has(self.allocator) && self.allocator ==
+                ''InCluster'' || self.pools.all(p, !has(p.sync) || !has(p.sync.enabled)
+                || !p.sync.enabled)'
           status:
             description: status is the observed state of NetBoxNetwork.
             minProperties: 1
@@ -310,7 +493,7 @@ spec:
               conditions:
                 description: |-
                   conditions represents the observations of a NetBoxNetwork's current state.
-                  Known condition types are Ready, MetadataSynced and ControlPlaneEndpointReady.
+                  Known condition types are Ready, MetadataSynced, ControlPlaneEndpointReady and LayoutReady.
                 items:
                   description: Condition contains details for one aspect of the current
                     state of this API Resource.
@@ -397,6 +580,110 @@ spec:
                 description: customFieldKeys are, per JSON-object custom field, the
                   keys the provider has written.
                 type: object
+              layout:
+                description: layout is the placement of spec.pools and spec.addresses
+                  in the prefix, with the NetBox ranges of the pools.
+                minProperties: 1
+                properties:
+                  addresses:
+                    description: addresses are the placed address groups in the order
+                      of spec.addresses.
+                    items:
+                      description: AddressGroupLayout is an address group placed in
+                        the prefix.
+                      properties:
+                        addresses:
+                          description: 'addresses of the group from the top down:
+                            the first has .Index 1.'
+                          items:
+                            maxLength: 39
+                            minLength: 1
+                            type: string
+                          maxItems: 64
+                          minItems: 1
+                          type: array
+                          x-kubernetes-list-type: atomic
+                        count:
+                          description: count is the count spec.addresses asked for
+                            when the group was placed.
+                          format: int32
+                          maximum: 64
+                          minimum: 1
+                          type: integer
+                        name:
+                          description: name of the group.
+                          maxLength: 63
+                          minLength: 1
+                          type: string
+                      required:
+                      - addresses
+                      - count
+                      - name
+                      type: object
+                    maxItems: 8
+                    type: array
+                    x-kubernetes-list-map-keys:
+                    - name
+                    x-kubernetes-list-type: map
+                  pools:
+                    description: pools are the placed pools in the order of spec.pools.
+                    items:
+                      description: PoolLayout is a pool placed in the prefix.
+                      properties:
+                        name:
+                          description: name of the pool.
+                          maxLength: 63
+                          minLength: 1
+                          type: string
+                        ranges:
+                          description: ranges hold the addresses of the pool, ascending;
+                            the addresses between them are not the pool's.
+                          items:
+                            description: LayoutRange is one NetBox IP range of a placed
+                              pool.
+                            properties:
+                              end:
+                                description: end is the last address of the range.
+                                maxLength: 39
+                                minLength: 1
+                                type: string
+                              id:
+                                description: id is the NetBox ID of the IP range,
+                                  unset until it is created.
+                                format: int64
+                                minimum: 1
+                                type: integer
+                              start:
+                                description: start is the first address of the range.
+                                maxLength: 39
+                                minLength: 1
+                                type: string
+                            required:
+                            - end
+                            - start
+                            type: object
+                          maxItems: 32
+                          minItems: 1
+                          type: array
+                          x-kubernetes-list-type: atomic
+                        size:
+                          anyOf:
+                          - type: integer
+                          - type: string
+                          description: size is the size spec.pools asked for when
+                            the pool was placed.
+                          x-kubernetes-int-or-string: true
+                      required:
+                      - name
+                      - ranges
+                      - size
+                      type: object
+                    maxItems: 16
+                    type: array
+                    x-kubernetes-list-map-keys:
+                    - name
+                    x-kubernetes-list-type: map
+                type: object
               ownerID:
                 description: ownerID is the NetBox ID spec.owner resolves to; unset
                   without spec.owner.
@@ -413,6 +700,16 @@ spec:
                 format: int64
                 minimum: 1
                 type: integer
+              publishedSecrets:
+                description: |-
+                  publishedSecrets are the Secrets the network has written its addresses to, which it deletes once no enabled
+                  pool or group publishes in them.
+                items:
+                  maxLength: 253
+                  type: string
+                maxItems: 16
+                type: array
+                x-kubernetes-list-type: set
               tags:
                 description: tags are the slugs of the tags the provider has set on
                   the prefix.

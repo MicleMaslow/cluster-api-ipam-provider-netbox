@@ -35,7 +35,9 @@ import (
 	"k8s.io/client-go/tools/events"
 	"k8s.io/klog/v2"
 	"k8s.io/utils/ptr"
+	inclusterv1 "sigs.k8s.io/cluster-api-ipam-provider-in-cluster/api/v1alpha2"
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
+	ipamv1 "sigs.k8s.io/cluster-api/api/ipam/v1beta2"
 	"sigs.k8s.io/cluster-api/util/labels"
 	"sigs.k8s.io/cluster-api/util/patch"
 	"sigs.k8s.io/cluster-api/util/paused"
@@ -68,7 +70,8 @@ var poolLeft = builder.WithPredicates(predicate.Funcs{
 	GenericFunc: func(event.GenericEvent) bool { return false },
 })
 
-// NetBoxNetworkReconciler holds a NetBox prefix for every NetBoxNetwork.
+// NetBoxNetworkReconciler holds a NetBox prefix for every NetBoxNetwork, its VIP and the NetBox ranges of its pools,
+// and with allocator InCluster an InClusterIPPool per pool.
 type NetBoxNetworkReconciler struct {
 	client.Client
 	APIReader        client.Reader // reads past the cache
@@ -76,11 +79,13 @@ type NetBoxNetworkReconciler struct {
 	Keys             netbox.Keys
 	WatchFilterValue string
 	Recorder         events.EventRecorder
+	InCluster        bool // InClusterIPPool is served
 }
 
 // +kubebuilder:rbac:groups=ipam.cluster.x-k8s.io,resources=netboxnetworks,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups=ipam.cluster.x-k8s.io,resources=netboxnetworks/status;netboxnetworks/finalizers,verbs=get;update;patch
 // +kubebuilder:rbac:groups=ipam.cluster.x-k8s.io,resources=netboxippools,verbs=get;list;watch
+// +kubebuilder:rbac:groups=ipam.cluster.x-k8s.io,resources=ipaddresses,verbs=get;list;watch
 // +kubebuilder:rbac:groups=cluster.x-k8s.io,resources=clusters,verbs=get;list;watch;patch
 
 // SetupWithManager sets up the controller with the Manager.
@@ -94,13 +99,18 @@ func (r *NetBoxNetworkReconciler) SetupWithManager(ctx context.Context, mgr ctrl
 	}); err != nil {
 		return err
 	}
-	return ctrl.NewControllerManagedBy(mgr).
+	filter := builder.WithPredicates(predicates.ResourceHasFilterLabel(mgr.GetScheme(), ctrl.LoggerFrom(ctx), r.WatchFilterValue))
+	b := ctrl.NewControllerManagedBy(mgr).
 		WithOptions(options).
-		For(&v1alpha1.NetBoxNetwork{}).
-		Watches(&clusterv1.Cluster{}, handler.EnqueueRequestsFromMapFunc(r.clusterToNetworks), builder.WithPredicates(clusterEvents)).
-		Watches(&v1alpha1.NetBoxIPPool{}, handler.EnqueueRequestsFromMapFunc(poolToNetworks), poolLeft).
-		WithEventFilter(predicates.ResourceHasFilterLabel(mgr.GetScheme(), ctrl.LoggerFrom(ctx), r.WatchFilterValue)).
-		Complete(r)
+		For(&v1alpha1.NetBoxNetwork{}, filter).
+		Watches(&clusterv1.Cluster{}, handler.EnqueueRequestsFromMapFunc(r.clusterToNetworks), builder.WithPredicates(clusterEvents), filter).
+		Watches(&v1alpha1.NetBoxIPPool{}, handler.EnqueueRequestsFromMapFunc(poolToNetworks), poolLeft, filter)
+	if r.InCluster {
+		// An IPAddress carries no watch label: Reconcile filters the network it leads to.
+		b = b.Owns(&inclusterv1.InClusterIPPool{}, builder.WithPredicates(predicate.GenerationChangedPredicate{}), filter).
+			Watches(&ipamv1.IPAddress{}, handler.EnqueueRequestsFromMapFunc(r.addressToNetwork))
+	}
+	return b.Complete(r)
 }
 
 func (r *NetBoxNetworkReconciler) clusterToNetworks(ctx context.Context, o client.Object) []reconcile.Request {
@@ -184,10 +194,14 @@ func (r *NetBoxNetworkReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		}
 	}
 	setReady(&nw.Status.Conditions, nw.Generation, err)
+	laidOut := len(nw.Spec.Pools)+len(nw.Spec.Addresses)+len(nw.Status.Layout.Pools)+len(nw.Status.Layout.Addresses)+len(nw.Status.PublishedSecrets) > 0
 	if err != nil {
 		setWaitingForPrefix(nw, v1alpha1.MetadataSyncedCondition)
 		if nw.Spec.ControlPlaneEndpoint != nil {
 			setWaitingForPrefix(nw, v1alpha1.ControlPlaneEndpointReadyCondition)
+		}
+		if laidOut {
+			setWaitingForPrefix(nw, v1alpha1.LayoutReadyCondition)
 		}
 		return toResult(err)
 	}
@@ -197,15 +211,22 @@ func (r *NetBoxNetworkReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 			setCondition(&nw.Status.Conditions, v1alpha1.ControlPlaneEndpointReadyCondition, v1alpha1.ReasonReady, nw.Generation, vipErr)
 		}
 	}
+	var layoutErr error
+	if laidOut {
+		layoutErr = r.reconcileLayout(ctx, nw, hostOf(cluster))
+		setCondition(&nw.Status.Conditions, v1alpha1.LayoutReadyCondition, v1alpha1.ReasonReady, nw.Generation, layoutErr)
+	} else {
+		meta.RemoveStatusCondition(&nw.Status.Conditions, v1alpha1.LayoutReadyCondition)
+	}
 	err = foldErrors([]error{attrsErr, r.syncMetadata(ctx, nw, nw.Status.PrefixID)})
 	setCondition(&nw.Status.Conditions, v1alpha1.MetadataSyncedCondition, v1alpha1.ReasonSynced, nw.Generation, err)
 	if errors.Is(vipErr, errClusterChanged) {
-		if _, err := toResult(err); err != nil {
+		if _, err := toResult(foldErrors([]error{err, layoutErr})); err != nil {
 			return ctrl.Result{}, err
 		}
 		return ctrl.Result{Requeue: true}, nil //nolint:staticcheck // rate-limited: a Cluster that keeps changing backs off
 	}
-	return toResult(foldErrors([]error{vipErr, err}))
+	return toResult(foldErrors([]error{vipErr, err, layoutErr}))
 }
 
 // getCluster returns the Cluster of nw from the cache, or nil if there is none.
@@ -647,9 +668,31 @@ func (r *NetBoxNetworkReconciler) reconcileDelete(ctx context.Context, nw *v1alp
 			return waitFor(v1alpha1.ReasonWaitingForPools, fmt.Errorf("network is still used by NetBoxIPPool %s", pools.Items[i].Name))
 		}
 	}
+	if nw.Spec.Allocator == v1alpha1.AllocatorInCluster {
+		if r.InCluster {
+			if err := r.deleteInClusterPools(ctx, nw); err != nil {
+				return err
+			}
+		} else if served, err := inClusterServed(r.RESTMapper()); err != nil {
+			return err
+		} else if served {
+			// in-cluster installed since the start: the pools of nw are not seen until a restart, and may hand out addresses.
+			return waitFor(v1alpha1.ReasonAllocatorUnavailable, errors.New("InClusterIPPool is served now: restart the provider to delete the InClusterIPPools of the network"))
+		}
+		if err := r.syncAddresses(ctx, nw); err != nil {
+			return err
+		}
+	}
 	// A deleted VIP could go to another cluster while this one still serves on it; a retained one is never handed out.
 	if vip := nw.Status.ControlPlaneEndpoint.Host; nw.Spec.DeletionPolicy == v1alpha1.DeletionPolicyDelete && vip != "" && hostOf(cluster) == vip {
 		return waitFor(v1alpha1.ReasonWaitingForCluster, fmt.Errorf("cluster %s still uses the VIP %s", nw.Spec.ClusterName, vip))
+	}
+	ranges, err := r.NetBox.FindByRefPrefix(ctx, r.Keys, netbox.IPRanges, poolRangeRef(r.Keys, nw, ""))
+	if err != nil {
+		return err
+	}
+	if err := r.releaseRanges(ctx, nw, ranges, nw.Spec.DeletionPolicy); err != nil {
+		return err
 	}
 	ref := r.Keys.Key("NetBoxNetwork", nw)
 	found, err := r.NetBox.FindByRef(ctx, r.Keys, netbox.Prefixes, ref)
@@ -683,6 +726,9 @@ func (r *NetBoxNetworkReconciler) reconcileDelete(ctx context.Context, nw *v1alp
 		normalEvent(r.Recorder, nw, "PrefixReleased", "Released the NetBox prefix %s (deletionPolicy %s)", p.Prefix, policy)
 	}
 	if err := r.releaseVIP(ctx, nw); err != nil {
+		return err
+	}
+	if err := r.releaseReserves(ctx, nw); err != nil {
 		return err
 	}
 	controllerutil.RemoveFinalizer(nw, networkFinalizer)

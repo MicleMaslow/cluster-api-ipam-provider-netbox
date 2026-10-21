@@ -33,6 +33,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/tools/events"
 	"k8s.io/client-go/util/retry"
 	"k8s.io/utils/ptr"
@@ -188,6 +189,21 @@ func newNetwork(ns, name string) *v1alpha1.NetBoxNetwork {
 			ClusterName: ns, ParentPrefix: "10.10.0.0/22", Gateway: "10.10.0.1", PrefixLength: 28,
 		},
 	}
+}
+
+// netPool is a pool of a network's layout of size addresses, 0 for rest.
+func netPool(name string, size int32) v1alpha1.NetworkPool {
+	if size == 0 {
+		return v1alpha1.NetworkPool{Name: name, Size: intstr.FromString("rest")}
+	}
+	return v1alpha1.NetworkPool{Name: name, Size: intstr.FromInt32(size)}
+}
+
+// layoutNetwork is newNetwork laid out as cp 3, workers rest.
+func layoutNetwork(ns, name string) *v1alpha1.NetBoxNetwork {
+	nw := newNetwork(ns, name)
+	nw.Spec.Pools = []v1alpha1.NetworkPool{netPool("cp", 3), netPool("workers", 0)}
+	return nw
 }
 
 type conditioned interface {

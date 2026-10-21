@@ -28,8 +28,16 @@ const MetadataSyncedCondition = "MetadataSynced"
 // cannot be the VIP, Exhausted when no address is left for it. It never changes Ready.
 const ControlPlaneEndpointReadyCondition = "ControlPlaneEndpointReady"
 
-// RangesReadyCondition is true when every range of a NetBoxIPPool is in NetBox as the spec asks.
+// RangesReadyCondition is true when every range of a NetBoxIPPool is a pool placed in its network and in NetBox.
 const RangesReadyCondition = "RangesReady"
+
+// LayoutReadyCondition is true once spec.pools of a NetBoxNetwork are placed and their ranges are in NetBox.
+// False with InvalidSpec when they do not fit, RangeInUse when a change would move allocated addresses to another pool,
+// AllocatorUnavailable when allocator InCluster has no InClusterIPPool CRD, AddressConflict when an address in use in
+// NetBox is allocated from an InClusterIPPool, SecretConflict when a Secret to publish in exists and is not the network's.
+// Addresses are published (spec.pools[].publish, spec.addresses[].publish) only once the layout is applied.
+// Unset without spec.pools. It never changes Ready.
+const LayoutReadyCondition = "LayoutReady"
 
 // Reasons of the Ready condition.
 const (
@@ -47,6 +55,10 @@ const (
 	ReasonInvalidSpec     = "InvalidSpec"
 	ReasonRangeInUse      = "RangeInUse"
 	ReasonRangeOverlap    = "RangeOverlap"
+
+	ReasonAllocatorUnavailable = "AllocatorUnavailable"
+	ReasonAddressConflict      = "AddressConflict"
+	ReasonSecretConflict       = "SecretConflict"
 
 	ReasonDeleting            = "Deleting"
 	ReasonWaitingForPools     = "WaitingForPools"

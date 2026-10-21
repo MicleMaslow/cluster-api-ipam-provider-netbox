@@ -6,6 +6,15 @@ metadata:
 rules:
 - apiGroups:
   - ""
+  resources:
+  - secrets
+  verbs:
+  - create
+  - delete
+  - get
+  - update
+- apiGroups:
+  - ""
   - events.k8s.io
   resources:
   - events
@@ -48,6 +57,19 @@ rules:
 - apiGroups:
   - ipam.cluster.x-k8s.io
   resources:
+  - inclusterippools
+  - ipaddresses
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - ipam.cluster.x-k8s.io
+  resources:
   - ipaddressclaims
   - netboxippools
   - netboxnetworks
@@ -70,18 +92,6 @@ rules:
   - get
   - patch
   - update
-- apiGroups:
-  - ipam.cluster.x-k8s.io
-  resources:
-  - ipaddresses
-  verbs:
-  - create
-  - delete
-  - get
-  - list
-  - patch
-  - update
-  - watch
 - apiGroups:
   - ipam.cluster.x-k8s.io
   resources:

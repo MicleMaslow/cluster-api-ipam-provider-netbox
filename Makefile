@@ -20,6 +20,7 @@ SHELL := /usr/bin/env bash
 # Versions and dev stand.
 #
 CAPI_VERSION ?= v1.14.3
+INCLUSTER_VERSION ?= v1.1.1
 ENVTEST_K8S_VERSION ?= 1.37.0
 KIND_CLUSTER ?= capi-netbox-dev
 DEV_COMPOSE := docker compose -f hack/dev/compose.yaml
@@ -160,7 +161,8 @@ verify-doc-links: ## Verify relative links and anchors in README.md and docs
 
 ##@ Test
 
-ENVTEST_ENV = KUBEBUILDER_ASSETS="$$($(SETUP_ENVTEST) use $(ENVTEST_K8S_VERSION) -p path)" CAPI_CRDS="$$(go mod download sigs.k8s.io/cluster-api && go list -m -f '{{.Dir}}' sigs.k8s.io/cluster-api)/core/config/crd/bases"
+ENVTEST_ENV = KUBEBUILDER_ASSETS="$$($(SETUP_ENVTEST) use $(ENVTEST_K8S_VERSION) -p path)" CAPI_CRDS="$$(go mod download sigs.k8s.io/cluster-api && go list -m -f '{{.Dir}}' sigs.k8s.io/cluster-api)/core/config/crd/bases" \
+	INCLUSTER_CRDS="$$(go mod download sigs.k8s.io/cluster-api-ipam-provider-in-cluster && go list -m -f '{{.Dir}}' sigs.k8s.io/cluster-api-ipam-provider-in-cluster)/config/crd/bases"
 
 .PHONY: test
 test: $(SETUP_ENVTEST) ## Run unit tests, CRD validation and the control-plane VIP command test (no NetBox needed)
@@ -217,8 +219,9 @@ release-manifests: generate $(KUSTOMIZE) ## Build out/ipam-components.yaml with 
 
 # Sequential sub-makes: the steps depend on each other, so -j must not reorder them.
 .PHONY: dev-all
-dev-all: ## Whole dev stand: dev-up, deploy-dev, vcsim-up and the clusters vc (owner, tenant) and vc2; repeatable
+dev-all: ## Whole dev stand: dev-up, incluster-up, deploy-dev, vcsim-up and the clusters vc (owner, tenant) and vc2; repeatable
 	$(MAKE) --no-print-directory dev-up
+	$(MAKE) --no-print-directory incluster-up
 	$(MAKE) --no-print-directory deploy-dev
 	$(MAKE) --no-print-directory vcsim-up
 	NODE_DOMAIN=nodes.test OWNER=dev-team TENANT=dev-tenant $(MAKE) --no-print-directory vcsim-cluster NAME=vc
@@ -244,6 +247,11 @@ netbox-down: ## Stop NetBox and drop its data
 kind-up: $(CLUSTERCTL) ## Create the kind cluster and install CAPI core
 	if kind get clusters 2>/dev/null | grep -qx $(KIND_CLUSTER); then kind export kubeconfig --name $(KIND_CLUSTER) --kubeconfig $(KUBECONFIG); else kind create cluster --name $(KIND_CLUSTER) --kubeconfig $(KUBECONFIG); fi
 	kubectl -n capi-kubeadm-control-plane-system get deployment capi-kubeadm-control-plane-controller-manager >/dev/null 2>&1 || $(CLUSTERCTL) init --config hack/dev/clusterctl.yaml --core cluster-api:$(CAPI_VERSION) --bootstrap kubeadm:$(CAPI_VERSION) --control-plane kubeadm:$(CAPI_VERSION) --wait-providers
+
+# The provider looks for the InClusterIPPool CRD at start: install before deploy-dev, or restart the provider after.
+.PHONY: incluster-up
+incluster-up: $(CLUSTERCTL) ## Install cluster-api-ipam-provider-in-cluster INCLUSTER_VERSION into kind, unless its CRD is there
+	kubectl get crd inclusterippools.ipam.cluster.x-k8s.io >/dev/null 2>&1 || $(CLUSTERCTL) init --config hack/dev/clusterctl.yaml --ipam in-cluster:$(INCLUSTER_VERSION) --wait-providers
 
 .PHONY: kind-down
 kind-down: ## Delete the kind cluster
@@ -280,7 +288,7 @@ vcsim-up: $(CLUSTERCTL) $(KUSTOMIZE) ## Install CAPV and its vcsim controller (a
 	CLUSTERCTL=$(CLUSTERCTL) KUSTOMIZE=$(KUSTOMIZE) KIND_CLUSTER=$(KIND_CLUSTER) hack/dev/vcsim.sh up
 
 .PHONY: vcsim-cluster
-vcsim-cluster: $(CLUSTERCTL) ## Create the CAPV cluster NAME (default vc) on vcsim, machine addresses from NetBox
+vcsim-cluster: $(CLUSTERCTL) ## Create the CAPV cluster NAME (default vc) on vcsim, machine addresses from NetBox; ALLOCATOR=InCluster from InClusterIPPools
 	CLUSTERCTL=$(CLUSTERCTL) hack/dev/vcsim.sh cluster $(or $(NAME),vc)
 
 .PHONY: vcsim-delete

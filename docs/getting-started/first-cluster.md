@@ -6,7 +6,7 @@ You need the provider [installed](install.md), a parent prefix in NetBox (here `
 
 ## Steps
 
-1. **Plan the subnet.** One /26 per cluster, split into pools: control plane (6 addresses), ingress (8) and workers (the rest). A range is given as offsets from the first address of the prefix; a negative offset counts back from the last one (`-1`). The network address and the gateway of the L2 network are never handed out: a range that covers them is `InvalidRange`, and in the first /26 of the parent they are offsets 0 and 1. The ranges here start at 2, which is valid wherever the /26 is carved.
+1. **Plan the subnet.** One /26 per cluster, split into pools: control plane (6 addresses) and workers (the rest). Give only the sizes: the network places the pools from the start of its prefix on free addresses, past the network address and gateway of the L2 network and anything NetBox already holds ([Layout](../guides/networks.md#layout)).
 
 2. **Create the network and the pools** in the namespace of the Cluster `demo`:
 
@@ -19,19 +19,22 @@ You need the provider [installed](install.md), a parent prefix in NetBox (here `
      parentPrefix: 10.10.0.0/22
      gateway: 10.10.0.1
      prefixLength: 26
+     pools:
+     - {name: cp, size: 6}
+     - {name: workers, size: rest}
    ---
    apiVersion: ipam.cluster.x-k8s.io/v1alpha1
    kind: NetBoxIPPool
    metadata: {name: demo-cp, namespace: demo, labels: {cluster.x-k8s.io/cluster-name: demo}}
-   spec: {ranges: [{networkName: demo, start: 2, end: 7}]}
+   spec: {ranges: [{networkName: demo, pool: cp}]}
    ---
    apiVersion: ipam.cluster.x-k8s.io/v1alpha1
    kind: NetBoxIPPool
    metadata: {name: demo-workers, namespace: demo, labels: {cluster.x-k8s.io/cluster-name: demo}}
-   spec: {ranges: [{networkName: demo, start: 16, end: -3}]}
+   spec: {ranges: [{networkName: demo, pool: workers}]}
    ```
 
-   Label every pool with `cluster.x-k8s.io/cluster-name` so that pausing the Cluster pauses the pool. The order in which you apply the manifests, and the Cluster, does not matter: a network whose Cluster does not exist yet waits (`WaitingForCluster`) and touches nothing in NetBox. The whole scheme, with ingress and MetalLB pools and the VIP, is [`docs/examples/network-scheme.yaml`](../examples/network-scheme.yaml); it is explained in [Pools](../guides/pools.md#example-network-scheme).
+   Label every pool with `cluster.x-k8s.io/cluster-name` so that pausing the Cluster pauses the pool. The order in which you apply the manifests, and the Cluster, does not matter: a network whose Cluster does not exist yet waits (`WaitingForCluster`) and touches nothing in NetBox. The whole scheme, with an ingress pool and the VIP, is [`docs/examples/network-scheme.yaml`](../examples/network-scheme.yaml); it is explained in [Pools](../guides/pools.md#example-network-scheme).
 
    If your zone is fenced by an owner or a tenant, or you want them on the NetBox objects, add `spec.owner` and `spec.tenant` to the network ([Networks](../guides/networks.md#owner-and-tenant)).
 
@@ -67,9 +70,9 @@ kubectl -n demo get netboxippool demo-workers -o jsonpath='{.status.ranges}'
 
 Use the full resource names: in Kubernetes 1.33 and later the plain name `ipaddresses` resolves to `networking.k8s.io`.
 
-- The network is `Ready=True` and shows its prefix; each pool is `Ready=True` with its total, used and free addresses.
+- The network is `Ready=True` and shows its prefix, `LayoutReady=True` with the ranges of each pool in `status.layout`; each `NetBoxIPPool` is `Ready=True` with its total, used and free addresses.
 - Each machine has an `IPAddressClaim` with `status.addressRef`, and an `IPAddress` with the address, the mask of the L2 network and the gateway.
-- In NetBox, the prefix, one IP range per pool range and one IP address per machine exist, each with the key in the key field, a description and comments, the owner and tenant if you set them, and a changelog message that starts with `capi:`. Find the prefix by its id:
+- In NetBox, the prefix, the IP ranges of the pools and one IP address per machine exist, each with the key in the key field, a description and comments, the owner and tenant if you set them, and a changelog message that starts with `capi:`. Find the prefix by its id:
 
   ```bash
   id=$(kubectl -n demo get netboxnetwork demo -o jsonpath='{.status.prefixID}')

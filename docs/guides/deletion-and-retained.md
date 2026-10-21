@@ -4,17 +4,19 @@ Goal: know what stays in NetBox when a network, a pool or a claim goes, and remo
 
 ## What happens on deletion
 
-`deletionPolicy` of the network decides the fate of its prefix, the pool ranges inside it and the VIP:
+`deletionPolicy` of the network decides the fate of its prefix, the ranges of its pools, its reserved addresses and the VIP:
 
 | NetBox object | `Retain` (default) | `Delete` |
 |---|---|---|
 | prefix, carved by the provider | marked `deprecated`; reclaimed when a network of the same name is created again | deleted |
 | prefix, adopted with `spec.prefix` | only released: the key is removed, everything else stays | not allowed for an adopted prefix (the CRD rejects it) |
-| IP ranges of the pools in the network | marked `deprecated` when the pool releases them | deleted |
+| IP ranges of the pools of the network | marked `deprecated` and closed to allocation (`mark_populated`) | deleted |
 | VIP | marked `deprecated`, taken back when the network is created again | deleted |
+| reserved addresses (`spec.addresses`) | marked `deprecated`, taken back when the network is created again | deleted |
 | IP address of a claim | always deleted with the claim | always deleted with the claim |
+| synced address of an `IPAddress` ([`sync`](in-cluster.md#addresses-of-the-machines-in-netbox)) | always deleted, with the `IPAddress` or the network | always deleted, with the `IPAddress` or the network |
 
-- **Order.** Pool ranges follow the policy when their pool releases them, because the range was removed or the pool deleted. The network itself is deleted only after those pools (`WaitingForPools`). A pool being deleted waits while addresses are allocated from it (`WaitingForAddresses`). A claim waits for the finalizers of the infrastructure provider and for `addressReuseGracePeriodSeconds`.
+- **Order.** The network is deleted only after the `NetBoxIPPool`s that take its pools (`WaitingForPools`); then it releases the ranges of its pools, the prefix, the VIP and the reserved addresses. A range of a pool that changes or leaves `spec.pools`, and a reserved address a smaller `count` or a removed group gives up, are deleted whatever the policy. A pool being deleted waits while addresses are allocated from it (`WaitingForAddresses`). A claim waits for the finalizers of the infrastructure provider and for `addressReuseGracePeriodSeconds`.
 - **An adopted prefix** is released, not removed: its key is cleared, everything else, tags, custom fields, owner, tenant and description included, stays; its pool ranges are deprecated. That holds for a prefix the provider created because none existed: it stays active with its description and needs manual cleanup in NetBox. The prefix is found in NetBox by the provider's key, not by the status.
 - **The VIP and `Delete`.** The network waits (`WaitingForCluster`) while the Cluster still has the VIP as its endpoint host, so that the address does not go to another cluster that is still served on it.
 - **Move.** An object deleted for `clusterctl move` (annotation `clusterctl.cluster.x-k8s.io/delete-for-move`) releases nothing ([clusterctl move and pivot](move-and-pivot.md)).
@@ -22,15 +24,15 @@ Goal: know what stays in NetBox when a network, a pool or a claim goes, and remo
 
 ## Permissions
 
-Delete on `ipam.prefix` and `ipam.iprange` is needed only with `deletionPolicy: Delete`, and on ranges to delete deprecated ranges of the provider that are in the way of a new or resized range (without it the pool reports `Forbidden` until the deprecated range is deleted in NetBox). Addresses of deleted claims are always deleted.
+Delete on `ipam.prefix` is needed only with `deletionPolicy: Delete`. Delete on `ipam.iprange` is needed with `Delete`, when the layout of a network changes (a range of a pool that moved or left `spec.pools`), for ranges a deleted network of the same name retained, and for deprecated ranges of the provider in the way of a new or resized range; without it the network reports `Forbidden` on `LayoutReady`. Addresses of deleted claims are always deleted.
 
-For production, grant no delete on `ipam.prefix` and `ipam.iprange` and keep `deletionPolicy: Retain`. A network with `deletionPolicy: Delete`, or a pool with a range in such a network, then keeps its finalizer on deletion and reports `Forbidden` until an admin removes its NetBox objects or the policy is set to `Retain`. A claim stuck in deletion, for example without delete on `ipam.ipaddress`, is `ReleaseFailed`. See [NetBox access](../getting-started/netbox-access.md#permissions).
+For production, grant no delete on `ipam.prefix` and `ipam.iprange` and keep `deletionPolicy: Retain`. A network with `deletionPolicy: Delete` then keeps its finalizer on deletion and reports `Forbidden` until an admin removes its NetBox objects or the policy is set to `Retain`. A claim stuck in deletion, for example without delete on `ipam.ipaddress`, is `ReleaseFailed`. See [NetBox access](../getting-started/netbox-access.md#permissions).
 
 ## Retained objects
 
-`deletionPolicy: Retain` leaves the prefix the provider created, the pool IP ranges and the VIP of a deleted cluster in NetBox as `deprecated`. A prefix taken with `spec.prefix` is only released and stays active; its ranges and the VIP become deprecated. Deprecated objects still take their space in the parent; creating the same network again takes them back.
+`deletionPolicy: Retain` leaves the prefix the provider created, the pool IP ranges, the reserved addresses and the VIP of a deleted cluster in NetBox as `deprecated`. A prefix taken with `spec.prefix` is only released and stays active; its ranges, reserved addresses and the VIP become deprecated. Deprecated objects still take their space in the parent; creating the same network again takes the prefix, the VIP and the reserved addresses back (at their addresses, when they lie in the prefix), deletes its retained ranges and places its pools anew.
 
-If a network of the same name is created again with a spec the retained prefix does not fit (another `prefixLength` or `spec.prefix`, or a prefix outside the `parentPrefix`), the retained prefix is not taken back: its key becomes `<key>/retired`, a new prefix is carved or `spec.prefix` adopted, and the network records `PrefixRetired`. A retained VIP outside the new prefix is retired the same way (`VIPRetired`, its key becomes `<key>/vip/retired`) and a new VIP reserved. Retired objects stay `deprecated` and keep their space like other retained ones. Objects in NetBox whose key ends in `/retired` are these.
+If a network of the same name is created again with a spec the retained prefix does not fit (another `prefixLength` or `spec.prefix`, or a prefix outside the `parentPrefix`), the retained prefix is not taken back: its key becomes `<key>/retired`, a new prefix is carved or `spec.prefix` adopted, and the network records `PrefixRetired`. A retained VIP outside the new prefix is retired the same way (`VIPRetired`, its key becomes `<key>/vip/retired`) and a new VIP reserved; so is a retained reserved address outside it (`ReserveRetired`, `<key>/addresses/<group>/<index>/retired`), and a new one is reserved in the new prefix. Retired objects stay `deprecated` and keep their space like other retained ones. Objects in NetBox whose key ends in `/retired` are these.
 
 To remove retained objects, run the cleanup script. For clusters where space matters more than protection, use `deletionPolicy: Delete`.
 
@@ -46,7 +48,7 @@ hack/netbox-cleanup-retained.sh <namespace> --yes    # deletes it
 
 | Option | Meaning |
 |---|---|
-| `<namespace>` | the namespace of the deleted networks and pools; required |
+| `<namespace>` | the namespace of the deleted networks; required |
 | `--instance <name>` | the instance name of the provider (`NETBOX_INSTANCE`); keep only keys that start with it. Without it only keys without an instance match |
 | `--ref-field <field>` | the text custom field of the key, as `NETBOX_REF_FIELD`; default `capi_ref` |
 | `--yes` | delete; without it the script only lists |
@@ -58,7 +60,7 @@ hack/netbox-cleanup-retained.sh <namespace> --yes    # deletes it
   ```
 
 - The listing starts with the effective scope: the namespace, the field, the instance and the status. Owner and tenant are not filtered.
-- Only `deprecated` objects whose key is `[<instance>/]<Kind>/<namespace>/...` are touched: the VIP (role `vip`), ranges and prefix, retired ones included; active objects, other namespaces and other instances stay.
+- Only `deprecated` objects whose key is `[<instance>/]<Kind>/<namespace>/...` are touched: the VIP, reserved addresses, ranges and prefix, retired ones included; active objects, other namespaces and other instances stay.
 - Run it when the namespace has no networks left: a live network's adopted prefix that an admin keeps `deprecated` carries a key of the namespace too.
 - Each object is read for its `ETag` and deleted with `If-Match`, which NetBox checks, so one changed meanwhile stays; one no longer `deprecated` or no longer under the listed key when read is skipped; only HTTP 204 counts as deleted, and any other answer stops the script with its body on a line of its own.
 

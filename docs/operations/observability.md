@@ -38,13 +38,16 @@ Changes of the kinds below are recorded as Normal Events on the object that caus
 | | `PrefixReleased` | the prefix was deleted, deprecated or let go on deletion of the network (`deletionPolicy`) |
 | | `PrefixRetired` | a retained prefix that did not fit the spec got the key `<ref>/retired` ([Deletion and retained objects](../guides/deletion-and-retained.md#retained-objects)) |
 | | `VIPReserved` | the VIP was created in NetBox |
+| | `VIPAdopted` | a NetBox address without a key at the Cluster's endpoint became the VIP ([Control-plane VIP](../guides/control-plane-vip.md#a-running-cluster)) |
+| | `ReserveAdopted` | a NetBox address without a key became a reserved address of a group |
+| | `PoolAdopted` | an `InClusterIPPool` without a controller of the name of a pool was taken over ([In-cluster allocator](../guides/in-cluster.md)) |
 | | `VIPReleased` | the VIP was deleted or deprecated on deletion of the network |
 | | `VIPRetired` | a retained VIP outside the new prefix got the key `<ref>/vip/retired` |
 | | `VIPDeleted` | the provider deleted its new VIP because an older NetBox address held its address too ([Troubleshooting](troubleshooting.md)) |
-| `NetBoxIPPool` | `RangeCreated` | a range was created in NetBox |
-| | `RangeUpdated` | a range was resized, or a deprecated range of the pool was taken back |
-| | `RangeReleased` | a range was deleted or deprecated by `deletionPolicy`, or a deprecated range in the way was deleted |
-| `NetBoxNetwork`, `NetBoxIPPool`, `IPAddressClaim` | `AttributesSynced` | the owner, tenant, description or comments of an existing NetBox object (the prefix or VIP of the network, a range of the pool, the address of the claim) were changed to the spec |
+| | `RangeCreated` | a range of a pool was created in NetBox |
+| | `RangeUpdated` | a range of a pool was resized or moved, or opened to allocation again |
+| | `RangeReleased` | a range of a pool was deleted (its pool changed or left `spec.pools`, or a deprecated range was in the way) or released by `deletionPolicy` |
+| `NetBoxNetwork`, `IPAddressClaim` | `AttributesSynced` | the owner, tenant, description or comments of an existing NetBox object (the prefix, VIP or a range of the network, the address of the claim) were changed to the spec |
 | `IPAddressClaim` | `AddressRestored` | an address deleted in NetBox by hand was created again |
 | | `AddressHandedBack` | an address deleted in NetBox by hand, which NetBox offered to a new claim, went back to the claim that holds it; the new claim takes the next one |
 | | `AddressReleased` | the address was deleted from NetBox with the claim |

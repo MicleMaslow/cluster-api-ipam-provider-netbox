@@ -27,6 +27,7 @@ import (
 
 	"k8s.io/apimachinery/pkg/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	inclusterv1 "sigs.k8s.io/cluster-api-ipam-provider-in-cluster/api/v1alpha2"
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	ipamv1 "sigs.k8s.io/cluster-api/api/ipam/v1beta2"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -68,6 +69,7 @@ func run(m *testing.M) int {
 			filepath.Join(crds, "cluster.x-k8s.io_clusters.yaml"),
 			filepath.Join(crds, "ipam.cluster.x-k8s.io_ipaddressclaims.yaml"),
 			filepath.Join(crds, "ipam.cluster.x-k8s.io_ipaddresses.yaml"),
+			filepath.Join(os.Getenv("INCLUSTER_CRDS"), "ipam.cluster.x-k8s.io_inclusterippools.yaml"),
 		},
 		ErrorIfCRDPathMissing: true,
 	}
@@ -78,7 +80,7 @@ func run(m *testing.M) int {
 	defer func() { _ = env.Stop() }()
 
 	scheme := runtime.NewScheme()
-	for _, add := range []func(*runtime.Scheme) error{clientgoscheme.AddToScheme, v1alpha1.AddToScheme, clusterv1.AddToScheme, ipamv1.AddToScheme} {
+	for _, add := range []func(*runtime.Scheme) error{clientgoscheme.AddToScheme, v1alpha1.AddToScheme, clusterv1.AddToScheme, ipamv1.AddToScheme, inclusterv1.AddToScheme} {
 		if err := add(scheme); err != nil {
 			panic(err)
 		}

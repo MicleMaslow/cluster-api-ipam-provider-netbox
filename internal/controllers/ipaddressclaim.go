@@ -29,6 +29,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/tools/events"
 	"k8s.io/klog/v2"
 	"k8s.io/utils/ptr"
@@ -69,6 +70,26 @@ type ProviderAdapter struct {
 }
 
 var _ ipamutil.ProviderAdapter = &ProviderAdapter{}
+
+// newClaimReconciler is ipamutil's claim reconciler over the claims of NetBoxIPPools.
+func newClaimReconciler(c client.Client, scheme *runtime.Scheme, watchFilter string, a *ProviderAdapter) *ipamutil.ClaimReconciler {
+	return &ipamutil.ClaimReconciler{Client: ownClaims{c}, Scheme: scheme, WatchFilterValue: watchFilter, Adapter: a}
+}
+
+// ownClaims reads a claim of another pool kind as not found, so ipamutil leaves it to its provider.
+// ipamutil's Cluster watch queues every claim of a cluster: it would add its finalizer to such a claim and, once
+// the claim is deleting, release it through this provider, ahead of its own provider's grace period.
+type ownClaims struct{ client.Client }
+
+func (c ownClaims) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	if err := c.Client.Get(ctx, key, obj, opts...); err != nil {
+		return err
+	}
+	if claim, ok := obj.(*ipamv1.IPAddressClaim); ok && poolRefName(claim.Spec.PoolRef) == nil {
+		return apierrors.NewNotFound(ipamv1.GroupVersion.WithResource("ipaddressclaims").GroupResource(), key.Name)
+	}
+	return nil
+}
 
 // +kubebuilder:rbac:groups=ipam.cluster.x-k8s.io,resources=ipaddressclaims,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups=ipam.cluster.x-k8s.io,resources=ipaddressclaims/status;ipaddressclaims/finalizers,verbs=get;update;patch

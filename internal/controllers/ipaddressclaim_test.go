@@ -62,7 +62,7 @@ func testHandler(url string, rangeIDs ...int64) *claimHandler {
 		pool.Status.Ranges = append(pool.Status.Ranges, v1alpha1.IPPoolRangeStatus{NetworkName: "default", ID: id, StartAddress: "10.10.1.20", EndAddress: "10.10.1.29", Ready: true})
 	}
 	pool.Namespace, pool.Name = "ns", "worker"
-	pool.Spec.Ranges = []v1alpha1.IPPoolRange{{NetworkName: "default", Start: 20, End: 29}}
+	pool.Spec.Ranges = []v1alpha1.IPPoolRange{{NetworkName: "default", Pool: "workers"}}
 	return &claimHandler{
 		ProviderAdapter: &ProviderAdapter{Client: claimClient(claimNetwork()), NetBox: &netbox.Client{URL: url, Token: "t"}, Keys: netbox.DefaultKeys, Recorder: events.NewFakeRecorder(10)},
 		claim:           &ipamv1.IPAddressClaim{ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "m1"}, Spec: ipamv1.IPAddressClaimSpec{ClusterName: "c1"}},
@@ -754,7 +754,7 @@ func TestNetworkAttrsWakeClaims(t *testing.T) {
 	scheme := runtime.NewScheme()
 	utilruntime.Must(v1alpha1.AddToScheme(scheme))
 	utilruntime.Must(ipamv1.AddToScheme(scheme))
-	in, out := newPool("ns", "worker", v1alpha1.IPPoolRange{NetworkName: "default"}), newPool("ns", "other", v1alpha1.IPPoolRange{NetworkName: "other"})
+	in, out := newPool("ns", "worker", v1alpha1.IPPoolRange{NetworkName: "default", Pool: "cp"}), newPool("ns", "other", v1alpha1.IPPoolRange{NetworkName: "other", Pool: "cp"})
 	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(in, out, newClaim("ns", "m1", "worker"), newClaim("ns", "m2", "other")).
 		WithIndex(&ipamv1.IPAddressClaim{}, poolRefField, func(o client.Object) []string {
 			claim, ok := asType[*ipamv1.IPAddressClaim](ctx, o)
@@ -953,6 +953,53 @@ func TestFetchPoolReportsMissingPool(t *testing.T) {
 	}
 }
 
+// TestForeignClaimsLeftAlone reconciles claims of an InClusterIPPool, as ipamutil's Cluster watch queues them:
+// a live one and a deleting one keep their finalizers and status, the IPAddress stays and NetBox is not called.
+func TestForeignClaimsLeftAlone(t *testing.T) {
+	g := NewWithT(t)
+	nb := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("NetBox called: %s %s", r.Method, r.URL)
+		http.Error(w, "unexpected", http.StatusInternalServerError)
+	}))
+	defer nb.Close()
+	ref := ipamv1.IPPoolReference{APIGroup: "ipam.cluster.x-k8s.io", Kind: "InClusterIPPool", Name: "c1-workers"}
+	cluster := &clusterv1.Cluster{ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "c1"}}
+	live := &ipamv1.IPAddressClaim{ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "live"}, Spec: ipamv1.IPAddressClaimSpec{ClusterName: "c1", PoolRef: ref}}
+	// The Cluster is gone, as after its deletion: ipamutil proceeds with the claim's deletion.
+	deleting := &ipamv1.IPAddressClaim{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "deleting", DeletionTimestamp: &metav1.Time{Time: time.Now()}, Finalizers: []string{ipamutil.ReleaseAddressFinalizer}},
+		Spec:       ipamv1.IPAddressClaimSpec{ClusterName: "gone", PoolRef: ref},
+	}
+	addr := &ipamv1.IPAddress{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "deleting", Finalizers: []string{ipamutil.ProtectAddressFinalizer}},
+		Spec:       ipamv1.IPAddressSpec{Address: "10.10.1.70", ClaimRef: ipamv1.IPAddressClaimReference{Name: "deleting"}, PoolRef: ref},
+	}
+	scheme := runtime.NewScheme()
+	utilruntime.Must(clusterv1.AddToScheme(scheme))
+	utilruntime.Must(ipamv1.AddToScheme(scheme))
+	utilruntime.Must(v1alpha1.AddToScheme(scheme))
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(cluster, live, deleting, addr).WithStatusSubresource(&ipamv1.IPAddressClaim{}).Build()
+	r := newClaimReconciler(c, scheme, "", &ProviderAdapter{Client: c, NetBox: &netbox.Client{URL: nb.URL, Token: "t"}, Keys: netbox.DefaultKeys, Recorder: events.NewFakeRecorder(10)})
+
+	for _, claim := range []*ipamv1.IPAddressClaim{live, deleting} {
+		key := client.ObjectKeyFromObject(claim)
+		before := &ipamv1.IPAddressClaim{}
+		g.Expect(c.Get(ctx, key, before)).To(Succeed())
+		for range 2 { // ipamutil's first pass on a claim only adds its finalizer
+			_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+			g.Expect(err).NotTo(HaveOccurred(), key.Name)
+		}
+		after := &ipamv1.IPAddressClaim{}
+		g.Expect(c.Get(ctx, key, after)).To(Succeed(), key.Name)
+		g.Expect(after.ResourceVersion).To(Equal(before.ResourceVersion), key.Name)
+		g.Expect(after.Finalizers).To(Equal(before.Finalizers), key.Name)
+		g.Expect(after.Status.Conditions).To(BeEmpty(), key.Name)
+	}
+	got := &ipamv1.IPAddress{}
+	g.Expect(c.Get(ctx, client.ObjectKeyFromObject(addr), got)).To(Succeed())
+	g.Expect(got.Finalizers).To(ConsistOf(ipamutil.ProtectAddressFinalizer))
+}
+
 func newClaim(ns, name, pool string) *ipamv1.IPAddressClaim {
 	return &ipamv1.IPAddressClaim{
 		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: name},
@@ -963,12 +1010,12 @@ func newClaim(ns, name, pool string) *ipamv1.IPAddressClaim {
 	}
 }
 
-// readyPool creates network "default" (/28) and pool "worker" over it and waits for both.
-func readyPool(g *WithT, ns string, ranges ...v1alpha1.IPPoolRange) (*v1alpha1.NetBoxNetwork, *v1alpha1.NetBoxIPPool) {
-	nw := newNetwork(ns, "default")
-	g.Expect(k8s.Create(ctx, nw)).To(Succeed())
-	waitReady(g, nw)
-	pool := newPool(ns, "worker", ranges...)
+// readyPool creates network "default" (/28) laid out as cp size, workers rest, and pool "worker" on cp, and waits for both.
+func readyPool(g *WithT, ns string, size int32) (*v1alpha1.NetBoxNetwork, *v1alpha1.NetBoxIPPool) {
+	nw := layoutNetwork(ns, "default")
+	nw.Spec.Pools[0] = netPool("cp", size)
+	readyLayout(g, nw)
+	pool := newPool(ns, "worker", v1alpha1.IPPoolRange{NetworkName: "default", Pool: "cp"})
 	g.Expect(k8s.Create(ctx, pool)).To(Succeed())
 	waitReady(g, pool)
 	return nw, pool
@@ -989,13 +1036,13 @@ func noAddress(claim *ipamv1.IPAddressClaim) func() bool {
 func TestClaimGetsAddress(t *testing.T) {
 	g := newG(t)
 	ns := newEnv(t, nil)
-	nw, pool := readyPool(g, ns, v1alpha1.IPPoolRange{NetworkName: "default", Start: 2, End: 4})
+	nw, pool := readyPool(g, ns, 3)
 	claim := newClaim(ns, "m1", "worker")
 	g.Expect(k8s.Create(ctx, claim)).To(Succeed())
 
 	a := address(g, claim)
 	p := netip.MustParsePrefix(nw.Status.Prefix)
-	g.Expect([]string{addr(p, 2), addr(p, 3), addr(p, 4)}).To(ContainElement(a.Spec.Address))
+	g.Expect([]string{addr(p, 0), addr(p, 1), addr(p, 2)}).To(ContainElement(a.Spec.Address))
 	g.Expect(*a.Spec.Prefix).To(Equal(int32(22)))
 	g.Expect(a.Spec.Gateway).To(Equal("10.10.0.1"))
 	g.Eventually(func() string {
@@ -1021,7 +1068,7 @@ func TestClaimGetsAddress(t *testing.T) {
 func TestClaimAllocatesThroughReadOnlyPass(t *testing.T) {
 	g := newG(t)
 	ns := newEnv(t, nil)
-	readyPool(g, ns, v1alpha1.IPPoolRange{NetworkName: "default", Start: 2, End: 4})
+	readyPool(g, ns, 3)
 	claim := newClaim(ns, "m1", "worker")
 	g.Expect(k8s.Create(ctx, claim)).To(Succeed())
 
@@ -1044,7 +1091,7 @@ func TestClaimAllocatesThroughReadOnlyPass(t *testing.T) {
 func TestClaimReleaseDeletesNetBoxAddress(t *testing.T) {
 	g := newG(t)
 	ns := newEnv(t, nil)
-	readyPool(g, ns, v1alpha1.IPPoolRange{NetworkName: "default", Start: 2, End: 4})
+	readyPool(g, ns, 3)
 	claim := newClaim(ns, "m1", "worker")
 	g.Expect(k8s.Create(ctx, claim)).To(Succeed())
 	address(g, claim)
@@ -1097,7 +1144,7 @@ func TestReleaseWaitsForForeignFinalizers(t *testing.T) {
 func TestReleaseGracePeriod(t *testing.T) {
 	g := newG(t)
 	ns := newEnv(t, nil)
-	_, pool := readyPool(g, ns, v1alpha1.IPPoolRange{NetworkName: "default", Start: 2, End: 4})
+	_, pool := readyPool(g, ns, 3)
 	setGrace(g, pool, 5)
 	m1 := newClaim(ns, "m1", "worker")
 	g.Expect(k8s.Create(ctx, m1)).To(Succeed())
@@ -1124,7 +1171,7 @@ func TestReleaseGracePeriod(t *testing.T) {
 func TestReleaseGraceSkippedForDeletingPool(t *testing.T) {
 	g := newG(t)
 	ns := newEnv(t, nil)
-	_, pool := readyPool(g, ns, v1alpha1.IPPoolRange{NetworkName: "default", Start: 2, End: 4})
+	_, pool := readyPool(g, ns, 3)
 	setGrace(g, pool, 300)
 	m1, m2 := newClaim(ns, "m1", "worker"), newClaim(ns, "m2", "worker")
 	g.Expect(k8s.Create(ctx, m1)).To(Succeed())
@@ -1146,7 +1193,7 @@ func TestReleaseGraceSkippedForDeletingPool(t *testing.T) {
 func TestClaimWaitsForFreeAddress(t *testing.T) {
 	g := newG(t)
 	ns := newEnv(t, nil)
-	readyPool(g, ns, v1alpha1.IPPoolRange{NetworkName: "default", Start: 2, End: 2})
+	readyPool(g, ns, 1)
 	m1 := newClaim(ns, "m1", "worker")
 	g.Expect(k8s.Create(ctx, m1)).To(Succeed())
 	first := address(g, m1)
@@ -1169,17 +1216,17 @@ func claimReady(g *WithT, claim *ipamv1.IPAddressClaim) string {
 func TestClaimReusesNetBoxAddressAfterCrash(t *testing.T) {
 	g := newG(t)
 	ns := newEnv(t, nil)
-	nw, _ := readyPool(g, ns, v1alpha1.IPPoolRange{NetworkName: "default", Start: 2, End: 4})
+	nw, _ := readyPool(g, ns, 3)
 	p := netip.MustParsePrefix(nw.Status.Prefix)
 	ref := refOf("IPAddressClaim", ns, "m1")
 	_, err := admin.Create(ctx, netbox.IPAddresses, map[string]any{
-		"address": addr(p, 4) + "/22", "status": "active", "custom_fields": map[string]any{keys.Ref: ref},
+		"address": addr(p, 2) + "/22", "status": "active", "custom_fields": map[string]any{keys.Ref: ref},
 	})
 	g.Expect(err).NotTo(HaveOccurred())
 
 	claim := newClaim(ns, "m1", "worker")
 	g.Expect(k8s.Create(ctx, claim)).To(Succeed())
-	g.Expect(address(g, claim).Spec.Address).To(Equal(addr(p, 4)))
+	g.Expect(address(g, claim).Spec.Address).To(Equal(addr(p, 2)))
 	g.Expect(findRef(netbox.IPAddresses, ref)).To(HaveLen(1))
 }
 
@@ -1192,7 +1239,7 @@ func ownedIPs(ns, name string) func() ([]netbox.Object, error) {
 
 // allocatedClaim creates a claim and waits until it holds an address and is Ready.
 func allocatedClaim(g *WithT, ns string) (*ipamv1.IPAddressClaim, netbox.Object) {
-	readyPool(g, ns, v1alpha1.IPPoolRange{NetworkName: "default", Start: 2, End: 4})
+	readyPool(g, ns, 3)
 	claim := newClaim(ns, "m1", "worker")
 	g.Expect(k8s.Create(ctx, claim)).To(Succeed())
 	address(g, claim)
@@ -1290,7 +1337,7 @@ func TestClaimDoesNotTakeDeletedAddress(t *testing.T) {
 func TestClaimSkipsPausedCluster(t *testing.T) {
 	g := newG(t)
 	ns := newEnv(t, nil)
-	readyPool(g, ns, v1alpha1.IPPoolRange{NetworkName: "default", Start: 2, End: 4})
+	readyPool(g, ns, 3)
 	setPaused(t, ns, true)
 	claim := newClaim(ns, "m1", "worker")
 	g.Expect(k8s.Create(ctx, claim)).To(Succeed())
@@ -1316,14 +1363,12 @@ func setAnnotation(g *WithT, obj client.Object, key string, on bool) {
 func TestPausedClaimSkipped(t *testing.T) {
 	g := newG(t)
 	ns := newEnv(t, nil)
-	nw := newNetwork(ns, "default")
-	g.Expect(k8s.Create(ctx, nw)).To(Succeed())
-	waitReady(g, nw)
+	readyLayout(g, layoutNetwork(ns, "default"))
 	claim := newClaim(ns, "m1", "worker")
 	claim.Annotations = map[string]string{clusterv1.PausedAnnotation: ""}
 	g.Expect(k8s.Create(ctx, claim)).To(Succeed())
 
-	pool := newPool(ns, "worker", v1alpha1.IPPoolRange{NetworkName: "default", Start: 2, End: 4})
+	pool := newPool(ns, "worker", v1alpha1.IPPoolRange{NetworkName: "default", Pool: "cp"})
 	g.Expect(k8s.Create(ctx, pool)).To(Succeed())
 	waitReady(g, pool)
 	g.Consistently(noAddress(claim)).Should(BeTrue())
@@ -1337,7 +1382,7 @@ func TestPausedClaimSkipped(t *testing.T) {
 func TestPoolUnpausedWakesClaims(t *testing.T) {
 	g := newG(t)
 	ns := newEnv(t, nil)
-	_, pool := readyPool(g, ns, v1alpha1.IPPoolRange{NetworkName: "default", Start: 2, End: 4})
+	_, pool := readyPool(g, ns, 3)
 	setAnnotation(g, pool, clusterv1.PausedAnnotation, true)
 	waitTypedCondition(g, pool, clusterv1.PausedCondition, metav1.ConditionTrue, clusterv1.PausedReason)
 	claim := newClaim(ns, "m1", "worker")
@@ -1352,7 +1397,7 @@ func TestPoolUnpausedWakesClaims(t *testing.T) {
 func TestClaimAddressFields(t *testing.T) {
 	g := newG(t)
 	ns := newEnv(t, nil)
-	readyPool(g, ns, v1alpha1.IPPoolRange{NetworkName: "default", Start: 2, End: 5})
+	readyPool(g, ns, 4)
 	node := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "node-a"}}
 	g.Expect(k8s.Create(ctx, node)).To(Succeed())
 	owned := newClaim(ns, "node-a-0-0", "worker")

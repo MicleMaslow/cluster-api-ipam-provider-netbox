@@ -71,9 +71,13 @@ Rules the provider checks at start; a violation is logged and ends the start wit
 | `--log-text-info-buffer-size`, `--log-text-split-stream`, `--log-json-info-buffer-size`, `--log-json-split-stream` | | alpha logging flags of Kubernetes (they need a feature gate this binary does not expose); `--help` describes them |
 | `--version` | | print the version and exit |
 
+## Optional dependency: in-cluster IPAM
+
+`allocator: InCluster` needs the `InClusterIPPool` CRD of cluster-api-ipam-provider-in-cluster. The provider looks for it once, at start, and watches `InClusterIPPool`s only when it is served; without it it logs `InClusterIPPool is not served: networks with allocator InCluster wait for cluster-api-ipam-provider-in-cluster and a restart`, and those networks report `AllocatorUnavailable`. Restart the provider after installing in-cluster ([Install](../getting-started/install.md#in-cluster-ipam)). The RBAC of the manifests covers `inclusterippools` in any case.
+
 ## What the Deployment fixes
 
-The manifests set `--leader-elect`, `--diagnostics-address=:8443`, `--health-addr=:9440` and the two flags `--instance-name` and `--netbox-ref-field`, and take `NETBOX_URL` and `NETBOX_TOKEN` from the Secret. One replica; requests 10m CPU and 64Mi memory, limit 256Mi memory; it runs as user and group 65530, non-root, with a read-only root filesystem, no privilege escalation, all capabilities dropped and the `RuntimeDefault` seccomp profile; it tolerates the control-plane taint. The ports are `healthz` (9440) and `metrics` (8443). The namespace enforces the `restricted` Pod Security level.
+The manifests set `--leader-elect`, `--diagnostics-address=:8443`, `--health-addr=:9440` and the two flags `--instance-name` and `--netbox-ref-field`, and take `NETBOX_URL` and `NETBOX_TOKEN` from the Secret. One replica; requests 10m CPU and 64Mi memory, limit 256Mi memory; it runs as user and group 65530, non-root, with a read-only root filesystem, no privilege escalation, all capabilities dropped and the `RuntimeDefault` seccomp profile; it tolerates the control-plane taint. The ports are `healthz` (9440) and `metrics` (8443). The namespace enforces the `restricted` Pod Security level. The ClusterRole allows `get`, `create`, `update` and `delete` on Secrets in every namespace, for `publish` ([Published addresses](../guides/networks.md#published-addresses)).
 
 To change another flag, patch the Deployment's args as in [Install](../getting-started/install.md#tls):
 

@@ -27,6 +27,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
@@ -90,11 +91,10 @@ func TestValidation(t *testing.T) {
 			"pool-with-prefix": {func(s *NetBoxNetworkSpec) {
 				s.PrefixLength, s.Prefix, s.IsPool = 0, "10.10.1.0/27", ptr.To(true)
 			}, "isPool needs prefixLength"},
-			"endpoint-port-too-big":        {func(s *NetBoxNetworkSpec) { s.ControlPlaneEndpoint = &ControlPlaneEndpoint{Port: 65536} }, "spec.controlPlaneEndpoint.port"},
-			"endpoint-port-negative":       {func(s *NetBoxNetworkSpec) { s.ControlPlaneEndpoint = &ControlPlaneEndpoint{Port: -1} }, "spec.controlPlaneEndpoint.port"},
-			"endpoint-dns-name-with-space": {func(s *NetBoxNetworkSpec) { s.ControlPlaneEndpoint = &ControlPlaneEndpoint{DNSName: "api cluster"} }, "spec.controlPlaneEndpoint.dnsName"},
+			"endpoint-port-too-big":  {func(s *NetBoxNetworkSpec) { s.ControlPlaneEndpoint = &ControlPlaneEndpoint{Port: 65536} }, "spec.controlPlaneEndpoint.port"},
+			"endpoint-port-negative": {func(s *NetBoxNetworkSpec) { s.ControlPlaneEndpoint = &ControlPlaneEndpoint{Port: -1} }, "spec.controlPlaneEndpoint.port"},
 			"endpoint-dns-name-too-long": {func(s *NetBoxNetworkSpec) {
-				s.ControlPlaneEndpoint = &ControlPlaneEndpoint{DNSName: strings.Repeat("a", 256)}
+				s.ControlPlaneEndpoint = &ControlPlaneEndpoint{DNSName: strings.Repeat("a", 1025)}
 			}, "spec.controlPlaneEndpoint.dnsName"},
 			"prefix-outside-parent":           {func(s *NetBoxNetworkSpec) { s.PrefixLength, s.Prefix = 0, "10.20.1.0/27" }, "prefix must be inside parentPrefix"},
 			"prefix-ipv6-in-ipv4-parent":      {func(s *NetBoxNetworkSpec) { s.PrefixLength, s.Prefix = 0, "fd00::/80" }, "prefix must be inside parentPrefix"},
@@ -148,6 +148,9 @@ func TestValidation(t *testing.T) {
 			},
 			"endpoint-dns-wildcard": func(s *NetBoxNetworkSpec) {
 				s.ControlPlaneEndpoint = &ControlPlaneEndpoint{DNSName: "*.cluster.example"}
+			},
+			"endpoint-dns-template": func(s *NetBoxNetworkSpec) {
+				s.ControlPlaneEndpoint = &ControlPlaneEndpoint{DNSName: "{{ .Cluster }}-controlplane.example.test"}
 			},
 			"owner-name-tenant-slug": func(s *NetBoxNetworkSpec) {
 				s.Owner, s.Tenant = &OwnerRef{Name: "zone-a-owner"}, &TenantRef{Slug: "platform"}
@@ -284,16 +287,109 @@ func TestValidation(t *testing.T) {
 		}
 	})
 
+	t.Run("network pools", func(t *testing.T) {
+		withPools := func(name string, pools ...NetworkPool) *NetBoxNetwork {
+			return network(name, func(s *NetBoxNetworkSpec) { s.Pools = pools })
+		}
+		if err := c.Create(ctx, withPools("pools-ok", NetworkPool{Name: "cp", Size: intstr.FromInt32(6)}, NetworkPool{Name: "workers", Size: intstr.FromString("rest")})); err != nil {
+			t.Errorf("size 6 and rest: %v", err)
+		}
+		for name, size := range map[string]intstr.IntOrString{
+			"zero": intstr.FromInt32(0), "negative": intstr.FromInt32(-1), "half": intstr.FromString("half"), "too-big": intstr.FromInt32(65536),
+		} {
+			wantErr(t, c.Create(ctx, withPools("size-"+name, NetworkPool{Name: "cp", Size: size})), "must be a positive number or rest")
+		}
+		rest := intstr.FromString("rest")
+		wantErr(t, c.Create(ctx, withPools("two-rest", NetworkPool{Name: "a", Size: rest}, NetworkPool{Name: "b", Size: rest})), "at most one pool of size rest")
+		wantErr(t, c.Create(ctx, withPools("upper-name", NetworkPool{Name: "CP", Size: rest})), "spec.pools[0].name")
+	})
+
+	t.Run("network allocator", func(t *testing.T) {
+		wantErr(t, c.Create(ctx, network("allocator-other", func(s *NetBoxNetworkSpec) { s.Allocator = "Other" })), "spec.allocator")
+		n := network("allocator-in-cluster", func(s *NetBoxNetworkSpec) { s.Allocator = AllocatorInCluster })
+		if err := c.Create(ctx, n); err != nil {
+			t.Fatal(err)
+		}
+		n.Spec.Allocator = AllocatorNetBox
+		wantErr(t, c.Update(ctx, n), "allocator is immutable")
+		n.Spec.Allocator = ""
+		wantErr(t, c.Update(ctx, n), "allocator cannot be added or removed")
+
+		n = network("allocator-unset", nil)
+		if err := c.Create(ctx, n); err != nil {
+			t.Fatal(err)
+		}
+		n.Spec.Allocator = AllocatorNetBox
+		wantErr(t, c.Update(ctx, n), "allocator cannot be added or removed")
+	})
+
+	t.Run("network address groups", func(t *testing.T) {
+		withGroups := func(name string, groups ...AddressGroup) *NetBoxNetwork {
+			return network(name, func(s *NetBoxNetworkSpec) {
+				s.Pools = []NetworkPool{{Name: "cp", Size: intstr.FromInt32(3)}, {Name: "workers", Size: intstr.FromString("rest")}}
+				s.Addresses = groups
+			})
+		}
+		if err := c.Create(ctx, withGroups("groups-ok", AddressGroup{Name: "metallb", Count: 64, DNSName: "{{ .Cluster }}-metallb-{{ .Index }}.example.test"}, AddressGroup{Name: "ingress", Count: 1})); err != nil {
+			t.Errorf("groups: %v", err)
+		}
+		for name, count := range map[string]int32{"zero": 0, "too-many": 65} {
+			wantErr(t, c.Create(ctx, withGroups("count-"+name, AddressGroup{Name: "metallb", Count: count})), "spec.addresses[0].count")
+		}
+		wantErr(t, c.Create(ctx, withGroups("pool-name", AddressGroup{Name: "workers", Count: 1})), "pool and address group names must differ")
+		wantErr(t, c.Create(ctx, withGroups("upper-name", AddressGroup{Name: "LB", Count: 1})), "spec.addresses[0].name")
+		wantErr(t, c.Create(ctx, withGroups("long-dns", AddressGroup{Name: "lb", Count: 1, DNSName: strings.Repeat("x", 1025)})), "spec.addresses[0].dnsName")
+	})
+
+	t.Run("network publish", func(t *testing.T) {
+		publishing := func(name string, p Publish) *NetBoxNetwork {
+			return network(name, func(s *NetBoxNetworkSpec) {
+				s.Pools = []NetworkPool{{Name: "cp", Size: intstr.FromInt32(3), Publish: p}, {Name: "workers", Size: intstr.FromString("rest")}}
+				s.Addresses = []AddressGroup{{Name: "metallb", Count: 2, Publish: p}}
+			})
+		}
+		for name, p := range map[string]Publish{
+			"enabled-with-name": {Enabled: ptr.To(true), SecretName: "cluster-endpoints.c1"},
+			"disabled":          {Enabled: ptr.To(false)},
+			"name-only":         {SecretName: "endpoints"},
+		} {
+			if err := c.Create(ctx, publishing("publish-ok-"+name, p)); err != nil {
+				t.Errorf("%s: %v", name, err)
+			}
+		}
+		wantErr(t, c.Create(ctx, publishing("publish-no-name", Publish{Enabled: ptr.To(true)})), "enabled needs secretName")
+		for name, secret := range map[string]string{"upper": "Endpoints", "underscore": "end_points", "dash-end": "endpoints-", "long": strings.Repeat("a", 254)} {
+			wantErr(t, c.Create(ctx, publishing("publish-secret-"+name, Publish{Enabled: ptr.To(true), SecretName: secret})), "secretName")
+		}
+	})
+
+	t.Run("network sync", func(t *testing.T) {
+		syncing := func(name string, allocator Allocator, s PoolSync) *NetBoxNetwork {
+			return network(name, func(spec *NetBoxNetworkSpec) {
+				spec.Allocator = allocator
+				spec.Pools = []NetworkPool{{Name: "cp", Size: intstr.FromInt32(3)}, {Name: "workers", Size: intstr.FromString("rest"), Sync: s}}
+			})
+		}
+		on := PoolSync{Enabled: ptr.To(true), IPAddress: IPAddressFields{DNSName: "{{ .Owner }}.nodes.example.test"}}
+		if err := c.Create(ctx, syncing("sync-in-cluster", AllocatorInCluster, on)); err != nil {
+			t.Errorf("sync with InCluster: %v", err)
+		}
+		if err := c.Create(ctx, syncing("sync-off-netbox", AllocatorNetBox, PoolSync{Enabled: ptr.To(false)})); err != nil {
+			t.Errorf("sync off with NetBox: %v", err)
+		}
+		wantErr(t, c.Create(ctx, syncing("sync-netbox", AllocatorNetBox, on)), "sync needs allocator InCluster")
+		wantErr(t, c.Create(ctx, syncing("sync-no-allocator", "", on)), "sync needs allocator InCluster")
+	})
+
 	t.Run("pool ranges", func(t *testing.T) {
 		pool := func(name string, ranges ...IPPoolRange) *NetBoxIPPool {
 			return &NetBoxIPPool{ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: name}, Spec: NetBoxIPPoolSpec{Ranges: ranges}}
 		}
-		a := IPPoolRange{NetworkName: "a", Start: 1, End: 6}
-		wantErr(t, c.Create(ctx, pool("dup", a, a)), "one range per network")
-		wantErr(t, c.Create(ctx, pool("reversed", IPPoolRange{NetworkName: "a", Start: 5, End: 2})), "start must not be after end")
-		wantErr(t, c.Create(ctx, pool("reversed-neg", IPPoolRange{NetworkName: "a", Start: -2, End: -5})), "start must not be after end")
-		if err := c.Create(ctx, pool("mixed-signs", IPPoolRange{NetworkName: "a", Start: 2, End: -1})); err != nil {
-			t.Errorf("start 2, end -1: %v", err)
+		a := IPPoolRange{NetworkName: "a", Pool: "cp"}
+		wantErr(t, c.Create(ctx, pool("dup", a, a)), "one range per network pool")
+		wantErr(t, c.Create(ctx, pool("no-pool", IPPoolRange{NetworkName: "a"})), "spec.ranges[0].pool")
+		if err := c.Create(ctx, pool("two-pools", a, IPPoolRange{NetworkName: "a", Pool: "workers"})); err != nil {
+			t.Errorf("two pools of a network: %v", err)
 		}
 
 		withFields := func(name string, f IPAddressFields) *NetBoxIPPool {
@@ -315,7 +411,7 @@ func TestValidation(t *testing.T) {
 			u := &unstructured.Unstructured{Object: map[string]any{
 				"metadata": map[string]any{"name": name, "namespace": "default"},
 				"spec": map[string]any{
-					"ranges":    []any{map[string]any{"networkName": "a", "start": int64(1), "end": int64(6)}},
+					"ranges":    []any{map[string]any{"networkName": "a", "pool": "cp"}},
 					"ipAddress": ipAddress,
 				},
 			}}
@@ -332,43 +428,17 @@ func TestValidation(t *testing.T) {
 			t.Errorf("ipAddress comments: %v", err)
 		}
 
-		withRange := func(name string, f IPRangeFields) *NetBoxIPPool {
-			p := pool(name, a)
-			p.Spec.IPRange = f
-			return p
-		}
-		for name, f := range map[string]IPRangeFields{
-			"description": {Description: "{{ .Network }}"},
-			"comments":    {Comments: strings.Repeat("x", 1024)},
-		} {
-			if err := c.Create(ctx, withRange("range-"+name, f)); err != nil {
-				t.Errorf("ipRange %s: %v", name, err)
-			}
-		}
-		rawRange := func(name string, ipRange map[string]any) *unstructured.Unstructured {
-			u := raw(name, map[string]any{"dnsName": "x"})
-			if err := unstructured.SetNestedField(u.Object, ipRange, "spec", "ipRange"); err != nil {
-				t.Fatal(err)
-			}
-			return u
-		}
-		wantErr(t, c.Create(ctx, rawRange("range-empty", map[string]any{})), "should have at least 1 properties")
-		wantErr(t, c.Create(ctx, rawRange("range-empty-desc", map[string]any{"description": ""})), "spec.ipRange.description")
-		wantErr(t, c.Create(ctx, rawRange("range-long-desc", map[string]any{"description": strings.Repeat("x", 1025)})), "spec.ipRange.description")
-		wantErr(t, c.Create(ctx, rawRange("range-empty-comments", map[string]any{"comments": ""})), "spec.ipRange.comments")
-		wantErr(t, c.Create(ctx, rawRange("range-long-comments", map[string]any{"comments": strings.Repeat("x", 1025)})), "spec.ipRange.comments")
-
 		p := pool("edit", a)
 		if err := c.Create(ctx, p); err != nil {
 			t.Fatal(err)
 		}
-		p.Spec.Ranges = append(p.Spec.Ranges, IPPoolRange{NetworkName: "b", Start: -1, End: -1})
+		p.Spec.Ranges = append(p.Spec.Ranges, IPPoolRange{NetworkName: "b", Pool: "cp"})
 		if err := c.Update(ctx, p); err != nil {
 			t.Errorf("append: %v", err)
 		}
-		p.Spec.Ranges[0].End = 7
+		p.Spec.Ranges[0].Pool = "workers"
 		if err := c.Update(ctx, p); err != nil {
-			t.Errorf("change end: %v", err)
+			t.Errorf("change pool: %v", err)
 		}
 		p.Spec.Ranges = p.Spec.Ranges[1:]
 		if err := c.Update(ctx, p); err != nil {
@@ -399,7 +469,7 @@ func TestValidation(t *testing.T) {
 		p.Spec.OmitGateway = nil
 		wantErr(t, c.Update(ctx, p), "omitGateway cannot be added or removed")
 		p.Spec.OmitGateway = ptr.To(true)
-		p.Spec.Ranges[0].End = 7
+		p.Spec.Ranges[0].Pool = "workers"
 		if err := c.Update(ctx, p); err != nil {
 			t.Errorf("same omitGateway: %v", err)
 		}

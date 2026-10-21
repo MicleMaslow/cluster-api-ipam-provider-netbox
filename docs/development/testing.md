@@ -19,7 +19,7 @@ NETBOX_TEST_MODE=instance make test-integration
 | `make lint` | golangci-lint, and kube-api-linter on `api/` |
 | `make generate` | deepcopy, CRDs and RBAC |
 
-Every behaviour change comes with a test. Controller tests run against a real NetBox with envtest for the Kubernetes API; CEL rules are tested in `api/v1alpha1/validation_test.go`; the flags in `main_test.go`. The test environment is installed by `make`: `setup-envtest` with Kubernetes `ENVTEST_K8S_VERSION` (1.37.0), and the Cluster API CRDs from the module cache.
+Every behaviour change comes with a test. Controller tests run against a real NetBox with envtest for the Kubernetes API; CEL rules are tested in `api/v1alpha1/validation_test.go`; the flags in `main_test.go`. The test environment is installed by `make`: `setup-envtest` with Kubernetes `ENVTEST_K8S_VERSION` (1.37.0), and the Cluster API CRDs and the `InClusterIPPool` CRD of in-cluster IPAM from the module cache. envtest runs no in-cluster controller or webhook: the tests that need its finalizer or its refusals set them up themselves.
 
 To run one test, source the stand's env file and set what the Makefile sets:
 
@@ -27,6 +27,7 @@ To run one test, source the stand's env file and set what the Makefile sets:
 set -a; source hack/dev/.env; set +a
 KUBEBUILDER_ASSETS="$(hack/tools/bin/setup-envtest-v0.25.0 use 1.37.0 -p path)" \
   CAPI_CRDS="$(go list -m -f '{{.Dir}}' sigs.k8s.io/cluster-api)/core/config/crd/bases" \
+  INCLUSTER_CRDS="$(go list -m -f '{{.Dir}}' sigs.k8s.io/cluster-api-ipam-provider-in-cluster)/config/crd/bases" \
   go test ./internal/controllers -run TestNetworkSyncsAttrs -count=1
 ```
 

@@ -12,6 +12,8 @@ see-also:
 
 # NetBox IPAM provider for Cluster API
 
+> **History.** This proposal describes the provider as first built: pools by offsets, `spec.ipRange`, ranges keyed `NetBoxIPPool/...`. The network now places its pools itself and can hand out addresses through in-cluster IPAM. The current behaviour is in [Networks](../guides/networks.md) and [In-cluster allocator](../guides/in-cluster.md).
+
 ## Table of Contents
 
 - [Glossary](#glossary)
@@ -273,7 +275,7 @@ NetBox token. The provider authenticates with a v2 token of an ordinary NetBox u
   | `ipam.iprange` | `{"tenant__slug": "platform", "start_address__net_host_contained": "10.10.0.0/16", "end_address__net_host_contained": "10.10.0.0/16"}` |
   | `ipam.ipaddress` | `{"tenant__slug": "platform", "address__net_host_contained": "10.10.0.0/16"}` |
 
-Kubernetes. The token reaches the provider as environment from the Secret `capi-ipam-netbox-credentials`, or as a file the user mounts (`NETBOX_TOKEN_FILE`); the provider has no RBAC on Secrets. It reads Clusters and patches their `spec.controlPlaneEndpoint`, writes its own kinds, `IPAddressClaim` status and `IPAddress` objects, and creates Events. Metrics (controller-runtime, `netbox_ipam_requests_total`, `netbox_ipam_request_duration_seconds`, `netbox_ipam_write_lock_wait_seconds`) are served on the diagnostics port behind authentication and authorization, as in Cluster API.
+Kubernetes. The token reaches the provider as environment from the Secret `capi-ipam-netbox-credentials`, or as a file the user mounts (`NETBOX_TOKEN_FILE`), so the provider needs no RBAC for it. Later, `publish` of a network's pools and groups made it write Secrets of addresses: the ClusterRole grants `get`, `create`, `update` and `delete` on Secrets in every namespace ([Published addresses](../guides/networks.md#published-addresses)). It reads Clusters and patches their `spec.controlPlaneEndpoint`, writes its own kinds, `IPAddressClaim` status and `IPAddress` objects, and creates Events. Metrics (controller-runtime, `netbox_ipam_requests_total`, `netbox_ipam_request_duration_seconds`, `netbox_ipam_write_lock_wait_seconds`) are served on the diagnostics port behind authentication and authorization, as in Cluster API.
 
 Tenancy. Anyone who may create a `NetBoxNetwork` in a namespace may carve from any parent prefix the token can write to and adopt deprecated prefixes of the same namespace. NetBox constraints bound what the token can reach; an admin-scoped parent object is future work.
 

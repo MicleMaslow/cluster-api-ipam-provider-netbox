@@ -1,13 +1,15 @@
-# One /26 per cluster, carved from the parent L2 network 10.10.0.0/22:
+# One /26 per cluster, carved from the parent L2 network 10.10.0.0/22. The network lays out its prefix from the
+# start, in the order of spec.pools, on free addresses: not the network, broadcast or gateway of 10.10.0.0/22,
+# not the VIP, not used in NetBox by anything else.
 #
-#   offset   0-1   unused: in the first /26 of the parent they are its network address and gateway (InvalidRange)
-#   offset   2-7   demo-cp       control plane machines (6)
-#   offset  8-15   demo-ingress  ingress nodes (8)
-#   offset 16-53   demo-workers  worker machines (16..-11, the rest)
-#   offset 54-61   demo-metallb  MetalLB addresses (-10..-3, 8)
-#   offset 62-63   the VIP of controlPlaneEndpoint: the highest free address, 63, or 62 in the
-#                  last /26 of the parent, where 63 is its broadcast address; no pool covers it
+#   cp       control plane machines, 6 addresses
+#   ingress  ingress nodes, 8 addresses
+#   workers  worker machines, the rest
+#   the VIP of controlPlaneEndpoint: the highest free address, reserved before the pools are placed
+#   metallb  2 addresses reserved in NetBox under the VIP, for MetalLB; .Index 1 is the higher one
 #
+# status.layout of the network shows the NetBox ranges each pool got and the addresses of each group;
+# each NetBoxIPPool hands out one pool.
 # Apply in the namespace of the Cluster `demo`:
 #   kubectl apply -n <namespace> -f network-scheme.yaml
 apiVersion: ipam.cluster.x-k8s.io/v1alpha1
@@ -22,7 +24,13 @@ spec:
   # The VIP is written to Cluster.spec.controlPlaneEndpoint while that has no host or no port.
   controlPlaneEndpoint:
     port: 6443
-    dnsName: demo-api.example
+    dnsName: "{{ .Cluster }}-controlplane.example.test"
+  pools:
+  - {name: cp, size: 6}
+  - {name: ingress, size: 8}
+  - {name: workers, size: rest}
+  addresses:
+  - {name: metallb, count: 2, dnsName: "{{ .Cluster }}-metallb-{{ .Index }}.example.test"}
   # Optional metadata on the NetBox prefix; tags and custom fields must exist in NetBox.
   # tags: [k8s]
   # customFields:
@@ -36,7 +44,7 @@ metadata:
     cluster.x-k8s.io/cluster-name: demo
 spec:
   ranges:
-  - {networkName: demo, start: 2, end: 7}
+  - {networkName: demo, pool: cp}
 ---
 apiVersion: ipam.cluster.x-k8s.io/v1alpha1
 kind: NetBoxIPPool
@@ -46,7 +54,7 @@ metadata:
     cluster.x-k8s.io/cluster-name: demo
 spec:
   ranges:
-  - {networkName: demo, start: 8, end: 15}
+  - {networkName: demo, pool: ingress}
 ---
 apiVersion: ipam.cluster.x-k8s.io/v1alpha1
 kind: NetBoxIPPool
@@ -56,14 +64,4 @@ metadata:
     cluster.x-k8s.io/cluster-name: demo
 spec:
   ranges:
-  - {networkName: demo, start: 16, end: -11}
----
-apiVersion: ipam.cluster.x-k8s.io/v1alpha1
-kind: NetBoxIPPool
-metadata:
-  name: demo-metallb
-  labels:
-    cluster.x-k8s.io/cluster-name: demo
-spec:
-  ranges:
-  - {networkName: demo, start: -10, end: -3}
+  - {networkName: demo, pool: workers}

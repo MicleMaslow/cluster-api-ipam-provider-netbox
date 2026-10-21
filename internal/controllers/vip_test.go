@@ -23,6 +23,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -105,40 +106,6 @@ func TestVIPUsable(t *testing.T) {
 	}
 }
 
-func TestReservedOf(t *testing.T) {
-	g := NewWithT(t)
-	gw := netip.MustParseAddr("10.10.0.1")
-	nw := newNetwork("ns", "default")
-	g.Expect(reservedOf(nw, gw)).To(Equal([]netip.Addr{gw}))
-
-	nw.Status.ControlPlaneEndpoint = v1alpha1.APIEndpoint{Host: "10.10.0.14", Port: 6443}
-	g.Expect(reservedOf(nw, gw)).To(Equal([]netip.Addr{gw, netip.MustParseAddr("10.10.0.14")}))
-}
-
-// A range that is not in NetBox yet waits for the VIP of its network; nothing is written meanwhile.
-func TestPoolNewRangeWaitsForVIP(t *testing.T) {
-	g := NewWithT(t)
-	nw := vipNetwork("ns", "default")
-	nw.Status.Prefix = "10.10.0.16/28"
-	nw.Status.Conditions = []metav1.Condition{{Type: v1alpha1.ReadyCondition, Status: metav1.ConditionTrue, Reason: v1alpha1.ReasonReady}}
-	var writes atomic.Int32
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			writes.Add(1)
-		}
-		_, _ = io.WriteString(w, `{"results":[]}`)
-	}))
-	defer srv.Close()
-	r := &NetBoxIPPoolReconciler{Client: claimClient(nw), NetBox: &netbox.Client{URL: srv.URL}, Keys: netbox.DefaultKeys}
-
-	err := r.reconcileNormal(ctx, newPool("ns", "worker", v1alpha1.IPPoolRange{NetworkName: "default", Start: 2, End: 3}))
-	var re reasonError
-	g.Expect(errors.As(err, &re)).To(BeTrue(), "%v", err)
-	g.Expect(re.reason).To(Equal(v1alpha1.ReasonNetworkNotReady))
-	g.Expect(err.Error()).To(ContainSubstring("waiting for the VIP of network default"))
-	g.Expect(writes.Load()).To(BeZero())
-}
-
 // reserveVIP with a preferred address checks only that address and never moves an existing VIP.
 func TestReserveVIPPreferred(t *testing.T) {
 	g := newG(t)
@@ -147,7 +114,7 @@ func TestReserveVIPPreferred(t *testing.T) {
 	r := &NetBoxNetworkReconciler{NetBox: admin, Keys: keys, Recorder: rec}
 	nw := vipNetwork(ns, "default")
 	prefix := netip.MustParsePrefix("10.10.3.80/28")
-	byHand(t, g, netbox.IPAddresses, map[string]any{"address": "10.10.3.90/22", "status": "active"})
+	byHand(t, g, netbox.IPAddresses, map[string]any{"address": "10.10.3.90/22", "status": "active", "custom_fields": map[string]any{keys.Ref: "elsewhere"}})
 
 	for name, preferred := range map[string]string{"taken": "10.10.3.90", "outside": "10.10.3.200", "service address": "10.10.3.255"} {
 		_, err := r.reserveVIP(ctx, nw, prefix, netip.MustParseAddr(preferred), true)
@@ -291,6 +258,31 @@ func TestEndpointPartialHostOnly(t *testing.T) {
 	waitTypedCondition(g, nw, v1alpha1.ControlPlaneEndpointReadyCondition, metav1.ConditionTrue, v1alpha1.ReasonReady)
 	g.Expect(nw.Status.ControlPlaneEndpoint).To(Equal(v1alpha1.APIEndpoint{Host: "10.10.3.100", Port: 6443}))
 	g.Expect(clusterEndpointOf(g, ns)).To(Equal(clusterv1.APIEndpoint{Host: "10.10.3.100", Port: 6443}))
+}
+
+// The VIP of a running cluster, a NetBox address without a key at the Cluster's endpoint, is adopted: the same object
+// gets the key, the dns_name and the texts of the VIP, and no second one is created.
+func TestVIPAdoptsKeylessObject(t *testing.T) {
+	g := newG(t)
+	ns := newEnv(t, nil)
+	p := netip.MustParsePrefix("10.10.3.0/28")
+	setClusterEndpoint(t, ns, addr(p, 15), 6443)
+	ip := byHand(t, g, netbox.IPAddresses, map[string]any{"address": addr(p, 15) + "/22", "status": "active", "description": "by hand"})
+	nw := adoptedNetwork(ns, p.String())
+	nw.Spec.ControlPlaneEndpoint = &v1alpha1.ControlPlaneEndpoint{DNSName: "{{ .Cluster }}-api.example.test"}
+	g.Expect(k8s.Create(ctx, nw)).To(Succeed())
+	waitTypedCondition(g, nw, v1alpha1.ControlPlaneEndpointReadyCondition, metav1.ConditionTrue, v1alpha1.ReasonReady)
+
+	vips := vipsOf(g, ns, "default")
+	g.Expect(vips).To(HaveLen(1))
+	g.Expect(vips[0].ID).To(Equal(ip.ID))
+	g.Expect(vips[0].DNSName).To(Equal(ns + "-api.example.test"))
+	g.Expect(vips[0].Description).To(Equal(ns + "/default // " + ns + " control plane endpoint"))
+	same, err := admin.List(ctx, netbox.IPAddresses, url.Values{"address": {addr(p, 15)}})
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(same).To(HaveLen(1))
+	g.Expect(clusterEndpointOf(g, ns)).To(Equal(clusterv1.APIEndpoint{Host: addr(p, 15), Port: 6443}))
+	waitEvent(g, ns, "default", "VIPAdopted")
 }
 
 // A Cluster with a port only, as CAPI copies it from the infrastructure cluster, gets the VIP and keeps its port.
@@ -482,5 +474,66 @@ func TestReserveVIPOnePatch(t *testing.T) {
 			g.Expect(errReason(attrsErr)).To(Equal(tc.reason), name)
 		}
 		g.Expect(patches).To(Equal(tc.patches), name)
+	}
+}
+
+// The Cluster's endpoint is adopted only from a NetBox address without a key that is alone at it, outside ranges,
+// while the status has no VIP; otherwise it is EndpointConflict and nothing is written.
+func TestCreateVIPAdopts(t *testing.T) {
+	const (
+		keyless = `{"id":9,"address":"10.10.0.30/22","status":{"value":"active"},"custom_fields":{}}`
+		other   = `{"id":10,"address":"10.10.0.30/22","status":{"value":"active"},"custom_fields":{}}`
+		keyed   = `{"id":9,"address":"10.10.0.30/22","status":{"value":"active"},"custom_fields":{"capi_ref":"elsewhere"}}`
+		around  = `{"id":3,"start_address":"10.10.0.28/22","end_address":"10.10.0.31/22","custom_fields":{}}`
+	)
+	for name, tc := range map[string]struct {
+		ips, ranges, status string
+		adopted             bool
+	}{
+		"adopted":          {ips: keyless, adopted: true},
+		"another key":      {ips: keyed},
+		"two at it":        {ips: keyless + "," + other},
+		"in a range":       {ips: keyless, ranges: around},
+		"the status's VIP": {ips: keyless, status: "10.10.0.30"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			g := NewWithT(t)
+			var patches []string
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch {
+				case r.Method == http.MethodPatch:
+					b, _ := io.ReadAll(r.Body)
+					patches = append(patches, string(b))
+					_, _ = io.WriteString(w, keyless)
+				case r.Method != http.MethodGet:
+					t.Errorf("%s %s", r.Method, r.URL.Path)
+				case r.URL.Path == "/api/ipam/ip-addresses/9/":
+					w.Header().Set("ETag", `"e1"`)
+					_, _ = io.WriteString(w, keyless)
+				case r.URL.Path == "/api/ipam/ip-addresses/":
+					_, _ = io.WriteString(w, `{"results":[`+tc.ips+`]}`)
+				case r.URL.Path == "/api/ipam/ip-ranges/":
+					_, _ = io.WriteString(w, `{"results":[`+tc.ranges+`]}`)
+				default:
+					_, _ = io.WriteString(w, `{"results":[]}`)
+				}
+			}))
+			t.Cleanup(srv.Close)
+			r := networkOn(srv)
+			nw := vipNetwork("ns", "default")
+			nw.Spec.ControlPlaneEndpoint.DNSName = "api.example.test"
+			nw.Status.ControlPlaneEndpoint.Host = tc.status
+			ip, err := r.createVIP(ctx, nw, netip.MustParsePrefix("10.10.0.16/28"), netip.MustParseAddr("10.10.0.30"))
+			if !tc.adopted {
+				g.Expect(errReason(err)).To(Equal(v1alpha1.ReasonEndpointConflict))
+				g.Expect(patches).To(BeEmpty())
+				return
+			}
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(ip.ID).To(Equal(int64(9)))
+			g.Expect(patches).To(Equal([]string{`{"changelog_message":"capi: adopted by NetBoxNetwork/ns/default","comments":"` + managedComments +
+				`","custom_fields":{"capi_ref":"NetBoxNetwork/ns/default/vip"},"description":"ns/default // ns control plane endpoint","dns_name":"api.example.test"}`}))
+			g.Expect(emitted(r.Recorder)).To(ConsistOf("Normal VIPAdopted Adopted the NetBox address 10.10.0.30/22 as the control plane VIP"))
+		})
 	}
 }

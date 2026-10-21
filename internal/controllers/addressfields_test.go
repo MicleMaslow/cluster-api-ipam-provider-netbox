@@ -87,7 +87,7 @@ func TestAddressFields(t *testing.T) {
 	}
 }
 
-// The prefix and the VIP render the network's templates, the range the pool's ipRange ones; the defaults are those of
+// The prefix and the VIP render the network's templates, the ranges of its pools the defaults; the defaults are those of
 // the spec. The description is cut to 200 characters, comments are not; a network template that does not render is InvalidSpec.
 func TestTexts(t *testing.T) {
 	g := NewWithT(t)
@@ -133,23 +133,59 @@ func TestTexts(t *testing.T) {
 	g.Expect(errReason(err)).To(Equal(v1alpha1.ReasonInvalidSpec))
 	g.Expect(err).To(MatchError(ContainSubstring("NUL")))
 
-	pool := newPool("ns", "worker")
-	got, err := rangeTexts(pool, nw)
-	g.Expect(err).NotTo(HaveOccurred())
-	g.Expect(got).To(Equal(texts{Description: "ns/worker // pool of cluster c1", Comments: comments}))
-	pool.Spec.IPRange = v1alpha1.IPRangeFields{Description: "{{ .Pool }} in {{ .Network }}", Comments: long}
-	got, err = rangeTexts(pool, nw)
-	g.Expect(err).NotTo(HaveOccurred())
-	g.Expect(got).To(Equal(texts{Description: "worker in default", Comments: long}))
-	pool.Spec.IPRange.Description = "{{ .Owner }}"
-	_, err = rangeTexts(pool, nw)
-	g.Expect(err).To(MatchError(ContainSubstring("description: ")))
+	g.Expect(rangeTexts(nw, "cp")).To(Equal(texts{Description: "ns/cp // pool of cluster c1", Comments: comments}))
 
 	g.Expect(validatePoolTemplates(newPool("ns", "worker"))).To(Succeed())
-	pool = newPool("ns", "worker")
+	pool := newPool("ns", "worker")
 	pool.Spec.IPAddress.DNSName = "a/{{ .Owner }}"
 	g.Expect(validatePoolTemplates(pool)).To(MatchError(ContainSubstring("ipAddress: dnsName")))
-	pool = newPool("ns", "worker")
-	pool.Spec.IPRange.Comments = "{{ .Claim }}"
-	g.Expect(validatePoolTemplates(pool)).To(MatchError(ContainSubstring("ipRange: comments")))
+}
+
+// A reserve renders the templates of its group; without dnsName it has none. The index counts from the top down.
+func TestGroupFields(t *testing.T) {
+	g := NewWithT(t)
+	nw := newNetwork("ns", "default")
+	nw.Spec.ClusterName = "c1"
+
+	got, err := groupFields(nw, v1alpha1.AddressGroup{Name: "metallb", Count: 2}, 1)
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(got).To(Equal(ipFields{texts: texts{Description: "ns/default // c1 metallb 1", Comments: managedComments}}))
+
+	got, err = groupFields(nw, v1alpha1.AddressGroup{Name: "metallb", Count: 2, DNSName: "{{ .Cluster }}-metallb-{{ .Index }}.example.test", Description: "{{ .Group }}"}, 2)
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(got).To(Equal(ipFields{DNSName: "c1-metallb-2.example.test", texts: texts{Description: "metallb", Comments: managedComments}}))
+
+	_, err = groupFields(nw, v1alpha1.AddressGroup{Name: "metallb", Count: 2, DNSName: "{{ .Group }} {{ .Index }}"}, 1)
+	g.Expect(err).To(MatchError(ContainSubstring("not a valid DNS name")))
+	_, err = groupFields(nw, v1alpha1.AddressGroup{Name: "metallb", Count: 2, Description: "{{ .Pool }}"}, 1)
+	g.Expect(err).To(MatchError(ContainSubstring("description")))
+
+	// networkTexts renders every address of every group: one bad index is InvalidSpec before anything is written.
+	nw.Spec.Addresses = []v1alpha1.AddressGroup{{Name: "metallb", Count: 3, DNSName: `{{ if eq .Index 3 }}a b{{ end }}lb`}}
+	_, _, err = networkTexts(nw)
+	g.Expect(errReason(err)).To(Equal(v1alpha1.ReasonInvalidSpec))
+	g.Expect(err).To(MatchError(ContainSubstring("addresses metallb: dnsName")))
+}
+
+// The dnsName of the VIP is a template on the network's variables, lower case; one that does not render or is not a DNS
+// name is InvalidSpec.
+func TestVIPDNSName(t *testing.T) {
+	g := NewWithT(t)
+	nw := vipNetwork("ns", "default")
+	nw.Spec.ClusterName = "C1"
+	g.Expect(dnsNameOf(nw)).To(BeEmpty())
+
+	nw.Spec.ControlPlaneEndpoint.DNSName = "{{ .Cluster }}-controlplane.example.test"
+	g.Expect(dnsNameOf(nw)).To(Equal("c1-controlplane.example.test"))
+	_, _, err := networkTexts(nw)
+	g.Expect(err).NotTo(HaveOccurred())
+
+	for _, bad := range []string{"{{ .Cluster }} api", "{{ .Pool }}"} {
+		nw.Spec.ControlPlaneEndpoint.DNSName = bad
+		_, err := dnsNameOf(nw)
+		g.Expect(errReason(err)).To(Equal(v1alpha1.ReasonInvalidSpec), bad)
+		_, _, err = networkTexts(nw)
+		g.Expect(errReason(err)).To(Equal(v1alpha1.ReasonInvalidSpec), bad)
+		g.Expect(err).To(MatchError(ContainSubstring("controlPlaneEndpoint: dnsName")), bad)
+	}
 }
