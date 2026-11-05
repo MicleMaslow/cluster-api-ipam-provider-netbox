@@ -30,6 +30,7 @@ import (
 	"time"
 
 	"github.com/spf13/pflag"
+	"golang.org/x/time/rate"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
@@ -67,6 +68,8 @@ var (
 	syncPeriod                  time.Duration
 	restConfigQPS               float32
 	restConfigBurst             int
+	netboxQPS                   float64
+	netboxBurst                 int
 	healthAddr                  string
 	leaderElect                 bool
 	leaderElectionLeaseDuration time.Duration
@@ -101,6 +104,12 @@ func initFlags(fs *pflag.FlagSet) {
 		"Maximum queries per second from the controller client to the Kubernetes API server.")
 	fs.IntVar(&restConfigBurst, "kube-api-burst", 30,
 		"Maximum number of queries that should be allowed in one burst from the controller client to the Kubernetes API server.")
+	fs.Float64Var(&netboxQPS, "netbox-qps", 10,
+		"Maximum requests per second from the provider to the NetBox API; 0 is no limit.")
+	fs.IntVar(&netboxBurst, "netbox-burst", 20,
+		"Maximum number of requests that should be allowed in one burst from the provider to the NetBox API.")
+	fs.DurationVar(&controllerOpts.NetBoxResyncPeriod, "netbox-resync-period", 10*time.Minute,
+		"How often a NetBoxNetwork is checked against NetBox while nothing of it changes (e.g. 15m).")
 
 	fs.IntVar(&controllerOpts.NetworkConcurrency, "netboxnetwork-concurrency", controllers.DefaultConcurrency,
 		"Number of NetBoxNetworks to process simultaneously.")
@@ -193,6 +202,9 @@ func main() {
 		os.Exit(1)
 	}
 	nb := &netbox.Client{URL: nbURL, Token: token, TokenFile: tokenFile, HTTP: httpClient}
+	if netboxQPS > 0 {
+		nb.Limiter = rate.NewLimiter(rate.Limit(netboxQPS), max(netboxBurst, 1))
+	}
 	if err := nb.CheckToken(); err != nil {
 		setupLog.Error(err, "NetBox token")
 		os.Exit(1)

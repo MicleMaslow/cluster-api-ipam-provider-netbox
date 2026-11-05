@@ -36,6 +36,8 @@ import (
 	"strings"
 	"time"
 
+	"golang.org/x/time/rate"
+
 	"github.com/MicleMaslow/cluster-api-ipam-provider-netbox/internal/version"
 )
 
@@ -120,9 +122,21 @@ type Client struct {
 	// UserAgent defaults to cluster-api-ipam-provider-netbox/<version>.
 	UserAgent string
 	HTTP      *http.Client
+	// Limiter, if set, paces the requests: each waits for a token, at most until its context ends.
+	Limiter *rate.Limiter
 
 	readOnly bool
 }
+
+// Unlimited returns a copy of c without its Limiter.
+func (c *Client) Unlimited() *Client {
+	cp := *c
+	cp.Limiter = nil
+	return &cp
+}
+
+// IsReadOnly reports whether c is a copy of ReadOnly.
+func (c *Client) IsReadOnly() bool { return c.readOnly }
 
 // ReadOnly returns a copy of c that fails every request but GET with ErrWriteNeeded.
 func (c *Client) ReadOnly() *Client {
@@ -286,6 +300,14 @@ func objectPath(path string, id int64) string { return path + strconv.FormatInt(
 func (c *Client) do(ctx context.Context, method, path string, q url.Values, ifMatch string, body, out any) (etag string, err error) {
 	if c.readOnly && method != http.MethodGet {
 		return "", fmt.Errorf("%s %s: %w", method, path, ErrWriteNeeded)
+	}
+	if c.Limiter != nil {
+		start := time.Now()
+		err := c.Limiter.Wait(ctx)
+		waits.Observe(time.Since(start).Seconds())
+		if err != nil {
+			return "", fmt.Errorf("%s %s: waiting for the rate limit of the client: %w", method, path, err)
+		}
 	}
 	token, err := c.token()
 	if err != nil {

@@ -41,6 +41,7 @@ import (
 	clusterctlv1 "sigs.k8s.io/cluster-api/cmd/clusterctl/api/v1alpha3"
 	"sigs.k8s.io/cluster-api/util/annotations"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	crmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
 	"github.com/MicleMaslow/cluster-api-ipam-provider-netbox/api/v1alpha1"
 	"github.com/MicleMaslow/cluster-api-ipam-provider-netbox/internal/netbox"
@@ -288,6 +289,21 @@ func touch(g *WithT, obj client.Object) {
 
 func gone(obj client.Object) func() bool {
 	return func() bool { return apierrors.IsNotFound(k8s.Get(ctx, client.ObjectKeyFromObject(obj), obj)) }
+}
+
+// netBoxRequests is the number of NetBox requests made so far, by the provider and the test alike.
+func netBoxRequests(g Gomega) float64 {
+	families, err := crmetrics.Registry.Gather()
+	g.Expect(err).NotTo(HaveOccurred())
+	var n float64
+	for _, f := range families {
+		if f.GetName() == "netbox_ipam_requests_total" {
+			for _, m := range f.GetMetric() {
+				n += m.GetCounter().GetValue()
+			}
+		}
+	}
+	return n
 }
 
 // byHand creates an object in NetBox as an admin would and deletes it after the test.

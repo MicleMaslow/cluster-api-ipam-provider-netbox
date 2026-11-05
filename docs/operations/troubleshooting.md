@@ -89,7 +89,7 @@ The owner, tenant, description or comments of an existing object differ from the
 - `HTTP 400`: NetBox refuses the value, for example an owner id it does not have.
 - A claim's address: a failed sync stays out of the claim's status. The claim stays `Ready`, with no condition and no Event; the error shows only in the controller log and as a reconcile error of the claim (`Reconciler error`, retried with backoff).
 - Not synced by design: a field the spec leaves out (an owner or tenant is never cleared), and a prefix under `spec.prefix` after its creation.
-- A synced change is an Event `AttributesSynced` on the network or claim and a changelog message `capi: attributes of ...` or `capi: address fields for ...` in NetBox. A value edited in NetBox by hand is overwritten at the next reconcile.
+- A synced change is an Event `AttributesSynced` on the network or claim and a changelog message `capi: attributes of ...` or `capi: address fields for ...` in NetBox. A value edited in NetBox by hand is overwritten at the next check: of a network within `--netbox-resync-period` or at once on an annotation of it ([Load on NetBox](configuration.md#load-on-netbox)), of a claim at its next reconcile.
 
 ## A prefix is gone
 

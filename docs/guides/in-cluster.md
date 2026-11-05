@@ -83,7 +83,7 @@ pools:
 - **Deleted** with its `IPAddress`, when `sync` is turned off, and with the network, whatever `deletionPolicy` says. An address a new `IPAddress` takes at once (in-cluster reuses it) keeps one NetBox address: the old one is deleted right before the new one is created.
 - **An address of someone else.** A NetBox address at the address of an `IPAddress` that does not carry a sync key of the network (no key, a claim's, another network's) is left alone: `LayoutReady=False` with `AddressConflict` and the `IPAddress` in the message. Delete it in NetBox, or give it the key, to let the sync take the address.
 - **One sync per pool.** A sync of the VMs that records the same addresses makes each of them `AddressConflict`: turn `sync` on only for pools nothing else records.
-- `sync` needs `allocator: InCluster` (`sync needs allocator InCluster`). A network wakes on every `IPAddress` of its `InClusterIPPool`s.
+- `sync` needs `allocator: InCluster` (`sync needs allocator InCluster`). A network wakes on every `IPAddress` of its pools with `sync`.
 
 ## Order of a change
 

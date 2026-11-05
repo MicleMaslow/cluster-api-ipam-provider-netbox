@@ -251,7 +251,7 @@ func (h *claimHandler) EnsureAddress(ctx context.Context, address *ipamv1.IPAddr
 			return hh.allocate(ctx, address)
 		}
 		err := hh.restore(ctx, address)
-		if errors.Is(err, errAddressConflict) && nb != h.NetBox {
+		if errors.Is(err, errAddressConflict) && nb.IsReadOnly() {
 			// A hand-back to this claim can land between the reads of the first pass: the locked pass decides.
 			return netbox.ErrWriteNeeded
 		}

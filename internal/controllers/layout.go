@@ -27,6 +27,7 @@ import (
 
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/klog/v2"
+	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 
 	"github.com/MicleMaslow/cluster-api-ipam-provider-netbox/api/v1alpha1"
@@ -86,8 +87,9 @@ func layoutOf(st v1alpha1.NetworkLayout) layout.Layout {
 // then the reserves it holds, then the Secrets the pools and groups publish in. A step that fails stops the next ones;
 // a change that would move an allocated address out of its pool is refused as a whole. Once the ranges are there, the
 // IPAddresses of the pools that sync go to NetBox (allocator InCluster). Its error is LayoutReady's. endpoint is the
-// host of the Cluster's endpoint: never adopted by a group, as it is the VIP to be.
-func (r *NetBoxNetworkReconciler) reconcileLayout(ctx context.Context, nw *v1alpha1.NetBoxNetwork, endpoint string) error {
+// host of the Cluster's endpoint: never adopted by a group, as it is the VIP to be. A quick reconcile leaves NetBox
+// alone but for the sync: it brings about the InClusterIPPools and the Secrets of the layout in the status.
+func (r *NetBoxNetworkReconciler) reconcileLayout(ctx context.Context, nw *v1alpha1.NetBoxNetwork, endpoint string, quick bool) error {
 	inCluster := nw.Spec.Allocator == v1alpha1.AllocatorInCluster
 	if inCluster && !r.InCluster {
 		return waitFor(v1alpha1.ReasonAllocatorUnavailable,
@@ -106,6 +108,8 @@ func (r *NetBoxNetworkReconciler) reconcileLayout(ctx context.Context, nw *v1alp
 		groups = append(groups, groupOf(g))
 	}
 	prev := layoutOf(nw.Status.Layout)
+	// A layout to restore or to place is not quick work: fresh rules both out, should one come it is done in full.
+	quick = quick && len(prev.Pools)+len(prev.Groups) > 0
 	if len(prev.Pools) == 0 && len(prev.Groups) == 0 {
 		if prev, err = r.restore(ctx, nw, prefix, pools); err != nil {
 			return err
@@ -115,6 +119,7 @@ func (r *NetBoxNetworkReconciler) reconcileLayout(ctx context.Context, nw *v1alp
 	wantVIP := nw.Spec.ControlPlaneEndpoint != nil && nw.Status.ControlPlaneEndpoint.Host == ""
 	replan := wantVIP || !slices.EqualFunc(prev.Pools, pools, func(p layout.PlacedPool, s layout.Pool) bool { return p.Pool == s }) ||
 		!slices.EqualFunc(prev.Groups, groups, func(p layout.PlacedGroup, g layout.Group) bool { return p.Group == g })
+	quick = quick && !replan
 	next := prev
 	if replan {
 		// The pools of prev hold their NetBox addresses, those adopted before their ranges are in NetBox too.
@@ -147,24 +152,31 @@ func (r *NetBoxNetworkReconciler) reconcileLayout(ctx context.Context, nw *v1alp
 	if err != nil {
 		return err
 	}
-	if err := r.dropExcessReserves(ctx, nw, next); err != nil {
-		return err
+	if !quick {
+		if err := r.dropExcessReserves(ctx, nw, next); err != nil {
+			return err
+		}
 	}
 	if inCluster {
 		if err := r.applyInClusterPools(ctx, nw, next, excluded); err != nil {
 			return err
 		}
 	}
-	if err := r.applyRanges(ctx, nw, next); err != nil {
-		return err
+	if !quick {
+		if err := r.applyRanges(ctx, nw, next); err != nil {
+			return err
+		}
 	}
 	// Only what is applied is published: whoever reads the Secrets sees no address the layout has not reached.
-	var publishErr, syncErr error
-	reserveErr := r.applyReserves(ctx, nw, next)
+	var reserveErr, publishErr, syncErr error
+	if !quick {
+		reserveErr = r.applyReserves(ctx, nw, next)
+	}
 	if reserveErr == nil {
 		publishErr = r.publish(ctx, nw, publishData(nw, next, excluded))
 	}
-	if inCluster {
+	// Leftovers of a sync turned off go in a full reconcile: turning it off changes the generation.
+	if inCluster && (!quick || slices.ContainsFunc(nw.Spec.Pools, func(p v1alpha1.NetworkPool) bool { return ptr.Deref(p.Sync.Enabled, false) })) {
 		syncErr = r.syncAddresses(ctx, nw)
 	}
 	return foldErrors([]error{reserveErr, publishErr, syncErr})

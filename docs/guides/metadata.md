@@ -27,7 +27,7 @@ Goal: set the text, the tags and the custom fields that people and tools read in
 
 ## Description and comments
 
-Every NetBox object the provider writes gets a description, for people, and comments, which say that the object is managed by the provider. Both are Go templates with defaults, written when the object is created and kept in sync with the spec: a value edited in NetBox by hand is overwritten at the next reconcile.
+Every NetBox object the provider writes gets a description, for people, and comments, which say that the object is managed by the provider. Both are Go templates with defaults, written when the object is created and kept in sync with the spec: a value edited in NetBox by hand is overwritten at the next check, of a network within `--netbox-resync-period` ([Load on NetBox](../operations/configuration.md#load-on-netbox)), of a claim at its next reconcile.
 
 | NetBox object | Fields in the spec | Variables | Default description | Default comments |
 |---|---|---|---|---|
@@ -47,7 +47,7 @@ The default comments of every object are `// managed by cluster-api-ipam-provide
 ## Custom fields
 
 - A JSON-object value is merged key by key: keys given here are written, keys the provider wrote earlier and that are no longer given are removed (`status.customFieldKeys`), other keys stay. Any other value replaces the field.
-- Values are compared with what NetBox returns in the form they are written in: the string of a select or multiselect value, the id of an object or multi-object field, a multi-object list without regard to its order. Write a datetime as ISO 8601 (`2026-01-02T03:04:05`) and repeat no id in a multi-object list: NetBox rewrites other forms, such a value never matches and is written at every reconcile.
+- Values are compared with what NetBox returns in the form they are written in: the string of a select or multiselect value, the id of an object or multi-object field, a multi-object list without regard to its order. Write a datetime as ISO 8601 (`2026-01-02T03:04:05`) and repeat no id in a multi-object list: NetBox rewrites other forms, such a value never matches and is written at every check of the network ([Load on NetBox](../operations/configuration.md#load-on-netbox)).
 - A failure shows in the `MetadataSynced` condition and never blocks `Ready`.
 
 ## Tags

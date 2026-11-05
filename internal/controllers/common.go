@@ -84,7 +84,8 @@ func underLock(ctx context.Context, nb *netbox.Client, op func(context.Context, 
 	return locked(ctx, nb, op)
 }
 
-// locked runs op on nb under netBoxWrites, within netBoxWriteTimeout.
+// locked runs op on nb under netBoxWrites, within netBoxWriteTimeout, past the rate limit of nb: queued behind the
+// readers for its tokens, the one section that holds the lock would run out of time and hold up every other writer.
 func locked(ctx context.Context, nb *netbox.Client, op func(context.Context, *netbox.Client) error) error {
 	start := time.Now()
 	netBoxWrites.Lock()
@@ -92,6 +93,9 @@ func locked(ctx context.Context, nb *netbox.Client, op func(context.Context, *ne
 	lockWait.Observe(time.Since(start).Seconds())
 	ctx, cancel := context.WithTimeout(ctx, netBoxWriteTimeout)
 	defer cancel()
+	if nb.Limiter != nil {
+		nb = nb.Unlimited()
+	}
 	return op(ctx, nb)
 }
 
@@ -121,7 +125,8 @@ type reasonError struct {
 func (e reasonError) Error() string { return e.err.Error() }
 func (e reasonError) Unwrap() error { return e.err }
 
-// withReason is an error with a reason; InvalidSpec is never retried, any other one goes back to controller-runtime.
+// withReason is an error with a reason; InvalidSpec is not retried but by a change or a resync, any other one goes back
+// to controller-runtime.
 func withReason(reason string, err error) error { return reasonError{reason: reason, err: err} }
 
 // waitFor is a normal wait: the condition says why and a watch re-triggers the reconcile.

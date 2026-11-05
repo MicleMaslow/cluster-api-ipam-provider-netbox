@@ -104,8 +104,8 @@ and run `make deploy-dev DEV_ENV_FILE=<file>`. The provider then does not find t
 ```bash
 export KUBECONFIG=$PWD/hack/dev/kubeconfig
 kubectl delete -f out/ipam-components.yaml   # the deploy-dev install, after make smoke-clean
-make release docker-build RELEASE_TAG=v0.1.0-rc.0
-kind load docker-image ghcr.io/miclemaslow/cluster-api-ipam-provider-netbox:v0.1.0-rc.0 --name capi-netbox-dev
+make release docker-build RELEASE_TAG=v0.2.0-rc.0
+kind load docker-image ghcr.io/miclemaslow/cluster-api-ipam-provider-netbox:v0.2.0-rc.0 --name capi-netbox-dev
 (set -a; source hack/dev/.env; NETBOX_URL=http://capi-netbox-dev-netbox-1:8080 \
   hack/tools/bin/clusterctl-v1.14.3 init --ipam netbox --config hack/dev/clusterctl.yaml --wait-providers)
 make smoke smoke-clean

@@ -36,10 +36,15 @@ var (
 		Help:    "Duration of requests to the NetBox API by method and path.",
 		Buckets: prometheus.DefBuckets,
 	}, []string{"method", "path"})
+	waits = prometheus.NewHistogram(prometheus.HistogramOpts{
+		Name:    "netbox_ipam_request_wait_seconds",
+		Help:    "Time requests to the NetBox API waited for the rate limit of the provider (--netbox-qps, --netbox-burst).",
+		Buckets: prometheus.DefBuckets,
+	})
 )
 
 func init() {
-	crmetrics.Registry.MustRegister(requests, durations)
+	crmetrics.Registry.MustRegister(requests, durations, waits)
 }
 
 func observe(method, path string, resp *http.Response, err error, start time.Time) {

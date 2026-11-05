@@ -27,6 +27,7 @@ import (
 	"testing"
 	"time"
 
+	"golang.org/x/time/rate"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -227,6 +228,22 @@ func TestUnderLockReadOnly(t *testing.T) {
 	})
 	if err != nil || calls != 1 {
 		t.Errorf("err %v after %d calls, want nil after 1", err, calls)
+	}
+}
+
+// The section that holds the write lock runs past the rate limit of the client; the first pass and the client do not.
+func TestLockedPastLimit(t *testing.T) {
+	nb := &netbox.Client{URL: "http://netbox.invalid", Token: "t", Limiter: rate.NewLimiter(rate.Every(time.Hour), 1)}
+	var limited []bool
+	err := underLock(context.Background(), nb, func(_ context.Context, c *netbox.Client) error {
+		limited = append(limited, c.Limiter != nil)
+		if c.IsReadOnly() {
+			return netbox.ErrWriteNeeded
+		}
+		return nil
+	})
+	if err != nil || len(limited) != 2 || !limited[0] || limited[1] || nb.Limiter == nil {
+		t.Errorf("err %v, limited %v, client limited %t; want nil, [true false], true", err, limited, nb.Limiter != nil)
 	}
 }
 
