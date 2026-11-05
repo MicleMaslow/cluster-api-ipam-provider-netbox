@@ -35,6 +35,8 @@ The provider runs as `capi-ipam-netbox-controller-manager` in `capi-ipam-netbox-
 | `--netbox-ref-field` | `capi_ref` | the text custom field of the key. Blank: the default |
 | `--netbox-ca-file` | empty | PEM file with extra CA certificates for NetBox, added to the system roots (mount it into the pod) |
 | `--netbox-insecure-skip-verify` | false | skip verification of the NetBox certificate; development only |
+| `--netbox-qps`, `--netbox-burst` | 10, 20 | limits of the client to the NetBox API, for the whole provider: a request waits for its turn (`netbox_ipam_request_wait_seconds`). `0` qps is no limit |
+| `--netbox-resync-period` | `10m` | how often a `NetBoxNetwork` is checked against NetBox while nothing of it changes, less up to a fifth per network so that they spread out; `0`: on every reconcile ([Load on NetBox](#load-on-netbox)) |
 
 Rules the provider checks at start; a violation is logged and ends the start with exit code 1:
 
@@ -70,6 +72,19 @@ Rules the provider checks at start; a violation is logged and ends the start wit
 | `--vmodule`, `--log-flush-frequency` | `5s` for the latter | the standard Kubernetes logging flags |
 | `--log-text-info-buffer-size`, `--log-text-split-stream`, `--log-json-info-buffer-size`, `--log-json-split-stream` | | alpha logging flags of Kubernetes (they need a feature gate this binary does not expose); `--help` describes them |
 | `--version` | | print the version and exit |
+
+## Load on NetBox
+
+- Only `NetBoxNetwork`s and the claims of `NetBoxIPPool`s talk to NetBox. With `allocator: InCluster` the machines do not.
+- A network is checked against NetBox (its prefix, VIP, ranges, reserved addresses and metadata: about five reads when nothing changed) when its spec or its annotations change, while a condition is not `True`, after a failed reconcile, and once per `--netbox-resync-period`. The other reconciles, woken by its Cluster, its `InClusterIPPool`s or the resync of the cache (`--sync-period`), do the Kubernetes side only: the endpoint of the Cluster, the `InClusterIPPool`s and the Secrets of `publish`. A pool with `sync` reads its addresses in NetBox on each of them, and its `IPAddress`es wake the network; those of other pools do not.
+- A change made in NetBox by hand is put right at the next check: within `--netbox-resync-period`, or at once on an annotation of the network:
+
+  ```bash
+  kubectl -n <namespace> annotate netboxnetwork <name> example.test/check="$(date +%s)" --overwrite
+  ```
+
+- The check times are kept in memory: after a restart or a change of leader every network is checked once, as fast as `--netbox-qps` lets it.
+- `--netbox-qps` and `--netbox-burst` bound what one provider sends whatever happens, but for the one section at a time that holds the write lock: it writes past the limit, so as not to run out of time behind the readers. The providers of several management clusters on one NetBox add up.
 
 ## Optional dependency: in-cluster IPAM
 

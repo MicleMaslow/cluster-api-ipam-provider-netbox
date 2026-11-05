@@ -20,9 +20,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"net/netip"
 	"strings"
 	"testing"
+	"time"
 
 	. "github.com/onsi/gomega"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -176,7 +179,7 @@ func TestInClusterUnavailable(t *testing.T) {
 	nw := inClusterNetwork("ns", "default")
 	nw.Status.Prefix = "10.10.0.16/28"
 
-	err := r.reconcileLayout(ctx, nw, "")
+	err := r.reconcileLayout(ctx, nw, "", false)
 	g.Expect(errReason(err)).To(Equal(v1alpha1.ReasonAllocatorUnavailable))
 	g.Expect(err).To(MatchError(ContainSubstring("install cluster-api-ipam-provider-in-cluster and restart the provider")))
 	g.Expect(writes).To(BeEmpty())
@@ -238,6 +241,56 @@ func metallbNetBox(t *testing.T, writes *[]string) *NetBoxNetworkReconciler {
 	return networkOn(rangeNetBox(t, rangeObject("10.10.0.16", "10.10.0.29", true), func(int32) string { return reserves }, writes))
 }
 
+// A network checked against NetBox and not changed since leaves NetBox alone: an InClusterIPPool changed by hand is put
+// back without a request. An annotation checks it at once.
+func TestInClusterFreshLeavesNetBox(t *testing.T) {
+	g := newG(t)
+	ns := newEnv(t, nil)
+	nw := inClusterNetwork(ns, "default")
+	p := readyLayout(g, nw)
+	var before float64
+	g.Eventually(func() bool { // the reconciles the layout woke are done
+		n := netBoxRequests(g)
+		time.Sleep(2 * time.Second)
+		before = netBoxRequests(g)
+		return n == before
+	}).Should(BeTrue())
+
+	g.Eventually(func(g Gomega) {
+		pool := inClusterPool(g, ns, "workers")
+		pool.Spec.Addresses = []string{span(p, 3, 10)}
+		g.Expect(k8s.Update(ctx, pool)).To(Succeed())
+	}).Should(Succeed())
+	g.Eventually(func(g Gomega) {
+		g.Expect(inClusterPool(g, ns, "workers").Spec).To(Equal(inClusterSpecOf(span(p, 3, 15))))
+	}).Should(Succeed())
+	g.Expect(netBoxRequests(g)).To(Equal(before))
+
+	touch(g, nw)
+	g.Eventually(func() float64 { return netBoxRequests(g) }).Should(BeNumerically(">", before))
+}
+
+// A quick reconcile puts an InClusterIPPool changed by hand back from the status alone: NetBox sees no request.
+func TestInClusterQuickLeavesNetBox(t *testing.T) {
+	g := NewWithT(t)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("NetBox request %s %s", r.Method, r.URL)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	t.Cleanup(srv.Close)
+	r := networkOn(srv)
+	nw, pool := metallbGrows()
+	nw.Spec.Addresses = []v1alpha1.AddressGroup{metallb(2)}
+	pool.Spec.Addresses = []string{"10.10.0.16-10.10.0.20"}
+	r.InCluster = true
+	r.Client = inClusterClient(interceptor.Funcs{}, pool)
+
+	g.Expect(r.reconcileLayout(ctx, nw, "", true)).To(Succeed())
+	got := &inclusterv1.InClusterIPPool{}
+	g.Expect(r.Get(ctx, client.ObjectKeyFromObject(pool), got)).To(Succeed())
+	g.Expect(got.Spec).To(Equal(inClusterSpecOf("10.10.0.16-10.10.0.29")))
+}
+
 // The in-cluster webhook refuses a pool that gives up an allocated address: RangeInUse with its text, NetBox untouched.
 func TestInClusterRejectedUpdateStopsNetBox(t *testing.T) {
 	g := NewWithT(t)
@@ -254,7 +307,7 @@ func TestInClusterRejectedUpdateStopsNetBox(t *testing.T) {
 		},
 	}, pool)
 
-	err := r.reconcileLayout(ctx, nw, "")
+	err := r.reconcileLayout(ctx, nw, "", false)
 	g.Expect(errReason(err)).To(Equal(v1alpha1.ReasonRangeInUse))
 	g.Expect(err).To(MatchError(ContainSubstring("pool addresses do not contain allocated addresses: [10.10.0.29]")))
 	g.Expect(writes).To(BeEmpty())
@@ -275,7 +328,7 @@ func TestInClusterApplyOrder(t *testing.T) {
 		},
 	}, pool)
 
-	g.Expect(r.reconcileLayout(ctx, nw, "")).To(Succeed())
+	g.Expect(r.reconcileLayout(ctx, nw, "", false)).To(Succeed())
 	g.Expect(writes).To(HaveLen(3))
 	g.Expect(writes[0]).To(Equal("UPDATE *v1alpha2.InClusterIPPool workers"))
 	g.Expect(writes[1]).To(Equal(`PATCH /api/ipam/ip-ranges/7/ {"changelog_message":"capi: resized by NetBoxNetwork/ns/default/pool/workers","end_address":"10.10.0.28/22","mark_populated":false,"start_address":"10.10.0.16/22","status":"active"}`))

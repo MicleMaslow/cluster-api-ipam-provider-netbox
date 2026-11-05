@@ -56,7 +56,7 @@ metadata:
   name: netbox
   namespace: capi-ipam-netbox-system
 spec:
-  version: v0.1.0
+  version: v0.2.0
   configSecret:
     name: netbox-variables
   fetchConfig:
@@ -68,7 +68,7 @@ spec:
 - `kubectl -n capi-ipam-netbox-system get ipamprovider netbox` shows the installed version and `READY True`; then run [Check](#check).
 - Deployment patches (private CA, token file) go into `spec.patches` with `target: {kind: Deployment, name: capi-ipam-netbox-controller-manager}` and the operations of the `kubectl patch` commands below, so the operator keeps them.
 - Upgrade: change `spec.version`. Remove: delete the `IPAMProvider`; the CRDs, ClusterRoles and ClusterRoleBinding stay, as with clusterctl ([Remove](#remove)).
-- Air-gapped: put `ipam-components.yaml` and `metadata.yaml` of the release into a ConfigMap with the keys `components` and `metadata` and the label `provider.cluster.x-k8s.io/version: v0.1.0`, and use `fetchConfig.selector` with its labels instead of `url`.
+- Air-gapped: put `ipam-components.yaml` and `metadata.yaml` of the release into a ConfigMap with the keys `components` and `metadata` and the label `provider.cluster.x-k8s.io/version: v0.2.0`, and use `fetchConfig.selector` with its labels instead of `url`.
 
 ### In-cluster IPAM
 
@@ -144,8 +144,8 @@ The CA patch after the token patch is the same with the CA volume and mount.
 A local build is installed from a local clusterctl repository. `make release` writes it to `out/repo`, with the image `<REGISTRY>/cluster-api-ipam-provider-netbox:<RELEASE_TAG>`; push that image, or load it into a kind cluster with `kind load docker-image`:
 
 ```bash
-make release RELEASE_TAG=v0.1.0 REGISTRY=registry.example.com/capi
-make docker-build docker-push RELEASE_TAG=v0.1.0 REGISTRY=registry.example.com/capi   # docker-push-all: linux/amd64 and linux/arm64
+make release RELEASE_TAG=v0.2.0 REGISTRY=registry.example.com/capi
+make docker-build docker-push RELEASE_TAG=v0.2.0 REGISTRY=registry.example.com/capi   # docker-push-all: linux/amd64 and linux/arm64
 NETBOX_URL=... NETBOX_TOKEN=... clusterctl init --ipam netbox --config hack/dev/clusterctl.yaml
 ```
 

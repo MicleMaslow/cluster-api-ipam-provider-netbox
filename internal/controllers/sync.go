@@ -60,7 +60,7 @@ type synced struct {
 	keep      bool // fields unknown (the claim is gone, a template fails): an existing address is left as it is
 }
 
-// addressToNetwork wakes the network that controls the InClusterIPPool of an IPAddress.
+// addressToNetwork wakes the network that controls the InClusterIPPool of an IPAddress, if that pool syncs.
 func (r *NetBoxNetworkReconciler) addressToNetwork(ctx context.Context, o client.Object) []reconcile.Request {
 	a, ok := asType[*ipamv1.IPAddress](ctx, o)
 	if !ok || a.Spec.PoolRef.APIGroup != inclusterv1.GroupVersion.Group || a.Spec.PoolRef.Kind != "InClusterIPPool" {
@@ -77,7 +77,15 @@ func (r *NetBoxNetworkReconciler) addressToNetwork(ctx context.Context, o client
 	if gv, err := schema.ParseGroupVersion(ref.APIVersion); err != nil || gv.Group != v1alpha1.GroupVersion.Group {
 		return nil
 	}
-	return []reconcile.Request{{NamespacedName: types.NamespacedName{Namespace: a.Namespace, Name: ref.Name}}}
+	// Only the sync acts on an IPAddress: a pool without one wakes nothing.
+	nw := &v1alpha1.NetBoxNetwork{}
+	key := types.NamespacedName{Namespace: a.Namespace, Name: ref.Name}
+	if err := r.Get(ctx, key, nw); err != nil || !slices.ContainsFunc(nw.Spec.Pools, func(p v1alpha1.NetworkPool) bool {
+		return p.Name == pool.Name && ptr.Deref(p.Sync.Enabled, false)
+	}) {
+		return nil
+	}
+	return []reconcile.Request{{NamespacedName: key}}
 }
 
 // syncAddresses brings the NetBox addresses under the sync keys of nw to the IPAddresses of the InClusterIPPools of

@@ -14,6 +14,7 @@ The metrics are served by the diagnostics endpoint (`--diagnostics-address`, `:8
 |---|---|---|
 | `netbox_ipam_requests_total` | `method`, `path`, `code` | requests to the NetBox API; `path` is the API path with numeric segments replaced by `{id}`, `code` the HTTP status or `error` when there was no response |
 | `netbox_ipam_request_duration_seconds` | `method`, `path` | duration of those requests |
+| `netbox_ipam_request_wait_seconds` | | time a request waited for the rate limit of the provider (`--netbox-qps`, `--netbox-burst`) before it was sent |
 | `netbox_ipam_write_lock_wait_seconds` | | time a section that writes to NetBox waited for the write lock; reconciles that only read NetBox never wait |
 
 Queries to start with:

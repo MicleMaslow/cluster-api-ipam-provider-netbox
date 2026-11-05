@@ -19,6 +19,7 @@ package controllers
 import (
 	"cmp"
 	"context"
+	"sync"
 	"time"
 
 	"golang.org/x/time/rate"
@@ -46,6 +47,10 @@ type Options struct {
 	NetworkConcurrency int
 	PoolConcurrency    int
 	ClaimConcurrency   int
+
+	// NetBoxResyncPeriod is how often a network is checked against NetBox while nothing of it changes; 0 is on
+	// every reconcile.
+	NetBoxResyncPeriod time.Duration
 }
 
 // +kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;patch
@@ -80,7 +85,7 @@ func Setup(ctx context.Context, mgr ctrl.Manager, o Options) error {
 	}
 	if err := (&NetBoxNetworkReconciler{
 		Client: c, APIReader: mgr.GetAPIReader(), NetBox: o.NetBox, Keys: keys, WatchFilterValue: o.WatchFilterValue, Recorder: o.Recorder,
-		InCluster: inCluster,
+		InCluster: inCluster, ResyncPeriod: o.NetBoxResyncPeriod, checks: &sync.Map{},
 	}).SetupWithManager(ctx, mgr, controller.Options{MaxConcurrentReconciles: o.NetworkConcurrency, RateLimiter: rateLimiter()}); err != nil {
 		return err
 	}

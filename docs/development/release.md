@@ -9,7 +9,7 @@ Goal: publish a release: the image on ghcr.io and the manifests clusterctl insta
 2. **Build it locally first.** `RELEASE_TAG` is `vX.Y.Z`, or `vX.Y.Z-{alpha,beta,rc}.N`:
 
    ```bash
-   make release RELEASE_TAG=v0.1.0-rc.0
+   make release RELEASE_TAG=v0.2.0-rc.0
    ```
 
    It writes `out/ipam-components.yaml` (the manifests with the image `<REGISTRY>/cluster-api-ipam-provider-netbox:<tag>`), `out/metadata.yaml`, and a local clusterctl repository in `out/repo`. Installing from it is [A build of your own](../getting-started/install.md#a-build-of-your-own); on the dev stand see [Dev stand](dev-stand.md#run-inside-kind).

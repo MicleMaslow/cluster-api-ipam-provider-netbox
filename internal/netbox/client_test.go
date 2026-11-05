@@ -33,8 +33,10 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus/testutil"
+	"golang.org/x/time/rate"
 
 	"github.com/MicleMaslow/cluster-api-ipam-provider-netbox/internal/version"
 )
@@ -595,5 +597,36 @@ func TestMetricsRecorded(t *testing.T) {
 	}
 	if got := count("GET", "ipam/prefixes/{id}/", "error"); got != failed+1 {
 		t.Errorf("error count %v, want %v", got, failed+1)
+	}
+}
+
+// A request waits for a token of the limiter, at most until its context ends; one that cannot get it is not sent.
+func TestLimiter(t *testing.T) {
+	sent := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		sent++
+		w.Header().Set("ETag", `W/"e1"`)
+		_, _ = io.WriteString(w, `{"id":1}`)
+	}))
+	t.Cleanup(srv.Close)
+	c := &Client{URL: srv.URL, Token: "t", Limiter: rate.NewLimiter(rate.Every(time.Hour), 1)}
+	if _, _, err := c.Get(ctx, Prefixes, 1); err != nil {
+		t.Fatal(err)
+	}
+	short, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
+	defer cancel()
+	if _, _, err := c.Get(short, Prefixes, 1); err == nil || !strings.HasPrefix(err.Error(), "GET ipam/prefixes/1/: waiting for the rate limit of the client: rate: ") {
+		t.Errorf("err = %v", err)
+	}
+	if sent != 1 {
+		t.Errorf("sent %d requests, want 1", sent)
+	}
+}
+
+// A copy without the limiter sends at once; c keeps its limiter.
+func TestUnlimited(t *testing.T) {
+	c := &Client{Limiter: rate.NewLimiter(rate.Every(time.Hour), 1)}
+	if c.Unlimited().Limiter != nil || c.Limiter == nil {
+		t.Error("Unlimited must drop the limiter of the copy only")
 	}
 }

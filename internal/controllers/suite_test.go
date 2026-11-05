@@ -24,7 +24,9 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
+	"golang.org/x/time/rate"
 	"k8s.io/apimachinery/pkg/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	inclusterv1 "sigs.k8s.io/cluster-api-ipam-provider-in-cluster/api/v1alpha2"
@@ -98,7 +100,8 @@ func run(m *testing.M) int {
 	}
 	fmt.Fprintf(os.Stderr, "NetBox test mode: instance %q, ref %s\n", keys.Instance, keys.Ref)
 
-	nb := &netbox.Client{URL: os.Getenv("NETBOX_URL"), Token: os.Getenv("NETBOX_TOKEN")}
+	// Limited as in a deployment, high enough not to slow the suite.
+	nb := &netbox.Client{URL: os.Getenv("NETBOX_URL"), Token: os.Getenv("NETBOX_TOKEN"), Limiter: rate.NewLimiter(100, 200)}
 	admin = &netbox.Client{URL: os.Getenv("NETBOX_URL"), Token: os.Getenv("NETBOX_ADMIN_TOKEN")}
 	if err := nb.Preflight(ctx, keys); err != nil {
 		panic(err)
@@ -113,6 +116,7 @@ func run(m *testing.M) int {
 	if err := Setup(mgrCtx, mgr, Options{
 		NetBox: nb, Keys: keys, Recorder: mgr.GetEventRecorder("netbox-ipam"),
 		NetworkConcurrency: DefaultConcurrency, PoolConcurrency: DefaultConcurrency, ClaimConcurrency: DefaultConcurrency,
+		NetBoxResyncPeriod: 10 * time.Minute,
 	}); err != nil {
 		panic(err)
 	}

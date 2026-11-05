@@ -21,17 +21,21 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"net/netip"
 	"net/url"
 	"path"
 	"slices"
 	"strings"
+	"sync"
+	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	kerrors "k8s.io/apimachinery/pkg/util/errors"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/tools/events"
 	"k8s.io/klog/v2"
 	"k8s.io/utils/ptr"
@@ -80,6 +84,74 @@ type NetBoxNetworkReconciler struct {
 	WatchFilterValue string
 	Recorder         events.EventRecorder
 	InCluster        bool // InClusterIPPool is served
+	// ResyncPeriod is how often a network is checked against NetBox while nothing of it changes; 0 is on every
+	// reconcile.
+	ResyncPeriod time.Duration
+
+	checks *sync.Map // client.ObjectKey to check; nil keeps none
+}
+
+// check is the last check of a network against NetBox: the object, its generation and annotations then, and when the
+// next is due.
+type check struct {
+	uid         types.UID
+	generation  int64
+	annotations map[string]string
+	due         time.Time
+}
+
+// fresh reports whether nw was checked against NetBox, and that check is not due yet: the same object, neither its
+// spec nor its annotations changed since, and settled. The reconcile then leaves NetBox alone; an annotation forces a
+// check at once.
+func (r *NetBoxNetworkReconciler) fresh(nw *v1alpha1.NetBoxNetwork) bool {
+	c, ok := r.lastCheck(nw)
+	return ok && c.uid == nw.UID && c.generation == nw.Generation && maps.Equal(c.annotations, nw.Annotations) &&
+		time.Now().Before(c.due) && settled(nw)
+}
+
+// settled reports whether nw has its prefix and Ready True, and each of its other conditions that are there True,
+// all for its generation.
+func settled(nw *v1alpha1.NetBoxNetwork) bool {
+	if nw.Status.PrefixID == 0 || meta.FindStatusCondition(nw.Status.Conditions, v1alpha1.ReadyCondition) == nil {
+		return false
+	}
+	for _, t := range []string{v1alpha1.ReadyCondition, v1alpha1.MetadataSyncedCondition, v1alpha1.LayoutReadyCondition, v1alpha1.ControlPlaneEndpointReadyCondition} {
+		if cond := meta.FindStatusCondition(nw.Status.Conditions, t); cond != nil && (cond.Status != metav1.ConditionTrue || cond.ObservedGeneration != nw.Generation) {
+			return false
+		}
+	}
+	return true
+}
+
+// lastCheck is the last check of nw against NetBox, if any is kept.
+func (r *NetBoxNetworkReconciler) lastCheck(nw *v1alpha1.NetBoxNetwork) (check, bool) {
+	if r.checks == nil {
+		return check{}, false
+	}
+	v, _ := r.checks.Load(client.ObjectKeyFromObject(nw))
+	c, ok := v.(check)
+	return c, ok
+}
+
+// nextCheck records a check of nw against NetBox, unless quick, and returns the time until the next one: a
+// ResyncPeriod less up to a fifth, so that networks drift apart and a resync of the cache finds them fresh.
+func (r *NetBoxNetworkReconciler) nextCheck(nw *v1alpha1.NetBoxNetwork, quick bool) time.Duration {
+	if r.checks == nil || r.ResyncPeriod <= 0 {
+		return 0
+	}
+	if c, ok := r.lastCheck(nw); ok && quick {
+		return max(time.Until(c.due), time.Second) // a reconcile past due still leaves the check queued
+	}
+	d := wait.Jitter(r.ResyncPeriod*4/5, 0.25)
+	r.checks.Store(client.ObjectKeyFromObject(nw), check{uid: nw.UID, generation: nw.Generation, annotations: maps.Clone(nw.Annotations), due: time.Now().Add(d)})
+	return d
+}
+
+// forget drops the check of the network key: its next reconcile checks it against NetBox.
+func (r *NetBoxNetworkReconciler) forget(key types.NamespacedName) {
+	if r.checks != nil {
+		r.checks.Delete(key)
+	}
 }
 
 // +kubebuilder:rbac:groups=ipam.cluster.x-k8s.io,resources=netboxnetworks,verbs=get;list;watch;update;patch
@@ -142,6 +214,9 @@ func poolToNetworks(ctx context.Context, o client.Object) []reconcile.Request {
 func (r *NetBoxNetworkReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ ctrl.Result, reterr error) {
 	nw := &v1alpha1.NetBoxNetwork{}
 	if err := r.Get(ctx, req.NamespacedName, nw); err != nil {
+		if apierrors.IsNotFound(err) {
+			r.forget(req.NamespacedName)
+		}
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 	if r.WatchFilterValue != "" && !labels.HasWatchLabel(nw, r.WatchFilterValue) {
@@ -169,6 +244,7 @@ func (r *NetBoxNetworkReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	}
 	defer func() {
 		if err := helper.Patch(ctx, nw); err != nil {
+			r.forget(req.NamespacedName) // the check is not in the status
 			reterr = kerrors.NewAggregate([]error{reterr, err})
 		}
 	}()
@@ -183,13 +259,16 @@ func (r *NetBoxNetworkReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	if nw.Spec.ControlPlaneEndpoint == nil {
 		meta.RemoveStatusCondition(&nw.Status.Conditions, v1alpha1.ControlPlaneEndpointReadyCondition)
 	}
+	// A fresh network does the Kubernetes side only, and the sync of addresses that woke it.
+	quick := r.fresh(nw)
 	var vipErr, attrsErr error
 	if _, _, err = networkTexts(nw); err == nil {
-		if cluster == nil && nw.Status.PrefixID == 0 {
+		switch {
+		case cluster == nil && nw.Status.PrefixID == 0:
 			// Nothing reaches NetBox before the Cluster: after a move or restore the status is gone, and until the Cluster
 			// exists (and is unpaused) nw must not act; the Cluster may also come with an endpoint of its own. The Cluster watch wakes nw.
 			err = waitFor(v1alpha1.ReasonWaitingForCluster, fmt.Errorf("cluster %s does not exist", nw.Spec.ClusterName))
-		} else {
+		case !quick:
 			vipErr, attrsErr, err = r.reconcileNormal(ctx, nw, cluster)
 		}
 	}
@@ -213,20 +292,27 @@ func (r *NetBoxNetworkReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	}
 	var layoutErr error
 	if laidOut {
-		layoutErr = r.reconcileLayout(ctx, nw, hostOf(cluster))
+		layoutErr = r.reconcileLayout(ctx, nw, hostOf(cluster), quick)
 		setCondition(&nw.Status.Conditions, v1alpha1.LayoutReadyCondition, v1alpha1.ReasonReady, nw.Generation, layoutErr)
 	} else {
 		meta.RemoveStatusCondition(&nw.Status.Conditions, v1alpha1.LayoutReadyCondition)
 	}
-	err = foldErrors([]error{attrsErr, r.syncMetadata(ctx, nw, nw.Status.PrefixID)})
-	setCondition(&nw.Status.Conditions, v1alpha1.MetadataSyncedCondition, v1alpha1.ReasonSynced, nw.Generation, err)
+	if !quick {
+		err = foldErrors([]error{attrsErr, r.syncMetadata(ctx, nw, nw.Status.PrefixID)})
+		setCondition(&nw.Status.Conditions, v1alpha1.MetadataSyncedCondition, v1alpha1.ReasonSynced, nw.Generation, err)
+	}
 	if errors.Is(vipErr, errClusterChanged) {
 		if _, err := toResult(foldErrors([]error{err, layoutErr})); err != nil {
 			return ctrl.Result{}, err
 		}
 		return ctrl.Result{Requeue: true}, nil //nolint:staticcheck // rate-limited: a Cluster that keeps changing backs off
 	}
-	return toResult(foldErrors([]error{vipErr, err, layoutErr}))
+	res, err := toResult(foldErrors([]error{vipErr, err, layoutErr}))
+	if err != nil || !res.IsZero() || !settled(nw) { // a wait or InvalidSpec keeps its own retries
+		r.forget(req.NamespacedName)
+		return res, err
+	}
+	return ctrl.Result{RequeueAfter: r.nextCheck(nw, quick)}, nil
 }
 
 // getCluster returns the Cluster of nw from the cache, or nil if there is none.

@@ -371,7 +371,7 @@ func TestLayoutKeepsTopForVIP(t *testing.T) {
 	nw := layoutNetwork("ns", "default")
 	nw.Spec.ControlPlaneEndpoint = &v1alpha1.ControlPlaneEndpoint{}
 	nw.Status.Prefix = "10.10.0.16/28"
-	g.Expect(r.reconcileLayout(ctx, nw, "")).To(Succeed())
+	g.Expect(r.reconcileLayout(ctx, nw, "", false)).To(Succeed())
 	g.Expect(spans(nw.Status.Layout.Pools[1].Ranges)).To(Equal([]string{"10.10.0.19-10.10.0.30"}))
 }
 
@@ -387,7 +387,7 @@ func TestAdoptKeepsOffClusterEndpoint(t *testing.T) {
 	r := networkOn(rangeNetBox(t, "", func(int32) string { return ips }, &writes))
 	nw := reserveNetwork("ns", "default")
 	nw.Status.Prefix = "10.10.0.16/28"
-	g.Expect(r.reconcileLayout(ctx, nw, "10.10.0.31")).To(Succeed())
+	g.Expect(r.reconcileLayout(ctx, nw, "10.10.0.31", false)).To(Succeed())
 	g.Expect(nw.Status.Layout.Addresses).To(Equal([]v1alpha1.AddressGroupLayout{{Name: "metallb", Count: 2, Addresses: []string{"10.10.0.30", "10.10.0.29"}}}))
 	g.Expect(spans(nw.Status.Layout.Pools[1].Ranges)).To(Equal([]string{"10.10.0.19-10.10.0.27"}), "the VIP keeps 10.10.0.28")
 }
@@ -436,7 +436,7 @@ func TestReserveRefusesAllocatedAddress(t *testing.T) {
 	nw := layoutNetwork("ns", "default")
 	nw.Spec.Addresses = []v1alpha1.AddressGroup{metallb(2)}
 	nw.Status.Prefix = "10.10.0.16/28"
-	err := r.reconcileLayout(ctx, nw, "")
+	err := r.reconcileLayout(ctx, nw, "", false)
 	g.Expect(errReason(err)).To(Equal(v1alpha1.ReasonRangeInUse))
 	g.Expect(err).To(MatchError(ContainSubstring("10.10.0.31")))
 	g.Expect(writes).To(BeEmpty())
@@ -496,7 +496,7 @@ func TestLayoutKeepsOffFoundVIP(t *testing.T) {
 	nw := layoutNetwork("ns", "default")
 	nw.Spec.ControlPlaneEndpoint = &v1alpha1.ControlPlaneEndpoint{}
 	nw.Status.Prefix = "10.10.0.16/28"
-	g.Expect(r.reconcileLayout(ctx, nw, "")).To(Succeed())
+	g.Expect(r.reconcileLayout(ctx, nw, "", false)).To(Succeed())
 	g.Expect(writes).To(BeEmpty())
 	g.Expect(spans(nw.Status.Layout.Pools[1].Ranges)).To(Equal([]string{"10.10.0.19-10.10.0.25", "10.10.0.27-10.10.0.31"}))
 }

@@ -32,6 +32,7 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -1884,4 +1885,41 @@ func TestNetworkDeleteFindsByKey(t *testing.T) {
 			"GET /api/ipam/ip-addresses/?cf_capi_ref__isw=NetBoxNetwork%2Fns%2Fdefault%2Faddresses%2F&limit=1000&ordering=id",
 		}), name)
 	}
+}
+
+// A network is fresh from a check until the next is due, while it is the same object with its generation, annotations,
+// prefix and True conditions; a quick reconcile keeps the time of the check. Without a period every reconcile checks.
+func TestNetworkFresh(t *testing.T) {
+	g := NewWithT(t)
+	r := &NetBoxNetworkReconciler{ResyncPeriod: 10 * time.Minute, checks: &sync.Map{}}
+	nw := newNetwork("ns", "default")
+	nw.UID, nw.Generation, nw.Status.PrefixID = "u1", 2, 7
+	nw.Status.Conditions = []metav1.Condition{
+		{Type: v1alpha1.ReadyCondition, Status: metav1.ConditionTrue, Reason: v1alpha1.ReasonReady, ObservedGeneration: 2},
+		{Type: v1alpha1.LayoutReadyCondition, Status: metav1.ConditionTrue, Reason: v1alpha1.ReasonReady, ObservedGeneration: 2},
+	}
+	g.Expect(r.fresh(nw)).To(BeFalse())
+	d := r.nextCheck(nw, false)
+	g.Expect(d).To(And(BeNumerically(">=", 8*time.Minute), BeNumerically("<=", 10*time.Minute)))
+	g.Expect(r.fresh(nw)).To(BeTrue())
+	g.Expect(r.nextCheck(nw, true)).To(And(BeNumerically(">", d-time.Second), BeNumerically("<=", d)))
+
+	for name, change := range map[string]func(*v1alpha1.NetBoxNetwork){
+		"generation": func(nw *v1alpha1.NetBoxNetwork) { nw.Generation = 3 },
+		"annotation": func(nw *v1alpha1.NetBoxNetwork) { nw.Annotations = map[string]string{"example.test/check": "now"} },
+		"condition":  func(nw *v1alpha1.NetBoxNetwork) { nw.Status.Conditions[1].Status = metav1.ConditionFalse },
+		"observed":   func(nw *v1alpha1.NetBoxNetwork) { nw.Status.Conditions[0].ObservedGeneration = 1 },
+		"object":     func(nw *v1alpha1.NetBoxNetwork) { nw.UID = "u2" },
+		"prefix":     func(nw *v1alpha1.NetBoxNetwork) { nw.Status.PrefixID = 0 },
+		"no ready":   func(nw *v1alpha1.NetBoxNetwork) { nw.Status.Conditions = nw.Status.Conditions[1:] },
+	} {
+		changed := nw.DeepCopy()
+		change(changed)
+		g.Expect(r.fresh(changed)).To(BeFalse(), name)
+	}
+
+	every := &NetBoxNetworkReconciler{checks: &sync.Map{}}
+	g.Expect(every.nextCheck(nw, false)).To(BeZero())
+	g.Expect(every.fresh(nw)).To(BeFalse())
+	g.Expect((&NetBoxNetworkReconciler{}).fresh(nw)).To(BeFalse())
 }
