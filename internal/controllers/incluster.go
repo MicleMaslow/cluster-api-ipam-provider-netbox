@@ -56,25 +56,22 @@ func inClusterServed(m meta.RESTMapper) (bool, error) {
 }
 
 // inClusterSpec is the spec of the InClusterIPPool of p: the span of its ranges with the mask and gateway of the L2
-// network, without the addresses between the ranges and live, those in use in the span.
-func inClusterSpec(nw *v1alpha1.NetBoxNetwork, p layout.PlacedPool, live []netip.Addr) inclusterv1.InClusterIPPoolSpec {
+// network, without the addresses between the ranges and excluded, those of its excludedAddresses.
+func inClusterSpec(nw *v1alpha1.NetBoxNetwork, p layout.PlacedPool, excluded []layout.Span) inclusterv1.InClusterIPPoolSpec {
 	l2, gw, _ := l2Of(nw) // the CRD validates both
-	out := p.Gaps()
-	for _, a := range live {
-		out = append(out, layout.Span{From: a, To: a})
-	}
+	out := append(p.Gaps(), excluded...)
 	slices.SortFunc(out, func(a, b layout.Span) int { return a.From.Compare(b.From) })
-	var excluded []string
+	var strs []string
 	for i := 0; i < len(out); {
 		s := out[i]
 		for i++; i < len(out) && !s.To.Next().Less(out[i].From); i++ {
 			s.To = maxAddr(s.To, out[i].To)
 		}
-		excluded = append(excluded, spanString(s))
+		strs = append(strs, spanString(s))
 	}
 	return inclusterv1.InClusterIPPoolSpec{
 		Addresses: []string{p.Ranges[0].From.String() + "-" + p.Ranges[len(p.Ranges)-1].To.String()},
-		Prefix:    l2.Bits(), Gateway: gw.String(), ExcludedAddresses: excluded,
+		Prefix:    l2.Bits(), Gateway: gw.String(), ExcludedAddresses: strs,
 		AddressReuseGracePeriodSeconds: ptr.To(inClusterGracePeriod),
 	}
 }
@@ -116,6 +113,20 @@ func spanOf(s string) (layout.Span, bool) {
 	return layout.Span{From: a, To: b}, aerr == nil && berr == nil
 }
 
+// excludedOf returns the spans of the excludedAddresses of spec.pools, by pool; an entry that is not an IPv4 address,
+// a-b or CIDR is InvalidSpec.
+func excludedOf(nw *v1alpha1.NetBoxNetwork) (map[string][]layout.Span, error) {
+	out := map[string][]layout.Span{}
+	for _, p := range nw.Spec.Pools {
+		spans, ok := addressSpans(p.ExcludedAddresses)
+		if !ok || slices.ContainsFunc(spans, func(sp layout.Span) bool { return !sp.From.Is4() || !sp.To.Is4() || sp.To.Less(sp.From) }) {
+			return nil, withReason(v1alpha1.ReasonInvalidSpec, fmt.Errorf("pool %s: excludedAddresses %s are not addresses, ranges or CIDRs", p.Name, strings.Join(p.ExcludedAddresses, ", ")))
+		}
+		out[p.Name] = spans
+	}
+	return out, nil
+}
+
 // addressSpans are the spans of addresses of an InClusterIPPool, as in-cluster reads them: a-b, CIDRs and addresses.
 func addressSpans(addrs []string) ([]layout.Span, bool) {
 	out := make([]layout.Span, 0, len(addrs))
@@ -136,28 +147,27 @@ func addressSpans(addrs []string) ([]layout.Span, bool) {
 
 // inClusterPositions places the pools of spec.pools that have an InClusterIPPool of their name, controlled by nw or by
 // nothing, on the free runs of its addresses (layout.Runs): a network that takes over a running cluster keeps the
-// positions the pools have. What a pool excludes stays excluded; pools that overlap are InvalidSpec.
+// positions the pools have. NetBox addresses inside the pools are their machines' and do not split them; what a pool
+// excludes stays excluded; pools that overlap are InvalidSpec.
 func (r *NetBoxNetworkReconciler) inClusterPositions(ctx context.Context, nw *v1alpha1.NetBoxNetwork, prefix netip.Prefix) ([]layout.PlacedPool, error) {
 	list := &inclusterv1.InClusterIPPoolList{}
 	if err := r.List(ctx, list, client.InNamespace(nw.Namespace)); err != nil {
 		return nil, apiError(err)
 	}
-	var pools []*inclusterv1.InClusterIPPool
+	type adopted struct {
+		name, addrs     string
+		spans, excluded []layout.Span
+	}
+	var (
+		pools []adopted
+		all   []layout.Span
+	)
 	for _, p := range nw.Spec.Pools {
 		i := slices.IndexFunc(list.Items, func(o inclusterv1.InClusterIPPool) bool { return o.Name == p.Name })
-		if i >= 0 && (metav1.GetControllerOfNoCopy(&list.Items[i]) == nil || managedBy(&list.Items[i], nw)) {
-			pools = append(pools, &list.Items[i])
+		if i < 0 || metav1.GetControllerOfNoCopy(&list.Items[i]) != nil && !managedBy(&list.Items[i], nw) {
+			continue
 		}
-	}
-	if len(pools) == 0 {
-		return nil, nil
-	}
-	s, err := r.space(ctx, nw, prefix)
-	if err != nil {
-		return nil, err
-	}
-	var found []layout.PlacedPool
-	for _, pool := range pools {
+		pool := &list.Items[i]
 		addrs := strings.Join(pool.Spec.Addresses, ", ")
 		spans, ok := addressSpans(pool.Spec.Addresses)
 		if !ok || len(spans) == 0 || slices.ContainsFunc(spans, func(sp layout.Span) bool { return !prefix.Contains(sp.From) || !prefix.Contains(sp.To) }) {
@@ -167,13 +177,25 @@ func (r *NetBoxNetworkReconciler) inClusterPositions(ctx context.Context, nw *v1
 		if !ok {
 			return nil, withReason(v1alpha1.ReasonInvalidSpec, fmt.Errorf("InClusterIPPool %s: excludedAddresses %s are not addresses", pool.Name, strings.Join(pool.Spec.ExcludedAddresses, ", ")))
 		}
+		pools = append(pools, adopted{name: pool.Name, addrs: addrs, spans: spans, excluded: excluded})
+		all = append(all, spans...)
+	}
+	if len(pools) == 0 {
+		return nil, nil
+	}
+	s, err := r.space(ctx, nw, prefix, all...)
+	if err != nil {
+		return nil, err
+	}
+	var found []layout.PlacedPool
+	for _, pool := range pools {
 		ps := s
-		ps.Taken = append(slices.Clone(s.Taken), excluded...)
-		ranges := layout.Runs(ps, spans...)
+		ps.Taken = append(slices.Clone(s.Taken), pool.excluded...)
+		ranges := layout.Runs(ps, pool.spans...)
 		if len(ranges) == 0 {
-			return nil, withReason(v1alpha1.ReasonInvalidSpec, fmt.Errorf("InClusterIPPool %s: no free address in %s", pool.Name, addrs))
+			return nil, withReason(v1alpha1.ReasonInvalidSpec, fmt.Errorf("InClusterIPPool %s: no free address in %s", pool.name, pool.addrs))
 		}
-		found = append(found, layout.PlacedPool{Pool: layout.Pool{Name: pool.Name}, Ranges: ranges})
+		found = append(found, layout.PlacedPool{Pool: layout.Pool{Name: pool.name}, Ranges: ranges})
 	}
 	slices.SortFunc(found, func(a, b layout.PlacedPool) int { return a.Ranges[0].From.Compare(b.Ranges[0].From) })
 	for i := 1; i < len(found); i++ {
@@ -194,43 +216,12 @@ func within(spec, cur inclusterv1.InClusterIPPoolSpec) bool {
 	return cok && nok && !n.From.Less(c.From) && !c.To.Less(n.To)
 }
 
-// liveIn returns, per pool of l, the addresses in use in its span (those s takes, its VIP and the reserves of l) that the
-// pool excludes, and the allocated ones among them, ascending, which stay in the pool: the conflicts.
-func liveIn(l layout.Layout, s layout.Space, allocated []netip.Addr) (live map[string][]netip.Addr, conflicts []netip.Addr) {
-	inUse := slices.Clone(s.Taken)
-	if s.VIP.IsValid() {
-		inUse = append(inUse, layout.Span{From: s.VIP, To: s.VIP})
-	}
-	for _, g := range l.Groups {
-		for _, a := range g.Addrs {
-			inUse = append(inUse, layout.Span{From: a, To: a})
-		}
-	}
-	live = map[string][]netip.Addr{}
-	for _, p := range l.Pools {
-		first, last := p.Ranges[0].From, p.Ranges[len(p.Ranges)-1].To
-		for _, t := range inUse {
-			for a, to := maxAddr(t.From, first), minAddr(t.To, last); a.IsValid() && !to.Less(a); a = a.Next() {
-				if slices.Contains(allocated, a) {
-					conflicts = append(conflicts, a)
-				} else {
-					live[p.Name] = append(live[p.Name], a)
-				}
-			}
-		}
-	}
-	slices.SortFunc(conflicts, netip.Addr.Compare)
-	return live, slices.Compact(conflicts)
-}
-
 // applyInClusterPools brings an InClusterIPPool per pool of l to inClusterSpec and deletes the other pools of nw.
 // As with ranges, pools that keep or shrink their span go first, then pools that go, then new and growing ones:
 // in-cluster checks the addresses in use per pool, so no address is in two pools at once.
-// The addresses in use in the span of a pool (those s takes, its VIP and the reserves of l) are excluded but for
-// allocated ones, which stay in the pool and are AddressConflict once every pool is applied. A pool of the name that
-// nothing controls is adopted; one another controls is Duplicate; a change the in-cluster webhook refuses is RangeInUse.
-// Either stops the rest.
-func (r *NetBoxNetworkReconciler) applyInClusterPools(ctx context.Context, nw *v1alpha1.NetBoxNetwork, l layout.Layout, s layout.Space, allocated []netip.Addr) error {
+// A pool excludes the addresses of excluded under its name. A pool of the name that nothing controls is adopted; one
+// another controls is Duplicate; a change the in-cluster webhook refuses is RangeInUse. Either stops the rest.
+func (r *NetBoxNetworkReconciler) applyInClusterPools(ctx context.Context, nw *v1alpha1.NetBoxNetwork, l layout.Layout, excluded map[string][]layout.Span) error {
 	list := &inclusterv1.InClusterIPPoolList{}
 	if err := r.List(ctx, list, client.InNamespace(nw.Namespace)); err != nil {
 		return apiError(err)
@@ -239,11 +230,10 @@ func (r *NetBoxNetworkReconciler) applyInClusterPools(ctx context.Context, nw *v
 	for i := range list.Items {
 		have[list.Items[i].Name] = &list.Items[i]
 	}
-	live, conflicts := liveIn(l, s, allocated)
 	var grow []string
 	specs := map[string]inclusterv1.InClusterIPPoolSpec{}
 	for _, p := range l.Pools {
-		specs[p.Name] = inClusterSpec(nw, p, live[p.Name])
+		specs[p.Name] = inClusterSpec(nw, p, excluded[p.Name])
 		if cur := have[p.Name]; cur == nil || !within(specs[p.Name], cur.Spec) {
 			grow = append(grow, p.Name)
 		} else if err := r.applyInClusterPool(ctx, nw, p.Name, specs[p.Name], cur); err != nil {
@@ -261,10 +251,6 @@ func (r *NetBoxNetworkReconciler) applyInClusterPools(ctx context.Context, nw *v
 		if err := r.applyInClusterPool(ctx, nw, name, specs[name], have[name]); err != nil {
 			return err
 		}
-	}
-	if len(conflicts) > 0 {
-		return retryLater(v1alpha1.ReasonAddressConflict, fmt.Errorf("addresses in use in NetBox are allocated from the InClusterIPPools, which keep them: %s",
-			listAddresses(conflicts)))
 	}
 	return nil
 }

@@ -33,8 +33,9 @@ const RangesReadyCondition = "RangesReady"
 
 // LayoutReadyCondition is true once spec.pools of a NetBoxNetwork are placed and their ranges are in NetBox.
 // False with InvalidSpec when they do not fit, RangeInUse when a change would move allocated addresses to another pool,
-// AllocatorUnavailable when allocator InCluster has no InClusterIPPool CRD, AddressConflict when an address in use in
-// NetBox is allocated from an InClusterIPPool, SecretConflict when a Secret to publish in exists and is not the network's.
+// AllocatorUnavailable when allocator InCluster has no InClusterIPPool CRD, AddressConflict when a NetBox address of
+// someone else holds the address of an IPAddress to sync, SecretConflict when a Secret to publish in exists and is not
+// the network's.
 // Addresses are published (spec.pools[].publish, spec.addresses[].publish) only once the layout is applied.
 // Unset without spec.pools. It never changes Ready.
 const LayoutReadyCondition = "LayoutReady"

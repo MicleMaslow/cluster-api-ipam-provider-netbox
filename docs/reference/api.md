@@ -39,6 +39,7 @@ The CRD also rejects an IPv6 `parentPrefix` or `gateway`, an L2 network that doe
 | `size` | int 1-65535 or `rest` | the number of free addresses of the pool; `rest` takes those the other pools leave, at least one (`must be a positive number or rest`) |
 | `publish` | [Publish](#publish) | write the addresses of the pool to a Secret ([Published addresses](../guides/networks.md#published-addresses)) |
 | `sync` | [PoolSync](#poolsync) | write the addresses its `InClusterIPPool` hands out to NetBox; needs `allocator: InCluster` (`sync needs allocator InCluster`) |
+| `excludedAddresses` | list of addresses, `a-b` ranges and CIDRs, at most 32 | IPv4 addresses the `InClusterIPPool` of the pool never hands out, merged into its `excludedAddresses`; the size of the pool counts them. Needs `allocator: InCluster` (`excludedAddresses needs allocator InCluster`) ([In-cluster allocator](../guides/in-cluster.md#what-the-network-writes)) |
 
 ### AddressGroup
 

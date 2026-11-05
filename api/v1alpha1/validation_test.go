@@ -381,6 +381,20 @@ func TestValidation(t *testing.T) {
 		wantErr(t, c.Create(ctx, syncing("sync-no-allocator", "", on)), "sync needs allocator InCluster")
 	})
 
+	t.Run("network excludedAddresses", func(t *testing.T) {
+		excluding := func(name string, allocator Allocator) *NetBoxNetwork {
+			return network(name, func(spec *NetBoxNetworkSpec) {
+				spec.Allocator = allocator
+				spec.Pools = []NetworkPool{{Name: "workers", Size: intstr.FromString("rest"), ExcludedAddresses: []string{"10.10.0.40", "10.10.0.42-10.10.0.43"}}}
+			})
+		}
+		if err := c.Create(ctx, excluding("excluded-in-cluster", AllocatorInCluster)); err != nil {
+			t.Errorf("excludedAddresses with InCluster: %v", err)
+		}
+		wantErr(t, c.Create(ctx, excluding("excluded-netbox", AllocatorNetBox)), "excludedAddresses needs allocator InCluster")
+		wantErr(t, c.Create(ctx, excluding("excluded-no-allocator", "")), "excludedAddresses needs allocator InCluster")
+	})
+
 	t.Run("pool ranges", func(t *testing.T) {
 		pool := func(name string, ranges ...IPPoolRange) *NetBoxIPPool {
 			return &NetBoxIPPool{ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: name}, Spec: NetBoxIPPoolSpec{Ranges: ranges}}

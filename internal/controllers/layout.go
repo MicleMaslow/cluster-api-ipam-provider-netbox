@@ -82,11 +82,11 @@ func layoutOf(st v1alpha1.NetworkLayout) layout.Layout {
 
 // reconcileLayout places spec.pools and spec.addresses of nw in its prefix, again only when their names, sizes or counts
 // change or while the VIP waits to be reserved, and brings the layout about in order: reserves the layout drops, then
-// the InClusterIPPools (allocator InCluster), then the ranges of the pools, then the reserves it holds, then the
-// Secrets the pools and groups publish in. A step that fails stops the next ones; a change that would move an
-// allocated address out of its pool is refused as a whole. Once the ranges are there, the IPAddresses of the pools
-// that sync go to NetBox (allocator InCluster). Its error is LayoutReady's. endpoint is the host of the Cluster's
-// endpoint: never adopted by a group, as it is the VIP to be.
+// the InClusterIPPools (allocator InCluster, with the excludedAddresses of spec.pools), then the ranges of the pools,
+// then the reserves it holds, then the Secrets the pools and groups publish in. A step that fails stops the next ones;
+// a change that would move an allocated address out of its pool is refused as a whole. Once the ranges are there, the
+// IPAddresses of the pools that sync go to NetBox (allocator InCluster). Its error is LayoutReady's. endpoint is the
+// host of the Cluster's endpoint: never adopted by a group, as it is the VIP to be.
 func (r *NetBoxNetworkReconciler) reconcileLayout(ctx context.Context, nw *v1alpha1.NetBoxNetwork, endpoint string) error {
 	inCluster := nw.Spec.Allocator == v1alpha1.AllocatorInCluster
 	if inCluster && !r.InCluster {
@@ -115,25 +115,19 @@ func (r *NetBoxNetworkReconciler) reconcileLayout(ctx context.Context, nw *v1alp
 	wantVIP := nw.Spec.ControlPlaneEndpoint != nil && nw.Status.ControlPlaneEndpoint.Host == ""
 	replan := wantVIP || !slices.EqualFunc(prev.Pools, pools, func(p layout.PlacedPool, s layout.Pool) bool { return p.Pool == s }) ||
 		!slices.EqualFunc(prev.Groups, groups, func(p layout.PlacedGroup, g layout.Group) bool { return p.Group == g })
-	// InClusterIPPools exclude what is in use now, so the space is read on every reconcile.
-	var (
-		s         layout.Space
-		allocated []netip.Addr
-	)
-	if replan || inCluster {
-		if s, err = r.space(ctx, nw, prefix); err != nil {
+	next := prev
+	if replan {
+		// The pools of prev hold their NetBox addresses, those adopted before their ranges are in NetBox too.
+		s, err := r.space(ctx, nw, prefix, rangesOf(prev)...)
+		if err != nil {
 			return err
 		}
 		s.WantVIP = wantVIP
-		if replan {
-			s.Adopt = tail(s, pools, groups, prev, endpoint)
-		}
-		if allocated, err = r.allocatedIn(ctx, nw, prefix); err != nil {
+		s.Adopt = tail(s, pools, groups, prev, endpoint)
+		allocated, err := r.allocatedIn(ctx, nw, prefix)
+		if err != nil {
 			return err
 		}
-	}
-	next := prev
-	if replan {
 		if next, err = layout.Plan(s, pools, groups, prev); err != nil {
 			return withReason(v1alpha1.ReasonInvalidSpec, err)
 		}
@@ -149,17 +143,16 @@ func (r *NetBoxNetworkReconciler) reconcileLayout(ctx context.Context, nw *v1alp
 			ctrl.LoggerFrom(ctx).Info("Placed the pools and address groups of the network", "network", klog.KObj(nw), "pools", len(next.Pools), "groups", len(next.Groups))
 		}
 	}
+	excluded, err := excludedOf(nw)
+	if err != nil {
+		return err
+	}
 	if err := r.dropExcessReserves(ctx, nw, next); err != nil {
 		return err
 	}
-	var (
-		conflict error // AddressConflict stops nothing
-		live     map[string][]netip.Addr
-	)
 	if inCluster {
-		live, _ = liveIn(next, s, allocated)
-		if conflict = r.applyInClusterPools(ctx, nw, next, s, allocated); conflict != nil && errReason(conflict) != v1alpha1.ReasonAddressConflict {
-			return conflict
+		if err := r.applyInClusterPools(ctx, nw, next, excluded); err != nil {
+			return err
 		}
 	}
 	if err := r.applyRanges(ctx, nw, next); err != nil {
@@ -169,12 +162,12 @@ func (r *NetBoxNetworkReconciler) reconcileLayout(ctx context.Context, nw *v1alp
 	var publishErr, syncErr error
 	reserveErr := r.applyReserves(ctx, nw, next)
 	if reserveErr == nil {
-		publishErr = r.publish(ctx, nw, publishData(nw, next, live))
+		publishErr = r.publish(ctx, nw, publishData(nw, next, excluded))
 	}
 	if inCluster {
 		syncErr = r.syncAddresses(ctx, nw)
 	}
-	return foldErrors([]error{reserveErr, conflict, publishErr, syncErr})
+	return foldErrors([]error{reserveErr, publishErr, syncErr})
 }
 
 // restore takes the layout of nw back from its active NetBox ranges and its reserves, as after clusterctl move, and
@@ -245,8 +238,10 @@ func (r *NetBoxNetworkReconciler) restore(ctx context.Context, nw *v1alpha1.NetB
 
 // space is what the layout of nw is placed in: its prefix, where NetBox addresses and ranges that are not the network's
 // are taken, and the VIP of its status, else the one NetBox has under its key (a status lost, the VIP not reserved again yet).
-// A taken address without a key, alone at its address and in no range, can be adopted too (layout.Space.Adopt).
-func (r *NetBoxNetworkReconciler) space(ctx context.Context, nw *v1alpha1.NetBoxNetwork, prefix netip.Prefix) (layout.Space, error) {
+// NetBox addresses inside the ranges of its pools, and inside mine, are held (layout.Space.Held): their machines',
+// whoever wrote them. A taken address without a key, alone at its address and in no range, can be adopted too
+// (layout.Space.Adopt).
+func (r *NetBoxNetworkReconciler) space(ctx context.Context, nw *v1alpha1.NetBoxNetwork, prefix netip.Prefix, mine ...layout.Span) (layout.Space, error) {
 	l2, gw, err := l2Of(nw)
 	if err != nil {
 		return layout.Space{}, err
@@ -260,10 +255,26 @@ func (r *NetBoxNetworkReconciler) space(ctx context.Context, nw *v1alpha1.NetBox
 		s.VIP = vip
 	}
 	own, claims, pools := r.Keys.Key("NetBoxNetwork", nw)+"/", r.Keys.KindPrefix("IPAddressClaim"), poolRangeRef(r.Keys, nw, "")
+	var spans []layout.Span
+	for _, o := range ranges {
+		from, to, err := netBoxBounds(o)
+		if err != nil {
+			return layout.Space{}, err
+		}
+		sp := layout.Span{From: from, To: to}
+		spans = append(spans, sp)
+		if strings.HasPrefix(r.Keys.RefOf(o), pools) {
+			mine = append(mine, sp)
+		} else {
+			s.Taken = append(s.Taken, sp)
+		}
+	}
+	in := func(spans []layout.Span, a netip.Addr) bool {
+		return slices.ContainsFunc(spans, func(sp layout.Span) bool { return netmath.Contains(sp.From, sp.To, a) })
+	}
 	var (
 		keyless []netip.Addr
 		held    = map[netip.Addr]int{}
-		spans   []layout.Span
 	)
 	for _, ip := range ips {
 		ref := r.Keys.RefOf(ip)
@@ -272,31 +283,23 @@ func (r *NetBoxNetworkReconciler) space(ctx context.Context, nw *v1alpha1.NetBox
 			return layout.Space{}, err
 		}
 		held[p.Addr()]++
-		if ref == "" {
-			keyless = append(keyless, p.Addr())
-		}
 		switch {
 		case ref == vipRef(r.Keys, nw):
 			if !s.VIP.IsValid() {
 				s.VIP = p.Addr()
 			}
 		case strings.HasPrefix(ref, own), strings.HasPrefix(ref, claims):
+		case in(mine, p.Addr()):
+			s.Held = append(s.Held, p.Addr())
 		default:
+			if ref == "" {
+				keyless = append(keyless, p.Addr())
+			}
 			s.Taken = append(s.Taken, layout.Span{From: p.Addr(), To: p.Addr()})
 		}
 	}
-	for _, o := range ranges {
-		from, to, err := netBoxBounds(o)
-		if err != nil {
-			return layout.Space{}, err
-		}
-		spans = append(spans, layout.Span{From: from, To: to})
-		if !strings.HasPrefix(r.Keys.RefOf(o), pools) {
-			s.Taken = append(s.Taken, layout.Span{From: from, To: to})
-		}
-	}
 	for _, a := range keyless {
-		if held[a] == 1 && !slices.ContainsFunc(spans, func(sp layout.Span) bool { return netmath.Contains(sp.From, sp.To, a) }) {
+		if held[a] == 1 && !in(spans, a) {
 			s.Adopt = append(s.Adopt, a)
 		}
 	}
@@ -315,6 +318,15 @@ func tail(s layout.Space, pools []layout.Pool, groups []layout.Group, prev layou
 		}
 	}
 	return slices.DeleteFunc(slices.Clone(s.Adopt), func(a netip.Addr) bool { return top.IsValid() && !top.Less(a) || a.String() == endpoint })
+}
+
+// rangesOf returns the ranges of the pools of l.
+func rangesOf(l layout.Layout) []layout.Span {
+	var out []layout.Span
+	for _, p := range l.Pools {
+		out = append(out, p.Ranges...)
+	}
+	return out
 }
 
 // topOf is the last address of the ranges of l, zero if it has none.

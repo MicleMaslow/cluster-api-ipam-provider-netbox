@@ -101,17 +101,18 @@ func TestInClusterServed(t *testing.T) {
 	g.Expect(served).To(BeTrue())
 }
 
-// The pool spans its ranges; the addresses between them and those in use are excluded, adjacent ones as one range.
+// The pool spans its ranges; the addresses between them and those it excludes are excluded, adjacent ones as one range.
 func TestInClusterSpec(t *testing.T) {
 	g := NewWithT(t)
 	a := netip.MustParseAddr
+	one := func(s string) layout.Span { return layout.Span{From: a(s), To: a(s)} }
 	nw := newNetwork("ns", "default")
 	pool := func(ranges ...layout.Span) layout.PlacedPool {
 		return layout.PlacedPool{Pool: layout.Pool{Name: "workers", Rest: true}, Ranges: ranges}
 	}
-	g.Expect(inClusterSpec(nw, pool(layout.Span{From: a("10.10.0.2"), To: a("10.10.0.4")}, layout.Span{From: a("10.10.0.6"), To: a("10.10.0.9")}), []netip.Addr{a("10.10.0.8")})).
+	g.Expect(inClusterSpec(nw, pool(layout.Span{From: a("10.10.0.2"), To: a("10.10.0.4")}, layout.Span{From: a("10.10.0.6"), To: a("10.10.0.9")}), []layout.Span{one("10.10.0.8")})).
 		To(Equal(inClusterSpecOf("10.10.0.2-10.10.0.9", "10.10.0.5", "10.10.0.8")))
-	g.Expect(inClusterSpec(nw, pool(layout.Span{From: a("10.10.0.2"), To: a("10.10.0.4")}, layout.Span{From: a("10.10.0.7"), To: a("10.10.0.9")}), []netip.Addr{a("10.10.0.8"), a("10.10.0.4")})).
+	g.Expect(inClusterSpec(nw, pool(layout.Span{From: a("10.10.0.2"), To: a("10.10.0.4")}, layout.Span{From: a("10.10.0.7"), To: a("10.10.0.9")}), []layout.Span{one("10.10.0.8"), one("10.10.0.4")})).
 		To(Equal(inClusterSpecOf("10.10.0.2-10.10.0.9", "10.10.0.4-10.10.0.6", "10.10.0.8")))
 	g.Expect(inClusterSpec(nw, pool(layout.Span{From: a("10.10.0.2"), To: a("10.10.0.9")}), nil)).To(Equal(inClusterSpecOf("10.10.0.2-10.10.0.9")))
 }
@@ -277,7 +278,7 @@ func TestInClusterApplyOrder(t *testing.T) {
 	g.Expect(r.reconcileLayout(ctx, nw, "")).To(Succeed())
 	g.Expect(writes).To(HaveLen(3))
 	g.Expect(writes[0]).To(Equal("UPDATE *v1alpha2.InClusterIPPool workers"))
-	g.Expect(writes[1]).To(Equal(`PATCH /api/ipam/ip-ranges/7/ {"changelog_message":"capi: resized by NetBoxNetwork/ns/default/pool/workers","end_address":"10.10.0.28/22","mark_populated":true,"start_address":"10.10.0.16/22","status":"active"}`))
+	g.Expect(writes[1]).To(Equal(`PATCH /api/ipam/ip-ranges/7/ {"changelog_message":"capi: resized by NetBoxNetwork/ns/default/pool/workers","end_address":"10.10.0.28/22","mark_populated":false,"start_address":"10.10.0.16/22","status":"active"}`))
 	g.Expect(writes[2]).To(HavePrefix("POST /api/ipam/ip-addresses/ "))
 	g.Expect(writes[2]).To(ContainSubstring(`"address":"10.10.0.29/22"`))
 	got := &inclusterv1.InClusterIPPool{}
@@ -312,7 +313,7 @@ func TestInClusterShrinksFirst(t *testing.T) {
 		{Pool: layout.Pool{Name: "cp", Size: 4}, Ranges: []layout.Span{{From: a("10.10.0.16"), To: a("10.10.0.19")}}},
 		{Pool: layout.Pool{Name: "workers", Rest: true}, Ranges: []layout.Span{{From: a("10.10.0.20"), To: a("10.10.0.31")}}},
 	}}
-	g.Expect(r.applyInClusterPools(ctx, nw, l, layout.Space{}, nil)).To(Succeed())
+	g.Expect(r.applyInClusterPools(ctx, nw, l, nil)).To(Succeed())
 	g.Expect(updates).To(Equal([]string{"workers", "cp"}))
 }
 
@@ -335,7 +336,7 @@ func TestInClusterPoolTakesNewUID(t *testing.T) {
 		Ranges: []layout.Span{{From: netip.MustParseAddr("10.10.0.16"), To: netip.MustParseAddr("10.10.0.31")}}}}}
 
 	for range 2 {
-		g.Expect(r.applyInClusterPools(ctx, nw, l, layout.Space{}, nil)).To(Succeed())
+		g.Expect(r.applyInClusterPools(ctx, nw, l, nil)).To(Succeed())
 	}
 	g.Expect(updates).To(Equal(1))
 	pool := &inclusterv1.InClusterIPPool{}
@@ -365,7 +366,7 @@ func TestInClusterPoolAdoptedTakesWatchLabel(t *testing.T) {
 		Ranges: []layout.Span{{From: netip.MustParseAddr("10.10.0.16"), To: netip.MustParseAddr("10.10.0.31")}}}}}
 
 	for range 2 {
-		g.Expect(r.applyInClusterPools(ctx, nw, l, layout.Space{}, nil)).To(Succeed())
+		g.Expect(r.applyInClusterPools(ctx, nw, l, nil)).To(Succeed())
 	}
 	g.Expect(updates).To(Equal(1))
 	pool := &inclusterv1.InClusterIPPool{}
@@ -421,38 +422,52 @@ func TestInClusterPoolsCreated(t *testing.T) {
 		for _, lr := range rangesIn(g, nw, name) {
 			rng, _, err := admin.Get(ctx, netbox.IPRanges, lr.ID)
 			g.Expect(err).NotTo(HaveOccurred())
-			g.Expect(rng.MarkPopulated).To(BeTrue(), name)
+			g.Expect(rng.MarkPopulated).To(BeFalse(), name)
 			g.Expect(rng.Status.Value).To(Equal("active"), name)
 		}
 	}
 	waitEvent(g, ns, "default", "InClusterIPPoolCreated")
 }
 
-// An address taken in NetBox inside a placed pool is excluded from it; once allocated it stays in it, AddressConflict.
-func TestInClusterLiveExclusion(t *testing.T) {
+// NetBox addresses inside a placed pool, whoever writes them (a sync of the VMs), are its machines': nothing excludes
+// them, and a larger count passes over one at the top of the pool.
+func TestInClusterHeldAddresses(t *testing.T) {
+	g := newG(t)
+	ns := newEnv(t, nil)
+	nw := inClusterNetwork(ns, "default")
+	nw.Spec.Addresses = []v1alpha1.AddressGroup{metallb(2)}
+	p := readyLayout(g, nw)
+	g.Expect(k8s.Create(ctx, inClusterAddress(ns, "m1", "workers", addr(p, 3)))).To(Succeed())
+	byHand(t, g, netbox.IPAddresses, map[string]any{"address": addr(p, 3) + "/22", "status": "active"})
+	byHand(t, g, netbox.IPAddresses, map[string]any{"address": addr(p, 13) + "/22", "status": "active"})
+	touch(g, nw)
+	waitLayoutReady(g, nw)
+	g.Consistently(func(g Gomega) {
+		g.Expect(inClusterPool(g, ns, "workers").Spec).To(Equal(inClusterSpecOf(span(p, 3, 13))))
+	}).Should(Succeed())
+
+	setGroups(g, nw, metallb(3))
+	waitLayoutReady(g, nw)
+	g.Expect(inClusterPool(g, ns, "workers").Spec).To(Equal(inClusterSpecOf(span(p, 3, 11))))
+	g.Expect(reserveAddrs(g, nw, "metallb")).To(Equal(at(p, 15, 14, 12)))
+}
+
+// The excludedAddresses of a pool go to its InClusterIPPool as they are; the pool and its ranges stay.
+func TestInClusterExcludedAddresses(t *testing.T) {
 	g := newG(t)
 	ns := newEnv(t, nil)
 	nw := inClusterNetwork(ns, "default")
 	p := readyLayout(g, nw)
-	ranges := rangesIn(g, nw, "workers")
-
-	// NetBox refuses to create an address inside a populated range, not to move one there.
-	ip := byHand(t, g, netbox.IPAddresses, map[string]any{"address": "198.51.100.10/24", "status": "active"})
-	_, err := admin.Patch(ctx, netbox.IPAddresses, ip.ID, "", map[string]any{"address": addr(p, 8) + "/22"})
-	g.Expect(err).NotTo(HaveOccurred())
-	touch(g, nw)
+	updateNetwork(g, nw, func(s *v1alpha1.NetBoxNetworkSpec) {
+		s.Pools[1].ExcludedAddresses = []string{addr(p, 8), span(p, 10, 11)}
+	})
 	g.Eventually(func(g Gomega) {
-		g.Expect(inClusterPool(g, ns, "workers").Spec).To(Equal(inClusterSpecOf(span(p, 3, 15), addr(p, 8))))
+		g.Expect(inClusterPool(g, ns, "workers").Spec).To(Equal(inClusterSpecOf(span(p, 3, 15), addr(p, 8), span(p, 10, 11))))
 	}).Should(Succeed())
-	g.Expect(rangesIn(g, nw, "workers")).To(Equal(ranges))
+	g.Expect(spans(rangesIn(g, nw, "workers"))).To(Equal([]string{span(p, 3, 15)}))
 
-	g.Expect(k8s.Create(ctx, inClusterAddress(ns, "m1", "workers", addr(p, 8)))).To(Succeed())
-	touch(g, nw)
-	waitTypedCondition(g, nw, v1alpha1.LayoutReadyCondition, metav1.ConditionFalse, v1alpha1.ReasonAddressConflict)
-	g.Expect(meta.FindStatusCondition(nw.Status.Conditions, v1alpha1.LayoutReadyCondition).Message).To(ContainSubstring(addr(p, 8)))
-	g.Eventually(func(g Gomega) {
-		g.Expect(inClusterPool(g, ns, "workers").Spec).To(Equal(inClusterSpecOf(span(p, 3, 15))))
-	}).Should(Succeed())
+	updateNetwork(g, nw, func(s *v1alpha1.NetBoxNetworkSpec) { s.Pools[1].ExcludedAddresses = []string{"10.10.0.1/40"} })
+	waitTypedCondition(g, nw, v1alpha1.LayoutReadyCondition, metav1.ConditionFalse, v1alpha1.ReasonInvalidSpec)
 }
 
 // A larger count takes the top of workers while its start is allocated; not while its end is.
@@ -596,17 +611,38 @@ func TestInClusterAdoptSizeMismatch(t *testing.T) {
 	}).Should(Succeed())
 }
 
-// A NetBox address without a key inside an adopted pool is excluded from it: its range splits around it and the
-// size of the pool counts without it.
-func TestInClusterAdoptTakenInsideSpan(t *testing.T) {
+// A NetBox address without a key inside an adopted pool, as a sync of the VMs writes them, is a machine's: the pool
+// keeps it, in one range.
+func TestInClusterAdoptHeldInsideSpan(t *testing.T) {
 	g := newG(t)
 	ns := newEnv(t, nil)
 	p := migratedPrefix
 	byHand(t, g, netbox.IPAddresses, map[string]any{"address": addr(p, 8) + "/22", "status": "active"})
-	nw, _ := migrateNetwork(t, g, ns, 3, 7)
+	nw, _ := migrateNetwork(t, g, ns, 3, 8)
 	waitLayoutReady(g, nw)
-	g.Expect(spans(rangesIn(g, nw, "workers"))).To(Equal([]string{span(p, 5, 7), span(p, 9, 12)}))
-	g.Expect(inClusterPool(g, ns, "workers").Spec).To(Equal(inClusterSpecOf(span(p, 5, 12), addr(p, 8))))
+	g.Expect(spans(rangesIn(g, nw, "workers"))).To(Equal([]string{span(p, 5, 12)}))
+	g.Expect(inClusterPool(g, ns, "workers").Spec).To(Equal(inClusterSpecOf(span(p, 5, 12))))
+}
+
+// An adopted pool of size rest is placed again in the reconcile that adopts it, with the groups: the NetBox addresses
+// inside it stay its machines' there too, and it grows up to the group.
+func TestInClusterAdoptRestHeld(t *testing.T) {
+	g := newG(t)
+	ns := newEnv(t, nil)
+	p := migratedPrefix
+	byHand(t, g, netbox.IPAddresses, map[string]any{"address": addr(p, 8) + "/22", "status": "active"})
+	g.Expect(k8s.Create(ctx, chartPool(ns, "cp", span(p, 2, 4)))).To(Succeed())
+	g.Expect(k8s.Create(ctx, chartPool(ns, "workers", span(p, 5, 12)))).To(Succeed())
+	g.Expect(k8s.Create(ctx, inClusterAddress(ns, "m1", "workers", addr(p, 8)))).To(Succeed())
+	nw := inClusterNetwork(ns, "default")
+	nw.Spec.PrefixLength, nw.Spec.Prefix = 0, p.String()
+	nw.Spec.Pools = []v1alpha1.NetworkPool{netPool("cp", 3), netPool("workers", 0)}
+	nw.Spec.Addresses = []v1alpha1.AddressGroup{metallb(1)}
+	g.Expect(k8s.Create(ctx, nw)).To(Succeed())
+	waitLayoutReady(g, nw)
+	g.Expect(spans(rangesIn(g, nw, "workers"))).To(Equal([]string{span(p, 5, 14)}))
+	g.Expect(inClusterPool(g, ns, "workers").Spec).To(Equal(inClusterSpecOf(span(p, 5, 14))))
+	g.Expect(reserveAddrs(g, nw, "metallb")).To(Equal(at(p, 15)))
 }
 
 // An adopted pool of several addresses takes the free ones of each: those between them stay excluded and do not count.

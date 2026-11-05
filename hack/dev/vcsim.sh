@@ -24,7 +24,9 @@
 #                            (SYNC=1 syncs the addresses of NAME-workers to NetBox, dns_name <machine>.nodes.test);
 #                            LEGACY=1: no network, the cluster as a chart left it (see legacy)
 #   vcsim.sh adopt NAME      the network of a LEGACY cluster NAME, which takes it over
-#   vcsim.sh delete NAME     delete the cluster NAME, its NetBox objects (retained ones with the admin token of
+#   vcsim.sh vmsync NAME     one run of a VM sync of the hypervisor: a NetBox address without a key per IPAddress of
+#                            the cluster NAME, those of gone IPAddresses deleted
+#   vcsim.sh delete NAME     delete the cluster NAME, its NetBox objects (vmsync ones, retained ones with the admin token of
 #                            hack/dev/.env, of the instance NETBOX_INSTANCE if set) and its namespace;
 #                            DELETE_TIMEOUT seconds per wait (default 300)
 set -euo pipefail
@@ -175,15 +177,13 @@ ip_int() {
 int_ip() { echo "$(($1 >> 24 & 255)).$(($1 >> 16 & 255)).$(($1 >> 8 & 255)).$(($1 & 255))"; }
 
 # legacy NAME: the cluster NAME as a chart left it, before any network. In NetBox, with the admin token and without a
-# key: the prefix LEGACY_PREFIX (default 10.10.3.128/26), its MetalLB addresses at offsets -2 and -3 and, with
-# LEGACY_TAKEN_IN_WORKERS=1, an address in the middle of the workers, which the network then excludes from them.
+# key: the prefix LEGACY_PREFIX (default 10.10.3.128/26) and its MetalLB addresses at offsets -2 and -3.
 # The InClusterIPPools NAME-cp at offsets 2-7 and NAME-workers at 8 to -4, without a controller or excludedAddresses.
 legacy() {
   local name=$1 prefix=${LEGACY_PREFIX:-10.10.3.128/26} mask=${PARENT_PREFIX:-10.10.0.0/22} first last ips a
   mask=${mask#*/} first=$(ip_int "${prefix%/*}")
   last=$((first + (1 << (32 - ${prefix#*/})) - 1))
   ips=("$(int_ip $((last - 1))) metallb" "$(int_ip $((last - 2))) metallb")
-  [ -z "${LEGACY_TAKEN_IN_WORKERS:-}" ] || ips+=("$(int_ip $(((first + 8 + last - 3) / 2))) taken")
   echo "NetBox objects of $name without a key, which delete leaves:"
   nb POST ipam/prefixes/ --data "$(jq -nc --arg p "$prefix" --arg d "$name, as a chart left it" '{prefix: $p, description: $d}')" |
     jq -r '"prefix \(.id) \(.prefix)"'
@@ -205,27 +205,38 @@ EOF
 }
 
 # adopt NAME: the network of the LEGACY cluster NAME, which takes over its prefix, pools and MetalLB addresses:
-# allocator InCluster, NAME-cp of 6, NAME-workers of the span of its InClusterIPPool less the NetBox addresses in it.
+# allocator InCluster, NAME-cp of 6, NAME-workers of the span of its InClusterIPPool.
 adopt() {
-  local name=$1 prefix=${LEGACY_PREFIX:-10.10.3.128/26} span from to taken
+  local name=$1 span
   span=$(kubectl -n "$name" get inclusterippool "$name-workers" -o jsonpath='{.spec.addresses[0]}')
-  from=$(ip_int "${span%-*}") to=$(ip_int "${span#*-}")
-  taken=$(nb GET ipam/ip-addresses/ -G --data-urlencode "parent=$prefix" --data-urlencode limit=1000 |
-    jq --argjson from "$from" --argjson to "$to" '[.results[].address | split("/")[0] | split(".") | map(tonumber)
-      | .[0] * 16777216 + .[1] * 65536 + .[2] * 256 + .[3] | select(. >= $from and . <= $to)] | length')
-  echo "$name-workers: $span less $taken NetBox address(es)"
   kubectl apply -f - <<EOF
 apiVersion: ipam.cluster.x-k8s.io/v1alpha1
 kind: NetBoxNetwork
 metadata: {name: $name, namespace: $name}
-spec: {clusterName: $name, parentPrefix: ${PARENT_PREFIX:-10.10.0.0/22}, gateway: ${GATEWAY:-10.10.0.1}, prefix: $prefix,
-  allocator: InCluster, pools: [{name: $name-cp, size: 6}, {name: $name-workers, size: $((to - from + 1 - taken))}],
+spec: {clusterName: $name, parentPrefix: ${PARENT_PREFIX:-10.10.0.0/22}, gateway: ${GATEWAY:-10.10.0.1}, prefix: ${LEGACY_PREFIX:-10.10.3.128/26},
+  allocator: InCluster, pools: [{name: $name-cp, size: 6}, {name: $name-workers, size: $(($(ip_int "${span#*-}") - $(ip_int "${span%-*}") + 1))}],
   addresses: $(metallb "$name")}
 EOF
 }
 
+# vmsync NAME: what a VM sync of the hypervisor writes, once: per IPAddress of the namespace NAME a NetBox address
+# without a key, the description vmsync and the dns_name <VM>.vms.test; its addresses of gone IPAddresses are deleted.
+vmsync() {
+  local name=$1 mask=${PARENT_PREFIX:-10.10.0.0/22} want have a
+  mask=${mask#*/}
+  want=$(kubectl -n "$name" get ipaddresses.ipam.cluster.x-k8s.io -o json | jq -c '[.items[] | {a: .spec.address, vm: (.spec.claimRef.name | sub("-[0-9]+-[0-9]+$"; ""))}]')
+  have=$(nb GET ipam/ip-addresses/ -G --data-urlencode "description=vmsync $name" --data-urlencode limit=1000 | jq -c '.results')
+  for a in $(jq -r --argjson have "$have" '.[] | select(.a as $a | $have | all(.address | split("/")[0] != $a)) | "\(.a),\(.vm)"' <<<"$want"); do
+    nb POST ipam/ip-addresses/ --data "$(jq -nc --arg a "${a%,*}/$mask" --arg vm "${a#*,}" --arg d "vmsync $name" \
+      '{address: $a, status: "active", dns_name: ($vm + ".vms.test"), description: $d}')" | jq -r '"created \(.address) \(.dns_name)"'
+  done
+  for a in $(jq -r --argjson want "$want" '.[] | select(.address | split("/")[0] as $a | $want | all(.a != $a)) | "\(.id),\(.address)"' <<<"$have"); do
+    nb DELETE "ipam/ip-addresses/${a%,*}/" >/dev/null && echo "deleted ${a#*,}"
+  done
+}
+
 delete() {
-  local name=$1 end=$((SECONDS + DELETE_TIMEOUT)) cur token url instance cleanup=()
+  local name=$1 end=$((SECONDS + DELETE_TIMEOUT)) cur token url instance id cleanup=()
   case $name in
     default | kube-* | *-system | cert-manager | local-path-storage)
       echo "refusing to delete $name: not a workload namespace" >&2
@@ -255,6 +266,9 @@ delete() {
   echo "deleting pools and network of $name"
   kubectl -n "$name" delete netboxippool,netboxnetwork --all --ignore-not-found --timeout="${DELETE_TIMEOUT}s" ||
     { echo "pools or network of $name are not deleted after ${DELETE_TIMEOUT}s: kubectl -n $name get netboxippool,netboxnetwork" >&2; exit 1; }
+  for id in $(nb GET ipam/ip-addresses/ -G --data-urlencode "description=vmsync $name" --data-urlencode limit=1000 | jq -r '.results[].id'); do
+    nb DELETE "ipam/ip-addresses/$id/" >/dev/null
+  done
 
   NETBOX_URL=$url NETBOX_TOKEN=$token hack/netbox-cleanup-retained.sh "${cleanup[@]}" ||
     { echo "NetBox cleanup of $name failed: fix it and run delete $name again" >&2; exit 1; }
@@ -270,6 +284,7 @@ case "${1:-}" in
   up) up ;;
   cluster) [ -n "${2:-}" ] || { echo "usage: $0 cluster NAME" >&2; exit 1; }; cluster "$2" ;;
   adopt) [ -n "${2:-}" ] || { echo "usage: $0 adopt NAME" >&2; exit 1; }; adopt "$2" ;;
+  vmsync) [ -n "${2:-}" ] || { echo "usage: $0 vmsync NAME" >&2; exit 1; }; vmsync "$2" ;;
   delete) [ -n "${2:-}" ] || { echo "usage: $0 delete NAME" >&2; exit 1; }; delete "$2" ;;
-  *) echo "usage: $0 up | cluster NAME | adopt NAME | delete NAME" >&2; exit 1 ;;
+  *) echo "usage: $0 up | cluster NAME | adopt NAME | vmsync NAME | delete NAME" >&2; exit 1 ;;
 esac

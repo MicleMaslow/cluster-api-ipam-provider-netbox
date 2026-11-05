@@ -163,6 +163,32 @@ func TestPlanAdoptsTail(t *testing.T) {
 	}
 }
 
+// Held addresses stay in the pools that are placed again; groups and the VIP pass over them.
+func TestPlanHeld(t *testing.T) {
+	s := space()
+	s.Held = []netip.Addr{ip(30), ip(59)}
+	want := Layout{
+		Pools:  []PlacedPool{placed("cp", 6, r(2, 7)), placed("ingress", 8, r(8, 15)), rest("workers", r(16, 57))},
+		Groups: []PlacedGroup{group("metallb", 62, 61, 60, 58)},
+	}
+	if got, err := Plan(s, base, metallb(4), kept); err != nil || !reflect.DeepEqual(got, want) {
+		t.Errorf("Plan = %v, %v\nwant %v", got, err, want)
+	}
+	s.VIP, s.WantVIP, s.Held = netip.Addr{}, true, []netip.Addr{ip(63)}
+	want = Layout{
+		Pools:  []PlacedPool{placed("cp", 6, r(2, 7)), placed("ingress", 8, r(8, 15)), rest("workers", r(16, 59))},
+		Groups: []PlacedGroup{group("metallb", 61, 60)},
+	}
+	if got, err := Plan(s, base, metallb(2), Layout{}); err != nil || !reflect.DeepEqual(got, want) {
+		t.Errorf("VIP: Plan = %v, %v\nwant %v", got, err, want)
+	}
+	// What groups pass over does not count as free for them.
+	s.Held = []netip.Addr{ip(61), ip(62)}
+	if _, err := Plan(s, []Pool{{Name: "cp", Size: 58}}, metallb(2), Layout{}); err == nil || !strings.Contains(err.Error(), "need 61 free addresses, 60 are free") {
+		t.Errorf("err = %v", err)
+	}
+}
+
 func TestRuns(t *testing.T) {
 	if got, want := Runs(space(r(20, 20)), r(16, 35)), []Span{r(16, 19), r(21, 35)}; !slices.Equal(got, want) {
 		t.Errorf("Runs = %v, want %v", got, want)
@@ -170,6 +196,11 @@ func TestRuns(t *testing.T) {
 	s := space()
 	s.Adopt = []netip.Addr{ip(3)}
 	if got, want := Runs(s, r(0, 5)), []Span{r(2, 2), r(4, 5)}; !slices.Equal(got, want) {
+		t.Errorf("Runs = %v, want %v", got, want)
+	}
+	// Held addresses are the pool's.
+	s.Held = []netip.Addr{ip(20)}
+	if got, want := Runs(s, r(16, 35)), []Span{r(16, 35)}; !slices.Equal(got, want) {
 		t.Errorf("Runs = %v, want %v", got, want)
 	}
 	// Spans in any order, adjacent or overlapping, give one ascending list.
