@@ -212,8 +212,10 @@ func poolToNetworks(ctx context.Context, o client.Object) []reconcile.Request {
 
 // Reconcile reconciles a NetBoxNetwork.
 func (r *NetBoxNetworkReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ ctrl.Result, reterr error) {
+	// Read live: the cache can lag the status write that follows a conditions write, which woke this reconcile, and
+	// new conditions over an old status pass for a settled network (a new prefix or VIP for an empty one).
 	nw := &v1alpha1.NetBoxNetwork{}
-	if err := r.Get(ctx, req.NamespacedName, nw); err != nil {
+	if err := r.APIReader.Get(ctx, req.NamespacedName, nw); err != nil {
 		if apierrors.IsNotFound(err) {
 			r.forget(req.NamespacedName)
 		}
@@ -221,14 +223,6 @@ func (r *NetBoxNetworkReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	}
 	if r.WatchFilterValue != "" && !labels.HasWatchLabel(nw, r.WatchFilterValue) {
 		return ctrl.Result{}, nil
-	}
-	// An empty status leads to a new prefix or VIP. The cache can lag the status write that follows a conditions
-	// write, which woke this reconcile: an empty one is read live.
-	if nw.Status.PrefixID == 0 || nw.Spec.ControlPlaneEndpoint != nil && nw.Status.ControlPlaneEndpoint.Host == "" {
-		nw = &v1alpha1.NetBoxNetwork{}
-		if err := r.APIReader.Get(ctx, req.NamespacedName, nw); err != nil {
-			return ctrl.Result{}, client.IgnoreNotFound(err)
-		}
 	}
 	cluster, err := r.getCluster(ctx, nw)
 	if err != nil {
