@@ -57,6 +57,7 @@ const (
 // +kubebuilder:validation:XValidation:rule="!has(self.pools) || !has(self.addresses) || self.pools.all(p, !self.addresses.exists(a, a.name == p.name))",message="pool and address group names must differ"
 // +kubebuilder:validation:XValidation:rule="has(self.allocator) == has(oldSelf.allocator)",message="allocator cannot be added or removed"
 // +kubebuilder:validation:XValidation:rule="!has(self.pools) || has(self.allocator) && self.allocator == 'InCluster' || self.pools.all(p, !has(p.sync) || !has(p.sync.enabled) || !p.sync.enabled)",message="sync needs allocator InCluster"
+// +kubebuilder:validation:XValidation:rule="!has(self.pools) || has(self.allocator) && self.allocator == 'InCluster' || self.pools.all(p, !has(p.excludedAddresses))",message="excludedAddresses needs allocator InCluster"
 type NetBoxNetworkSpec struct {
 	// clusterName is the CAPI Cluster the network belongs to.
 	// +required
@@ -122,9 +123,11 @@ type NetBoxNetworkSpec struct {
 
 	// pools lay out the prefix: in order, each takes the next free addresses from the start of the prefix.
 	// A free address is not the network, broadcast or gateway of the L2 network, the VIP, nor held by a NetBox
-	// address or range of anything else. The layout is fixed in status.layout and placed again only when the names
-	// or sizes here change; a change that would move an allocated address to another pool is refused as a whole.
-	// Each pool is one or more NetBox IP ranges, which the allocator hands out addresses from.
+	// address or range of anything else. NetBox addresses inside the ranges of the pools are the pools' (their machines',
+	// whoever wrote them to NetBox) and are not checked again. The layout is fixed in status.layout and placed again
+	// only when the names or sizes here change; a change that would move an allocated address to another pool is
+	// refused as a whole. Each pool is one or more NetBox IP ranges, open to allocation, which the allocator hands out
+	// addresses from.
 	// +optional
 	// +listType=map
 	// +listMapKey=name
@@ -219,6 +222,15 @@ type NetworkPool struct {
 	// the IPAddress. Only with allocator InCluster.
 	// +optional
 	Sync PoolSync `json:"sync,omitempty,omitzero"`
+
+	// excludedAddresses are addresses, ranges (a-b) and CIDRs the InClusterIPPool of the pool never hands out, on top
+	// of those between its ranges. They do not move the pool: its size counts them. Only with allocator InCluster.
+	// +optional
+	// +listType=set
+	// +kubebuilder:validation:MaxItems=32
+	// +kubebuilder:validation:items:MinLength=1
+	// +kubebuilder:validation:items:MaxLength=43
+	ExcludedAddresses []string `json:"excludedAddresses,omitempty"`
 }
 
 // PoolSync writes the IPAddresses of an InClusterIPPool to NetBox: each an active NetBox address with the mask of the

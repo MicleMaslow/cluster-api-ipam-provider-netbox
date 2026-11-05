@@ -18,7 +18,6 @@ package controllers
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"maps"
 	"net/netip"
@@ -40,7 +39,6 @@ import (
 
 	"github.com/MicleMaslow/cluster-api-ipam-provider-netbox/api/v1alpha1"
 	"github.com/MicleMaslow/cluster-api-ipam-provider-netbox/internal/netbox"
-	"github.com/MicleMaslow/cluster-api-ipam-provider-netbox/internal/netmath"
 )
 
 // +kubebuilder:rbac:groups=ipam.cluster.x-k8s.io,resources=ipaddressclaims,verbs=get;list;watch
@@ -199,7 +197,7 @@ func (r *NetBoxNetworkReconciler) applySynced(ctx context.Context, nw *v1alpha1.
 	var (
 		errs      []error
 		conflicts []string
-		create    = map[int64][]synced{} // by the NetBox range at the address
+		create    []synced
 	)
 	for _, ref := range slices.Sorted(maps.Keys(want)) {
 		w := want[ref]
@@ -218,43 +216,24 @@ func (r *NetBoxNetworkReconciler) applySynced(ctx context.Context, nw *v1alpha1.
 				normalEvent(r.Recorder, nw, "SyncedAddressReclaimed", "Put the NetBox address of IPAddress %s back at %s", w.name, w.addr)
 			}
 		default:
-			id := rangeAt(nw, w.addr.Addr())
-			create[id] = append(create[id], w)
+			create = append(create, w)
 		}
 	}
-	for _, id := range slices.Sorted(maps.Keys(create)) {
-		var (
-			ready []synced
-			ours  [][]netbox.Object // at the address of each of ready
-		)
-		for _, w := range create[id] {
-			at, err := r.NetBox.List(ctx, netbox.IPAddresses, url.Values{"address": {w.addr.Addr().String()}, "vrf_id": {"null"}})
-			if err != nil {
-				return err
-			}
-			if slices.ContainsFunc(at, func(o netbox.Object) bool { return !strings.HasPrefix(r.Keys.RefOf(o), prefix) }) {
-				conflicts = append(conflicts, fmt.Sprintf("IPAddress %s (%s)", w.name, w.addr.Addr()))
-				continue
-			}
-			ready, ours = append(ready, w), append(ours, at)
+	for _, w := range create {
+		at, err := r.NetBox.List(ctx, netbox.IPAddresses, url.Values{"address": {w.addr.Addr().String()}, "vrf_id": {"null"}})
+		if err != nil {
+			return err
 		}
-		if len(ready) == 0 {
+		if slices.ContainsFunc(at, func(o netbox.Object) bool { return !strings.HasPrefix(r.Keys.RefOf(o), prefix) }) {
+			conflicts = append(conflicts, fmt.Sprintf("IPAddress %s (%s)", w.name, w.addr.Addr()))
 			continue
 		}
-		err := r.unfenced(ctx, nw, id, func() error {
-			for i, w := range ready {
-				for _, o := range ours[i] {
-					if err := r.dropSynced(ctx, nw, o); err != nil {
-						return err
-					}
-				}
-				if err := r.createSynced(ctx, nw, w, attrs); err != nil {
-					return err
-				}
+		for _, o := range at {
+			if err := r.dropSynced(ctx, nw, o); err != nil {
+				return err
 			}
-			return nil
-		})
-		if err != nil {
+		}
+		if err := r.createSynced(ctx, nw, w, attrs); err != nil {
 			return err
 		}
 	}
@@ -263,41 +242,6 @@ func (r *NetBoxNetworkReconciler) applySynced(ctx context.Context, nw *v1alpha1.
 			fmt.Errorf("NetBox addresses of others hold the addresses of %s, which are not synced", strings.Join(conflicts, ", "))))
 	}
 	return foldErrors(errs)
-}
-
-// rangeAt is the id of the NetBox range of nw that holds a, 0 for none.
-func rangeAt(nw *v1alpha1.NetBoxNetwork, a netip.Addr) int64 {
-	for _, p := range nw.Status.Layout.Pools {
-		for _, lr := range p.Ranges {
-			from, ferr := netip.ParseAddr(lr.Start)
-			to, terr := netip.ParseAddr(lr.End)
-			if ferr == nil && terr == nil && netmath.Contains(from, to, a) {
-				return lr.ID
-			}
-		}
-	}
-	return 0
-}
-
-// unfenced runs create with the NetBox range id of nw open (mark_populated false), 0 for none: NetBox refuses to
-// create an address inside a populated range, not to change, move or delete one. The range is closed again whatever
-// create does, an expired ctx and a panic included (the HTTP client's timeout bounds the close); one a failed close
-// leaves open is closed by the next applyRanges. It runs under netBoxWrites.
-func (r *NetBoxNetworkReconciler) unfenced(ctx context.Context, nw *v1alpha1.NetBoxNetwork, id int64, create func() error) (err error) {
-	if id == 0 {
-		return create()
-	}
-	set := func(ctx context.Context, on bool, message string) error {
-		_, err := r.NetBox.Patch(ctx, netbox.IPRanges, id, "", map[string]any{"mark_populated": on, "changelog_message": message + r.Keys.Key("NetBoxNetwork", nw)})
-		return err
-	}
-	if err := set(ctx, false, "capi: opened to sync addresses by "); err != nil {
-		return err
-	}
-	defer func() {
-		err = errors.Join(err, set(context.WithoutCancel(ctx), true, "capi: closed to allocation by "))
-	}()
-	return create()
 }
 
 // createSynced creates the NetBox address w of nw with attrs.

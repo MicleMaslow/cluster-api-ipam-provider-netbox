@@ -36,6 +36,7 @@ import (
 
 	"github.com/MicleMaslow/cluster-api-ipam-provider-netbox/api/v1alpha1"
 	"github.com/MicleMaslow/cluster-api-ipam-provider-netbox/internal/layout"
+	"github.com/MicleMaslow/cluster-api-ipam-provider-netbox/internal/netmath"
 )
 
 // maxPublishedSecrets is the number of Secrets status.publishedSecrets holds.
@@ -44,9 +45,9 @@ const maxPublishedSecrets = 16
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;create;update;delete
 
 // publishData is what the enabled pools and groups of nw publish, by Secret name, then key (the name of the pool or
-// group): the addresses of a pool's ranges but for live, its addresses in use, and the VIP; the addresses of a
-// group. Ascending, one per line, no mask, no trailing newline.
-func publishData(nw *v1alpha1.NetBoxNetwork, l layout.Layout, live map[string][]netip.Addr) map[string]map[string][]byte {
+// group): the addresses of a pool's ranges but for those it excludes (excluded, by pool) and the VIP; the addresses
+// of a group. Ascending, one per line, no mask, no trailing newline.
+func publishData(nw *v1alpha1.NetBoxNetwork, l layout.Layout, excluded map[string][]layout.Span) map[string]map[string][]byte {
 	vip, _ := netip.ParseAddr(nw.Status.ControlPlaneEndpoint.Host)
 	out := map[string]map[string][]byte{}
 	put := func(p v1alpha1.Publish, key string, addrs []netip.Addr) {
@@ -71,7 +72,7 @@ func publishData(nw *v1alpha1.NetBoxNetwork, l layout.Layout, live map[string][]
 		var addrs []netip.Addr
 		for _, rng := range l.Pools[i].Ranges {
 			for a := rng.From; a.IsValid() && !rng.To.Less(a); a = a.Next() {
-				if a != vip && !slices.Contains(live[sp.Name], a) {
+				if a != vip && !slices.ContainsFunc(excluded[sp.Name], func(e layout.Span) bool { return netmath.Contains(e.From, e.To, a) }) {
 					addrs = append(addrs, a)
 				}
 			}

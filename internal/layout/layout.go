@@ -68,6 +68,9 @@ type Space struct {
 	// Adopt are NetBox addresses without a key: a group placed for the first time takes the highest of them under the
 	// VIP first, from the top down; those it does not take are taken.
 	Adopt []netip.Addr
+	// Held are NetBox addresses inside the ranges of the pools, their machines': free for pools, which keep them, not
+	// for groups and the VIP.
+	Held []netip.Addr
 }
 
 // mark marks in busy the addresses of Adopt and those of Taken inside the prefix.
@@ -116,7 +119,8 @@ func Runs(s Space, spans ...Span) []Span {
 	return out
 }
 
-// Plan places pools from the start of the prefix and groups from its top, on free addresses.
+// Plan places pools from the start of the prefix and groups from its top, on free addresses; held ones are free for
+// pools only.
 // Leading pools equal to those of prev keep their ranges; groups keep their prev addresses, a group without them
 // adopts the highest of s.Adopt.
 func Plan(s Space, pools []Pool, groups []Group, prev Layout) (Layout, error) {
@@ -185,6 +189,7 @@ func Plan(s Space, pools []Pool, groups []Group, prev Layout) (Layout, error) {
 	if rests > 1 {
 		return Layout{}, fmt.Errorf("at most one pool of size rest, got %d", rests)
 	}
+	pooled := need
 	for i, g := range groups {
 		ask(g.Name, g.Count-len(kept[i]))
 	}
@@ -192,15 +197,29 @@ func Plan(s Space, pools []Pool, groups []Group, prev Layout) (Layout, error) {
 	if vip {
 		ask("VIP", 1)
 	}
-	if need > have {
-		return Layout{}, fmt.Errorf("%s need %d free addresses, %d are free from %s", strings.Join(asks, ", "), need, have, cursor)
+	// The VIP and groups take the top, from the highest free address down but for held ones; pools fill the free
+	// addresses under them from start up.
+	held := map[netip.Addr]bool{}
+	for _, a := range s.Held {
+		held[a] = true
+	}
+	var tops []netip.Addr
+	top := len(free)
+	for top > start && len(tops) < need-pooled {
+		top--
+		if !held[free[top]] {
+			tops = append(tops, free[top])
+		}
+	}
+	skipped := len(free) - top - len(tops)
+	if need+skipped > have {
+		return Layout{}, fmt.Errorf("%s need %d free addresses, %d are free from %s", strings.Join(asks, ", "), need, have-skipped, cursor)
 	}
 
-	// Pools fill free from start up; the VIP and groups take the top, which need leaves to them.
 	for _, p := range pools[len(out.Pools):] {
 		n := p.Size
 		if p.Rest {
-			n = have - need + 1
+			n = have - need - skipped + 1
 		}
 		pp := PlacedPool{Pool: p}
 		for _, a := range free[start : start+n] {
@@ -209,16 +228,13 @@ func Plan(s Space, pools []Pool, groups []Group, prev Layout) (Layout, error) {
 		start += n
 		out.Pools = append(out.Pools, pp)
 	}
-	top := len(free)
 	if vip {
-		top--
+		tops = tops[1:]
 	}
 	for i, g := range groups {
 		pg := PlacedGroup{Group: g, Addrs: kept[i]}
-		for len(pg.Addrs) < g.Count {
-			top--
-			pg.Addrs = append(pg.Addrs, free[top])
-		}
+		n := g.Count - len(pg.Addrs)
+		pg.Addrs, tops = append(pg.Addrs, tops[:n]...), tops[n:]
 		out.Groups = append(out.Groups, pg)
 	}
 	return out, nil

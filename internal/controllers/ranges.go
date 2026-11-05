@@ -181,7 +181,7 @@ func (r *NetBoxNetworkReconciler) syncRanges(ctx context.Context, nw *v1alpha1.N
 			if err != nil {
 				return status(), err
 			}
-			if from != s.From || to != s.To || o.MarkPopulated != populated(nw) || o.Status.Value == "deprecated" {
+			if from != s.From || to != s.To || o.MarkPopulated || o.Status.Value == "deprecated" {
 				if *o, err = r.resizeRange(ctx, nw, ref, *o, s.From, s.To, bits, addrs, inPool(p)); err != nil {
 					return status(), err
 				}
@@ -249,18 +249,9 @@ func minAddr(a, b netip.Addr) netip.Addr {
 	return b
 }
 
-// populated reports whether the ranges of nw are closed to allocation in NetBox (mark_populated): with allocator
-// InCluster, the InClusterIPPools hand out their addresses, never NetBox.
-func populated(nw *v1alpha1.NetBoxNetwork) bool {
-	return nw.Spec.Allocator == v1alpha1.AllocatorInCluster
-}
-
 // createRange creates the NetBox range of span s of pool under ref.
 func (r *NetBoxNetworkReconciler) createRange(ctx context.Context, nw *v1alpha1.NetBoxNetwork, ref, pool string, s layout.Span, bits int, t texts) (netbox.Object, error) {
 	fields := map[string]any{"start_address": netip.PrefixFrom(s.From, bits).String(), "end_address": netip.PrefixFrom(s.To, bits).String(), "status": "active"}
-	if populated(nw) {
-		fields["mark_populated"] = true
-	}
 	var obj netbox.Object
 	err := r.clearingDeprecated(ctx, nw, ref, s.From, s.To, 0, func() (err error) {
 		obj, err = r.NetBox.Create(ctx, netbox.IPRanges, r.Keys.Managed(t.on(networkAttrs(nw)), ref, "capi: range "+ref, fields))
@@ -274,9 +265,9 @@ func (r *NetBoxNetworkReconciler) createRange(ctx context.Context, nw *v1alpha1.
 	return obj, nil
 }
 
-// resizeRange brings the NetBox range cur to start-end, active, and open to allocation unless populated. Addresses it
-// gives up are fenced first: none but those keep accepts may be allocated; a populated range needs no fence, the
-// InClusterIPPool gave them up before. It returns the range as it is after the change.
+// resizeRange brings the NetBox range cur to start-end, active and open to allocation. Addresses it gives up are
+// fenced first: none but those keep accepts may be allocated; with allocator InCluster the InClusterIPPool gave them
+// up before. It returns the range as it is after the change.
 func (r *NetBoxNetworkReconciler) resizeRange(ctx context.Context, nw *v1alpha1.NetBoxNetwork, ref string, cur netbox.Object, start, end netip.Addr, bits int, addrs []netip.Addr, keep func(netip.Addr) bool) (netbox.Object, error) {
 	cur, etag, err := r.NetBox.Get(ctx, netbox.IPRanges, cur.ID)
 	if err != nil {
@@ -287,7 +278,7 @@ func (r *NetBoxNetworkReconciler) resizeRange(ctx context.Context, nw *v1alpha1.
 		return cur, err
 	}
 	var fenced bool
-	if !populated(nw) && (from.Less(start) || end.Less(to)) {
+	if nw.Spec.Allocator != v1alpha1.AllocatorInCluster && (from.Less(start) || end.Less(to)) {
 		etag, fenced, err = r.fence(ctx, cur, etag, addrs, keep, fmt.Sprintf("NetBox range stays %s-%s while addresses outside the pool are allocated", from, to))
 		if err != nil {
 			return cur, err
@@ -300,7 +291,7 @@ func (r *NetBoxNetworkReconciler) resizeRange(ctx context.Context, nw *v1alpha1.
 	err = r.clearingDeprecated(ctx, nw, ref, start, end, cur.ID, func() error {
 		_, err := r.NetBox.Patch(ctx, netbox.IPRanges, cur.ID, etag, map[string]any{
 			"start_address": netip.PrefixFrom(start, bits).String(), "end_address": netip.PrefixFrom(end, bits).String(),
-			"status": "active", "mark_populated": populated(nw), "changelog_message": message,
+			"status": "active", "mark_populated": false, "changelog_message": message,
 		})
 		return err
 	})
@@ -313,7 +304,7 @@ func (r *NetBoxNetworkReconciler) resizeRange(ctx context.Context, nw *v1alpha1.
 	ctrl.LoggerFrom(ctx).Info("Updated the NetBox range", "network", klog.KObj(nw), "ref", ref, "id", cur.ID, "from", from.String()+"-"+to.String(), "to", start.String()+"-"+end.String())
 	normalEvent(r.Recorder, nw, "RangeUpdated", "Updated the NetBox range %s-%s to %s-%s", from, to, start, end)
 	cur.StartAddress, cur.EndAddress = netip.PrefixFrom(start, bits).String(), netip.PrefixFrom(end, bits).String()
-	cur.Status.Value, cur.MarkPopulated = "active", populated(nw)
+	cur.Status.Value, cur.MarkPopulated = "active", false
 	return cur, nil
 }
 

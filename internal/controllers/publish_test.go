@@ -93,11 +93,11 @@ func TestPublishData(t *testing.T) {
 	}
 	g.Expect(publishData(nw, l, nil)).To(Equal(want))
 
-	// A live exclusion and the VIP drop out of the value of a pool.
+	// Excluded addresses and the VIP drop out of the value of a pool.
 	nw.Status.ControlPlaneEndpoint.Host = "10.10.0.5"
 	want["endpoints"]["cp"] = lines("10.10.0.2", "10.10.0.6")
 	want["endpoints"]["ingress"] = lines("10.10.0.9")
-	g.Expect(publishData(nw, l, map[string][]netip.Addr{"cp": {a("10.10.0.3")}, "ingress": {a("10.10.0.8")}})).To(Equal(want))
+	g.Expect(publishData(nw, l, map[string][]layout.Span{"cp": {span("10.10.0.3", "10.10.0.3")}, "ingress": {span("10.10.0.7", "10.10.0.8")}})).To(Equal(want))
 
 	nw.Spec.Pools[0].Publish = v1alpha1.Publish{}
 	nw.Spec.Pools[1].Publish = v1alpha1.Publish{}

@@ -17,13 +17,11 @@ limitations under the License.
 package controllers
 
 import (
-	"context"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"testing"
-	"time"
 
 	. "github.com/onsi/gomega"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -144,20 +142,14 @@ func syncedOn(srv *httptest.Server) (*NetBoxNetworkReconciler, *v1alpha1.NetBoxN
 	return r, nw
 }
 
-const (
-	openRange  = `PATCH /api/ipam/ip-ranges/7/ {"changelog_message":"capi: opened to sync addresses by NetBoxNetwork/ns/default","mark_populated":false}`
-	closeRange = `PATCH /api/ipam/ip-ranges/7/ {"changelog_message":"capi: closed to allocation by NetBoxNetwork/ns/default","mark_populated":true}`
-)
-
 // syncedIP is the synced NetBox address of m1 at a with dns_name dns.
 func syncedIP(a, dns string) string {
 	return `{"id":30,"address":"` + a + `/22","status":{"value":"active"},"dns_name":"` + dns + `",` + textsOf("ns/vm-1 // ns workers") +
 		`,"custom_fields":{"capi_ref":"NetBoxNetwork/ns/default/sync/workers/m1"}}`
 }
 
-// NetBox refuses to create an address inside a populated range, not to change or delete one: the range of the address
-// is opened for the create alone, and closed again whatever the create answers.
-func TestSyncOpensRangeOnlyToCreate(t *testing.T) {
+// A missing address is created, one of ours follows the IPAddress and the templates.
+func TestSyncCreatesAndUpdates(t *testing.T) {
 	g := NewWithT(t)
 	create := `POST /api/ipam/ip-addresses/ {"address":"10.10.0.20/22","changelog_message":"capi: address for NetBoxNetwork/ns/default/sync/workers/m1",` +
 		`"comments":"` + managedComments + `","custom_fields":{"capi_ref":"NetBoxNetwork/ns/default/sync/workers/m1"},"description":"ns/vm-1 // ns workers",` +
@@ -168,8 +160,8 @@ func TestSyncOpensRangeOnlyToCreate(t *testing.T) {
 		writes     []string
 		fails      bool
 	}{
-		"created":       {writes: []string{openRange, create, closeRange}},
-		"create fails":  {failCreate: http.StatusBadRequest, writes: []string{openRange, create, closeRange}, fails: true},
+		"created":       {writes: []string{create}},
+		"create fails":  {failCreate: http.StatusBadRequest, writes: []string{create}, fails: true},
 		"in sync":       {found: syncedIP("10.10.0.20", "vm-1")},
 		"dns_name":      {found: syncedIP("10.10.0.20", "old"), writes: []string{`PATCH /api/ipam/ip-addresses/30/ {"changelog_message":"capi: dns_name of NetBoxNetwork/ns/default/sync/workers/m1","dns_name":"vm-1"}`}},
 		"moved by hand": {found: syncedIP("10.10.0.21", "vm-1"), writes: []string{`PATCH /api/ipam/ip-addresses/30/ {"address":"10.10.0.20/22","changelog_message":"capi: reclaimed by NetBoxNetwork/ns/default/sync/workers/m1","status":"active"}`}},
@@ -180,50 +172,6 @@ func TestSyncOpensRangeOnlyToCreate(t *testing.T) {
 		g.Expect(err != nil).To(Equal(tc.fails), "%s: %v", name, err)
 		g.Expect(writes).To(Equal(tc.writes), name)
 	}
-}
-
-// The range is closed again when the reconcile's ctx ends during the create (the section's deadline, a shutdown), and
-// when the create panics.
-func TestSyncClosesRangeOnCancelAndPanic(t *testing.T) {
-	g := NewWithT(t)
-	cctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	var writes []string
-	srv := httptest.NewServer(writesNeedLock(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		if r.Method == http.MethodGet {
-			_, _ = io.WriteString(w, `{"results":[]}`)
-			return
-		}
-		b, _ := io.ReadAll(r.Body)
-		writes = append(writes, r.Method+" "+r.URL.Path+" "+string(b))
-		if r.Method == http.MethodPost {
-			cancel()
-			select { // the client gives up on its ctx
-			case <-r.Context().Done():
-			case <-time.After(5 * time.Second):
-			}
-			return
-		}
-		_, _ = io.WriteString(w, `{"id":9}`)
-	})))
-	t.Cleanup(srv.Close)
-	r, nw := syncedOn(srv)
-
-	err := r.syncAddresses(cctx, nw)
-	g.Expect(err).To(MatchError(context.Canceled))
-	g.Expect(writes).To(HaveLen(3))
-	g.Expect(writes[0]).To(Equal(openRange))
-	g.Expect(writes[1]).To(HavePrefix("POST /api/ipam/ip-addresses/ "))
-	g.Expect(writes[2]).To(Equal(closeRange))
-
-	writes = nil
-	g.Expect(func() {
-		netBoxWrites.Lock()
-		defer netBoxWrites.Unlock()
-		_ = r.unfenced(ctx, nw, 7, func() error { panic("create") })
-	}).To(PanicWith("create"))
-	g.Expect(writes).To(Equal([]string{openRange, closeRange}))
 }
 
 // An address under a sync key that no IPAddress has any more, or of a pool that no longer syncs, is deleted.
@@ -269,16 +217,14 @@ func TestSyncReusedAddressDeletedBeforeCreate(t *testing.T) {
 		syncedClaim("ns", "m1", "vm-1"), inClusterAddress("ns", "m1", "workers", "10.10.0.20"))
 	r.APIReader = r.Client
 	g.Expect(r.syncAddresses(ctx, nw)).To(Succeed())
-	g.Expect(writes).To(HaveLen(4))
-	g.Expect(writes[0]).To(Equal(openRange))
-	g.Expect(writes[1]).To(Equal(`DELETE /api/ipam/ip-addresses/29/ {"changelog_message":"capi: released by NetBoxNetwork/ns/default"}`))
-	g.Expect(writes[2]).To(And(HavePrefix("POST /api/ipam/ip-addresses/ "), ContainSubstring(`"capi_ref":"NetBoxNetwork/ns/default/sync/workers/m1"`)))
-	g.Expect(writes[3]).To(Equal(closeRange))
+	g.Expect(writes).To(HaveLen(2))
+	g.Expect(writes[0]).To(Equal(`DELETE /api/ipam/ip-addresses/29/ {"changelog_message":"capi: released by NetBoxNetwork/ns/default"}`))
+	g.Expect(writes[1]).To(And(HavePrefix("POST /api/ipam/ip-addresses/ "), ContainSubstring(`"capi_ref":"NetBoxNetwork/ns/default/sync/workers/m1"`)))
 }
 
 // Every IPAddress of a synced pool is a NetBox address under its sync key: the mask of the L2 network, dns_name and
-// texts from the templates for the owner of its claim, owner and tenant of the network. It goes with the IPAddress,
-// and the range stays closed to allocation.
+// texts from the templates for the owner of its claim, owner and tenant of the network. It goes with the IPAddress;
+// the range stays open to allocation.
 func TestSyncAddresses(t *testing.T) {
 	g := newG(t)
 	z := newZone(t, g)
@@ -298,7 +244,7 @@ func TestSyncAddresses(t *testing.T) {
 	for _, lr := range rangesIn(g, nw, "workers") {
 		rng, _, err := admin.Get(ctx, netbox.IPRanges, lr.ID)
 		g.Expect(err).NotTo(HaveOccurred())
-		g.Expect(rng.MarkPopulated).To(BeTrue())
+		g.Expect(rng.MarkPopulated).To(BeFalse())
 	}
 	waitEvent(g, ns, "default", "AddressSynced")
 
@@ -345,11 +291,8 @@ func TestSyncForeignObjectConflict(t *testing.T) {
 	ns := newEnv(t, nil)
 	nw := syncNetwork(ns, "default")
 	p := readyLayout(g, nw)
-	// NetBox refuses to create an address inside a populated range, not to move one there.
-	foreign := byHand(t, g, netbox.IPAddresses, map[string]any{"address": "198.51.100.11/24", "status": "active"})
-	_, err := admin.Patch(ctx, netbox.IPAddresses, foreign.ID, "", map[string]any{"address": addr(p, 5) + "/22"})
-	g.Expect(err).NotTo(HaveOccurred())
-	foreign, _, err = admin.Get(ctx, netbox.IPAddresses, foreign.ID)
+	foreign := byHand(t, g, netbox.IPAddresses, map[string]any{"address": addr(p, 5) + "/22", "status": "active"})
+	foreign, _, err := admin.Get(ctx, netbox.IPAddresses, foreign.ID)
 	g.Expect(err).NotTo(HaveOccurred())
 	allocate(g, ns, "m1", "vm-1", addr(p, 5))
 

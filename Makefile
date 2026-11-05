@@ -219,13 +219,13 @@ release-manifests: generate $(KUSTOMIZE) ## Build out/ipam-components.yaml with 
 
 # Sequential sub-makes: the steps depend on each other, so -j must not reorder them.
 .PHONY: dev-all
-dev-all: ## Whole dev stand: dev-up, incluster-up, deploy-dev, vcsim-up and the clusters vc (owner, tenant) and vc2; repeatable
+dev-all: ## Whole dev stand: dev-up, incluster-up, deploy-dev, vcsim-up, the clusters vc (owner, tenant) and vc2 (InCluster, sync); repeatable
 	$(MAKE) --no-print-directory dev-up
 	$(MAKE) --no-print-directory incluster-up
 	$(MAKE) --no-print-directory deploy-dev
 	$(MAKE) --no-print-directory vcsim-up
 	NODE_DOMAIN=nodes.test OWNER=dev-team TENANT=dev-tenant $(MAKE) --no-print-directory vcsim-cluster NAME=vc
-	NODE_DOMAIN=nodes.test $(MAKE) --no-print-directory vcsim-cluster NAME=vc2
+	ALLOCATOR=InCluster SYNC=1 $(MAKE) --no-print-directory vcsim-cluster NAME=vc2
 
 .PHONY: dev-up
 dev-up: netbox-up kind-up ## NetBox + kind management cluster with CAPI core

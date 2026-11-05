@@ -16,13 +16,13 @@ The Cluster's endpoint must be an IP address inside the prefix: that is how the 
 - with `controlPlaneEndpoint`, the VIP is `EndpointConflict` and the network reserves a new one at the highest free address of the prefix, which the Cluster never uses. Under the VIP and the MetalLB addresses that is usually an address of the top pool of the cluster that in-cluster can still hand out: the adopted pool loses it, and groups adopt only what lies under the new VIP;
 - without `controlPlaneEndpoint`, nothing tells the network which NetBox address is the VIP: a group placed for the first time can adopt the object of the Cluster's VIP as a reserved address.
 
-An adopted pool keeps its addresses: its ranges are the free ones of its `addresses`, less its `excludedAddresses`, which stay excluded; its spec is written whole ([In-cluster allocator](../guides/in-cluster.md#what-the-network-writes)). The VIP and the reserved addresses keep their NetBox objects and ids; they get the key, `dns_name`, description, comments, owner and tenant of the network; a reserved address also gets the mask of the L2 network and status `active`.
+An adopted pool keeps its addresses: its ranges are the free ones of its `addresses`, less its `excludedAddresses`, which stay excluded; NetBox addresses inside it, as a sync of the VMs records the machines, stay in it; its spec is written whole ([In-cluster allocator](../guides/in-cluster.md#what-the-network-writes)). The VIP and the reserved addresses keep their NetBox objects and ids; they get the key, `dns_name`, description, comments, owner and tenant of the network; a reserved address also gets the mask of the L2 network and status `active`.
 
 ## Steps
 
 1. **Keep the GitOps tool off the pools.** Once adopted, the network owns the `InClusterIPPool`s and rewrites their spec; a tool that applies the chart's version back or prunes them fights it. Turn off pruning and self-heal for them before the network exists, for example in Argo CD the annotation `argocd.argoproj.io/sync-options: Prune=false` on the pools and `ignoreDifferences` on their `spec` and `metadata.ownerReferences` (or self-heal off for the application); in Flux `kustomize.toolkit.fluxcd.io/prune: disabled` and `kustomize.toolkit.fluxcd.io/reconcile: disabled`.
 
-2. **Find the sizes.** The size of a pool is the number of free addresses of its `addresses`, less its `excludedAddresses`: not an address or inside a range NetBox holds for something else, not the VIP, not the gateway, network or broadcast address of the L2 network. A pool `10.10.0.8-10.10.0.60` with nothing of NetBox inside is 53; with the VIP inside, 52. When in doubt, apply any size: the network reports the sizes it found and changes nothing (step 4).
+2. **Find the sizes.** The size of a pool is the number of free addresses of its `addresses`, less its `excludedAddresses`: not inside a range NetBox holds for something else, not the VIP, not the gateway, network or broadcast address of the L2 network. NetBox addresses inside it count: they are the machines'. A pool `10.10.0.8-10.10.0.60` is 53; with the VIP inside, 52. When in doubt, apply any size: the network reports the sizes it found and changes nothing (step 4).
 
 3. **Apply the network** with the prefix of the cluster, its pools by name in the order of their addresses with the sizes found, and the groups with the count the cluster has:
 
@@ -56,8 +56,8 @@ An adopted pool keeps its addresses: its ranges are the free ones of its `addres
    ```
 
    - `Ready`, `ControlPlaneEndpointReady` and `LayoutReady` are `True`; `status.layout` has the spans of the pools.
-   - The pools are controlled by `demo`, with the same addresses; `excludedAddresses` lists what NetBox holds inside them.
-   - In NetBox the prefix, the VIP and the MetalLB addresses carry the key of the network with their old ids, and each pool is one or more ranges with `mark_populated`.
+   - The pools are controlled by `demo`, with the same addresses; `excludedAddresses` lists what they excluded before and what the pools leave out (the VIP, NetBox ranges of anything else).
+   - In NetBox the prefix, the VIP and the MetalLB addresses carry the key of the network with their old ids, and each pool is one or more ranges, open to allocation.
    - The Machines have the same names, UIDs and addresses, and there is no new one. The Events `PoolAdopted`, `VIPAdopted` and `ReserveAdopted` record what was taken over.
 
    `LayoutReady=False` with `InvalidSpec` and `spec.pools do not match the InClusterIPPools of the network: sizes must be those found: demo-cp 6, demo-workers 52` means other sizes or another order than found: fix the spec, nothing was changed. `Duplicate` is a pool of the name that another controller holds. `EndpointConflict` on `ControlPlaneEndpointReady` is a VIP address held by an object with a key, by more than one object, or inside an IP range: fix it in NetBox ([Control-plane VIP](../guides/control-plane-vip.md#a-running-cluster)).
@@ -66,7 +66,9 @@ An adopted pool keeps its addresses: its ranges are the free ones of its `addres
 
 ## Addresses inside a pool
 
-A VIP or a MetalLB address that NetBox holds inside the span of a pool follows the rule for every address in use: it goes to the `excludedAddresses` of the pool, the ranges in NetBox split around it, and the size counts without it. One at the first or last address of the span shrinks the pool instead: its `addresses` start after it or end before it. The webhook of in-cluster accepts that as long as no Machine has the address; if one has it, `LayoutReady` reports `RangeInUse` with the webhook's message and the pool stays as it was. Such a MetalLB address is not taken over by a group: groups take addresses above the pools.
+The VIP inside the span of a pool goes to the `excludedAddresses` of the pool, the ranges in NetBox split around it, and the size counts without it; so does a NetBox range of anything else. One at the first or last address of the span shrinks the pool instead: its `addresses` start after it or end before it. The webhook of in-cluster accepts that as long as no Machine has the address; if one has it, `LayoutReady` reports `RangeInUse` with the webhook's message and the pool stays as it was.
+
+Any other NetBox address inside the span is taken for a machine's and stays in the pool. A MetalLB address there that the pool did not exclude, in-cluster can hand out already: exclude it in the chart before the network adopts the pool, or add it to the pool's `excludedAddresses` in `spec.pools` ([In-cluster allocator](../guides/in-cluster.md#what-the-network-writes)). Groups do not take it over: they take addresses above the pools.
 
 ## Without in-cluster IPAM
 

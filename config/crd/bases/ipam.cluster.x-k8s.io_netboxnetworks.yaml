@@ -294,12 +294,25 @@ spec:
                 description: |-
                   pools lay out the prefix: in order, each takes the next free addresses from the start of the prefix.
                   A free address is not the network, broadcast or gateway of the L2 network, the VIP, nor held by a NetBox
-                  address or range of anything else. The layout is fixed in status.layout and placed again only when the names
-                  or sizes here change; a change that would move an allocated address to another pool is refused as a whole.
-                  Each pool is one or more NetBox IP ranges, which the allocator hands out addresses from.
+                  address or range of anything else. NetBox addresses inside the ranges of the pools are the pools' (their machines',
+                  whoever wrote them to NetBox) and are not checked again. The layout is fixed in status.layout and placed again
+                  only when the names or sizes here change; a change that would move an allocated address to another pool is
+                  refused as a whole. Each pool is one or more NetBox IP ranges, open to allocation, which the allocator hands out
+                  addresses from.
                 items:
                   description: NetworkPool is a pool of the network's layout.
                   properties:
+                    excludedAddresses:
+                      description: |-
+                        excludedAddresses are addresses, ranges (a-b) and CIDRs the InClusterIPPool of the pool never hands out, on top
+                        of those between its ranges. They do not move the pool: its size counts them. Only with allocator InCluster.
+                      items:
+                        maxLength: 43
+                        minLength: 1
+                        type: string
+                      maxItems: 32
+                      type: array
+                      x-kubernetes-list-type: set
                     name:
                       description: name of the pool, which NetBoxIPPool ranges refer
                         to; with allocator InCluster, the name of its InClusterIPPool.
@@ -479,6 +492,9 @@ spec:
               rule: '!has(self.pools) || has(self.allocator) && self.allocator ==
                 ''InCluster'' || self.pools.all(p, !has(p.sync) || !has(p.sync.enabled)
                 || !p.sync.enabled)'
+            - message: excludedAddresses needs allocator InCluster
+              rule: '!has(self.pools) || has(self.allocator) && self.allocator ==
+                ''InCluster'' || self.pools.all(p, !has(p.excludedAddresses))'
           status:
             description: status is the observed state of NetBoxNetwork.
             minProperties: 1

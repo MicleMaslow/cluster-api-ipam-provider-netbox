@@ -10,7 +10,7 @@ You need docker, kind, kubectl, go and jq, and `yq` for the CAPV cluster. Tools 
 make dev-all
 ```
 
-`make dev-all` runs the steps below one after the other, and can be repeated on a stand that is up. Or run them yourself:
+`make dev-all` runs the steps below one after the other, and can be repeated on a stand that is up; a cluster made with another `ALLOCATOR` (immutable) is deleted first (`make vcsim-delete NAME=...`). Or run them yourself:
 
 | Target | What it does |
 |---|---|
@@ -18,7 +18,7 @@ make dev-all
 | `make incluster-up` | [cluster-api-ipam-provider-in-cluster](https://github.com/kubernetes-sigs/cluster-api-ipam-provider-in-cluster) `INCLUSTER_VERSION` (default v1.1.1) through clusterctl, for networks with `allocator: InCluster`; skipped when the `InClusterIPPool` CRD is there. The provider looks for that CRD at start: installed after `deploy-dev`, restart the provider |
 | `make deploy-dev` | builds the image, loads it into kind, connects the NetBox container to the kind docker network, and installs the provider from `out/ipam-components.yaml` through clusterctl, with the variables of `hack/dev/.env` and NetBox reached as `http://capi-netbox-dev-netbox-1:8080` |
 | `make vcsim-up` | CAPV and the vcsim controller of CAPV's test infrastructure |
-| `make vcsim-cluster NAME=vc` | the network `vc` with the pools `cp` and `workers` and the address group `metallb`, the NetBoxIPPools `vc-cp` and `vc-workers`, and a cluster from CAPV's node-ipam template; `ALLOCATOR=InCluster`: the InClusterIPPools `vc-cp` and `vc-workers` instead, see below; `dev-all` creates `vc` with `OWNER=dev-team TENANT=dev-tenant` and `vc2` without, both with `NODE_DOMAIN=nodes.test` |
+| `make vcsim-cluster NAME=vc` | the network `vc` with the pools `cp` and `workers` and the address group `metallb`, the NetBoxIPPools `vc-cp` and `vc-workers`, and a cluster from CAPV's node-ipam template; `ALLOCATOR=InCluster`: the InClusterIPPools `vc-cp` and `vc-workers` instead, see below; `dev-all` creates `vc` with `OWNER=dev-team TENANT=dev-tenant NODE_DOMAIN=nodes.test` and `vc2` with `ALLOCATOR=InCluster SYNC=1` |
 | `make vcsim-delete NAME=vc` | deletes that cluster with its NetBox objects, see below. `NAME` is required: unlike `vcsim-cluster`, it has no default |
 | `make dev-down` | `kind-down` and `netbox-down`: deletes the kind cluster, the NetBox containers and data, and `hack/dev/.env`. Removes the whole stand |
 
@@ -122,14 +122,15 @@ make vcsim-up                # CAPV and the vcsim controller of CAPV's test infr
 make vcsim-cluster NAME=vc   # NetBoxNetwork vc, NetBoxIPPools vc-cp and vc-workers, and a cluster from CAPV's node-ipam template
 ALLOCATOR=InCluster make vcsim-cluster NAME=ic1   # the same with InClusterIPPools ic1-cp and ic1-workers (needs make incluster-up)
 LEGACY=1 make vcsim-cluster NAME=mig1             # a cluster as a chart left it, without a network
+hack/dev/vcsim.sh vmsync mig1                     # its machines in NetBox without a key, as a VM sync of the hypervisor writes them
 hack/dev/vcsim.sh adopt mig1                      # its network, which takes it over
 ```
 
-`make dev-all` creates two clusters: `vc`, whose network has the owner `dev-team` and the tenant `dev-tenant`, and `vc2` without them.
+`make dev-all` creates two clusters: `vc`, whose network has the owner `dev-team` and the tenant `dev-tenant`, and `vc2` with `allocator: InCluster`, without them, whose worker addresses are synced to NetBox.
 
 `vcsim-up` builds the vcsim controller image from the CAPV sources (`CAPV_VERSION`, default v1.17.0, cloned into `~/.cache/capi-ipam-netbox`) and installs CAPV with clusterctl. The machines get their addresses through `addressesFromPools`, control plane from `<NAME>-cp`, workers from `<NAME>-workers`, and CAPV writes them into the VM metadata in vcsim. The workload cluster itself is fake: the vcsim controller simulates the machine bootstrap and the API server behind the control plane endpoint, and without cloud-init the VMs report the address 192.0.2.100.
 
-The network lays out its prefix: the pool `cp` of 6 addresses, `workers` of the rest, and the address group `metallb` at the top, `METALLB` addresses with the `dns_name` `<NAME>-metallb-<index>.example.test`, published to the Secret `<NAME>-endpoints` ([Networks](../guides/networks.md)). With `ALLOCATOR=InCluster` the network has `allocator: InCluster` and its pools are `<NAME>-cp` and `<NAME>-workers`: the network creates the InClusterIPPools of those names, the ranges in NetBox are `mark_populated`, and the machines take their addresses from the InClusterIPPools; there are no NetBoxIPPools and no node addresses in NetBox ([In-cluster allocator](../guides/in-cluster.md)).
+The network lays out its prefix: the pool `cp` of 6 addresses, `workers` of the rest, and the address group `metallb` at the top, `METALLB` addresses with the `dns_name` `<NAME>-metallb-<index>.example.test`, published to the Secret `<NAME>-endpoints` ([Networks](../guides/networks.md)). With `ALLOCATOR=InCluster` the network has `allocator: InCluster` and its pools are `<NAME>-cp` and `<NAME>-workers`: the network creates the InClusterIPPools of those names, and the machines take their addresses from them; there are no NetBoxIPPools, and node addresses are in NetBox only with `SYNC=1` or `vmsync` ([In-cluster allocator](../guides/in-cluster.md)).
 
 | Variable | Default | Meaning |
 |---|---|---|
@@ -139,15 +140,17 @@ The network lays out its prefix: the pool `cp` of 6 addresses, `workers` of the 
 | `PARENT_PREFIX`, `GATEWAY`, `PREFIX_LENGTH` | `10.10.0.0/22`, `10.10.0.1`, `26` | the network |
 | `ALLOCATOR` | `NetBox` | `NetBox` or `InCluster`, the `allocator` of the network; immutable, so a cluster keeps the one it was created with |
 | `METALLB` | 2 | the count of the address group `metallb` |
+| `SYNC` | empty | `1`: `sync` on the pool `<NAME>-workers`, `dns_name` `<machine>.nodes.test`; `InCluster` allocator only |
 | `LEGACY` | empty | `1`: the cluster as a chart left it, without a network, see below |
-| `LEGACY_PREFIX` | `10.10.3.128/26` | the NetBox prefix of a `LEGACY` cluster, for `cluster` and `adopt`; another one for each such cluster |
-| `LEGACY_TAKEN_IN_WORKERS` | empty | `1`: one more NetBox address without a key, in the middle of the workers |
+| `LEGACY_PREFIX` | `10.10.3.128/26` | the NetBox prefix of a `LEGACY` cluster, for `cluster` and `adopt`; another one for each such cluster, outside `10.10.3.0/25`, which the integration tests use |
 | `NODE_DOMAIN` | empty | makes the `dns_name` of the node addresses `<node>.<NODE_DOMAIN>`; `NetBox` allocator only |
 | `OWNER`, `TENANT` | empty | `spec.owner.name` and `spec.tenant.slug` of the network; empty: left out |
 | `NETWORK_PATCH` | `hack/dev/vcsim-network.local.yaml`, else `hack/dev/vcsim-network.example.yaml` | a merge patch of the NetBoxNetwork (tags and custom fields), `${CLUSTER_NAME}` substituted |
 | `CAPV_VERSION`, `CAPV_SRC` | `v1.17.0`, `~/.cache/capi-ipam-netbox/capv-<version>` | the CAPV sources for `vcsim-up` |
 
-**A cluster as a chart left it**, to try [Migrating an existing cluster](../recipes/migrate-existing-cluster.md). `LEGACY=1` makes no network. With the admin token it creates in NetBox, without a key, the prefix `LEGACY_PREFIX` and the MetalLB addresses at its offsets −2 and −3, and prints their ids; `LEGACY_TAKEN_IN_WORKERS=1` adds one in the middle of the workers, which no machine of the stand gets, since in-cluster hands out from the start; the network puts it into their `excludedAddresses`. Then come the InClusterIPPools `<NAME>-cp` at offsets 2–7 and `<NAME>-workers` from 8 to −4, without a controller or `excludedAddresses`, and the cluster on them. A second run leaves them alone once `<NAME>-cp` exists. `hack/dev/vcsim.sh adopt <NAME>` applies the network that takes the cluster over: `prefix`, `allocator: InCluster`, `<NAME>-cp` of 6, `<NAME>-workers` of the span of its InClusterIPPool less the NetBox addresses in it, and `metallb` of `METALLB`, published as above.
+**A cluster as a chart left it**, to try [Migrating an existing cluster](../recipes/migrate-existing-cluster.md). `LEGACY=1` makes no network. With the admin token it creates in NetBox, without a key, the prefix `LEGACY_PREFIX` and the MetalLB addresses at its offsets −2 and −3, and prints their ids. Then come the InClusterIPPools `<NAME>-cp` at offsets 2–7 and `<NAME>-workers` from 8 to −4, without a controller or `excludedAddresses`, and the cluster on them. A second run leaves them alone once `<NAME>-cp` exists. `hack/dev/vcsim.sh adopt <NAME>` applies the network that takes the cluster over: `prefix`, `allocator: InCluster`, `<NAME>-cp` of 6, `<NAME>-workers` of the span of its InClusterIPPool, and `metallb` of `METALLB`, published as above.
+
+**A VM sync of the hypervisor**, as another team runs it: `hack/dev/vcsim.sh vmsync <NAME>` writes, once, a NetBox address without a key per `IPAddress` of the cluster (description `vmsync <NAME>`, `dns_name` `<VM>.vms.test`) and deletes its addresses of `IPAddress`es that are gone; run it again after the machines change. Inside the pools they are the machines': the network neither excludes them nor moves around them, and adopts a cluster with them in place ([In-cluster allocator](../guides/in-cluster.md#what-the-network-writes)). `delete` deletes them. Not on a pool with `SYNC=1`: both would record the same addresses.
 
 The control plane endpoint is the fake API server of vcsim, so the network has no `controlPlaneEndpoint`; the VIP is covered by the integration tests ([Testing](testing.md)). Deleting only the Cluster releases its addresses; the network and the pools stay.
 
@@ -203,7 +206,7 @@ kubectl -n capi-ipam-netbox-system rollout status deployment/capi-ipam-netbox-co
 kubectl get netboxnetworks,netboxippools -A
 ```
 
-After `make dev-all` the clusters `vc` and `vc2` are `Available` with all their machines `Running`, their networks and pools are `Ready` and the networks `LayoutReady`, the machines have addresses, the Secrets `vc-endpoints` and `vc2-endpoints` hold the `metallb` addresses, and NetBox at http://localhost:18000 shows the prefix, the IP ranges and the addresses of each cluster with the key `dev/...` in `capi_ref`, a description and comments; those of `vc` with the owner `dev-team` and the tenant `dev-tenant`.
+After `make dev-all` the clusters `vc` and `vc2` are `Available` with all their machines `Running`, their networks and pools are `Ready` and the networks `LayoutReady`, the machines have addresses (those of `vc2` from its InClusterIPPools), the Secrets `vc-endpoints` and `vc2-endpoints` hold the `metallb` addresses, and NetBox at http://localhost:18000 shows the prefix, the IP ranges and the addresses of each cluster with the key `dev/...` in `capi_ref`, a description and comments; those of `vc` with the owner `dev-team` and the tenant `dev-tenant`; the worker addresses of `vc2` come from the sync, with the `dns_name` `<machine>.nodes.test`.
 
 ## Next
 
