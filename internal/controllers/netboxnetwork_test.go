@@ -327,7 +327,7 @@ func TestNetworkWatchFilter(t *testing.T) {
 	g := NewWithT(t)
 	nw := newNetwork("ns", "default")
 	c := claimClient(nw)
-	r := &NetBoxNetworkReconciler{Client: c, WatchFilterValue: "x"}
+	r := &NetBoxNetworkReconciler{Client: c, APIReader: c, WatchFilterValue: "x"}
 
 	g.Expect(r.Reconcile(ctx, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(nw)})).To(Equal(ctrl.Result{}))
 	g.Expect(c.Get(ctx, client.ObjectKeyFromObject(nw), nw)).To(Succeed())
@@ -1373,6 +1373,30 @@ func TestNetworkStaleCacheReadsLiveStatus(t *testing.T) {
 	}
 }
 
+// The network is never taken from the cache: one that has the conditions of the last write and an older status, with
+// its owner or layout, passes for settled.
+func TestNetworkReadLive(t *testing.T) {
+	g := NewWithT(t)
+	scheme := runtime.NewScheme()
+	g.Expect(v1alpha1.AddToScheme(scheme)).To(Succeed())
+	g.Expect(clusterv1.AddToScheme(scheme)).To(Succeed())
+	nw := newNetwork("ns", "default")
+	nw.Status.Conditions = []metav1.Condition{{Type: clusterv1.PausedCondition, Status: metav1.ConditionFalse, Reason: clusterv1.NotPausedReason}}
+	cluster := &clusterv1.Cluster{ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "ns"}, Spec: clusterv1.ClusterSpec{Paused: ptr.To(false)}}
+	live := fake.NewClientBuilder().WithScheme(scheme).WithObjects(nw, cluster).WithStatusSubresource(nw).Build()
+	r := &NetBoxNetworkReconciler{APIReader: live, Client: interceptor.NewClient(live, interceptor.Funcs{Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+		if _, ok := obj.(*v1alpha1.NetBoxNetwork); ok {
+			return errors.New("the network is read from the cache")
+		}
+		return c.Get(ctx, key, obj, opts...)
+	}})}
+
+	_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(nw)})
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(live.Get(ctx, client.ObjectKeyFromObject(nw), nw)).To(Succeed())
+	g.Expect(nw.Finalizers).To(ContainElement(networkFinalizer))
+}
+
 // The prefix and the VIP are created with the owner and tenant the network resolved; ids need no lookup.
 func TestNetworkCreatesWithAttrs(t *testing.T) {
 	g := NewWithT(t)
@@ -1548,7 +1572,7 @@ func TestNetworkAttrsForbiddenKeepsReady(t *testing.T) {
 		Paused: ptr.To(false), ControlPlaneEndpoint: clusterv1.APIEndpoint{Host: "10.10.0.31", Port: 6443}}}
 	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(nw, cluster).WithStatusSubresource(nw).Build()
 	r := networkOn(srv)
-	r.Client = c
+	r.Client, r.APIReader = c, c
 
 	res, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(nw)})
 	g.Expect(err).NotTo(HaveOccurred())
