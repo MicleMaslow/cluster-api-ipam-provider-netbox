@@ -25,6 +25,7 @@ The provider runs as `capi-ipam-netbox-controller-manager` in `capi-ipam-netbox-
 |---|---|
 | `NETBOX_URL` | required, else the provider exits with code 1. `http://` logs a warning: the token is sent unencrypted |
 | `NETBOX_TOKEN`, `NETBOX_TOKEN_FILE` | exactly one is required. The file is read at every request, whitespace around the token is cut and an empty file is an error: a rotated token needs no restart |
+| `NETBOX_CA_CERT` | PEM with extra CA certificates for NetBox, added to the system roots like `--netbox-ca-file`; without a certificate the provider exits with code 1 |
 | `HTTPS_PROXY`, `HTTP_PROXY`, `NO_PROXY` | the usual proxy variables are honoured for requests to NetBox |
 
 ## Flags: NetBox

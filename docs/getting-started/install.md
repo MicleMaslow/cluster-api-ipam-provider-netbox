@@ -56,7 +56,7 @@ metadata:
   name: netbox
   namespace: capi-ipam-netbox-system
 spec:
-  version: v0.2.0
+  version: v0.2.1
   configSecret:
     name: netbox-variables
   fetchConfig:
@@ -66,9 +66,21 @@ spec:
 - The name is `netbox`: it gives the label `cluster.x-k8s.io/provider: ipam-netbox` and the object names of this page.
 - `fetchConfig.url` is the whole URL of the components file, as in the clusterctl config; the operator rejects `…/releases` alone. `spec.version` picks the release.
 - `kubectl -n capi-ipam-netbox-system get ipamprovider netbox` shows the installed version and `READY True`; then run [Check](#check).
-- Deployment patches (private CA, token file) go into `spec.patches` with `target: {kind: Deployment, name: capi-ipam-netbox-controller-manager}` and the operations of the `kubectl patch` commands below, so the operator keeps them.
+- A private CA needs no patch: `spec.deployment.containers` sets `NETBOX_CA_CERT` from a ConfigMap ([TLS](#tls)):
+
+  ```yaml
+  spec:
+    deployment:
+      containers:
+      - name: manager
+        env:
+        - name: NETBOX_CA_CERT
+          valueFrom: {configMapKeyRef: {name: netbox-ca, key: ca.crt}}
+  ```
+
+- Deployment patches (a token file) go into `spec.patches` with `target: {kind: Deployment, name: capi-ipam-netbox-controller-manager}` and the operations of the `kubectl patch` commands below, so the operator keeps them.
 - Upgrade: change `spec.version`. Remove: delete the `IPAMProvider`; the CRDs, ClusterRoles and ClusterRoleBinding stay, as with clusterctl ([Remove](#remove)).
-- Air-gapped: put `ipam-components.yaml` and `metadata.yaml` of the release into a ConfigMap with the keys `components` and `metadata` and the label `provider.cluster.x-k8s.io/version: v0.2.0`, and use `fetchConfig.selector` with its labels instead of `url`.
+- Air-gapped: put `ipam-components.yaml` and `metadata.yaml` of the release into a ConfigMap with the keys `components` and `metadata` and the label `provider.cluster.x-k8s.io/version: v0.2.1`, and use `fetchConfig.selector` with its labels instead of `url`.
 
 ### In-cluster IPAM
 
@@ -96,7 +108,7 @@ The ClusterRole of the provider allows `inclusterippools` (get, list, watch, cre
 
 ### TLS
 
-The provider trusts the system roots. A private CA is added with `--netbox-ca-file`, a PEM file mounted into the pod. `--netbox-insecure-skip-verify` turns verification off and is for development only. A `NETBOX_URL` with `http://` logs a warning: the token is sent unencrypted.
+The provider trusts the system roots. A private CA is added with `--netbox-ca-file`, a PEM file mounted into the pod, or with `NETBOX_CA_CERT`, the PEM itself in the environment, for example from a ConfigMap; both may be set. `--netbox-insecure-skip-verify` turns verification off and is for development only. A `NETBOX_URL` with `http://` logs a warning: the token is sent unencrypted.
 
 To trust a private CA, put it into a ConfigMap and patch the Deployment:
 
@@ -144,8 +156,8 @@ The CA patch after the token patch is the same with the CA volume and mount.
 A local build is installed from a local clusterctl repository. `make release` writes it to `out/repo`, with the image `<REGISTRY>/cluster-api-ipam-provider-netbox:<RELEASE_TAG>`; push that image, or load it into a kind cluster with `kind load docker-image`:
 
 ```bash
-make release RELEASE_TAG=v0.2.0 REGISTRY=registry.example.com/capi
-make docker-build docker-push RELEASE_TAG=v0.2.0 REGISTRY=registry.example.com/capi   # docker-push-all: linux/amd64 and linux/arm64
+make release RELEASE_TAG=v0.2.1 REGISTRY=registry.example.com/capi
+make docker-build docker-push RELEASE_TAG=v0.2.1 REGISTRY=registry.example.com/capi   # docker-push-all: linux/amd64 and linux/arm64
 NETBOX_URL=... NETBOX_TOKEN=... clusterctl init --ipam netbox --config hack/dev/clusterctl.yaml
 ```
 

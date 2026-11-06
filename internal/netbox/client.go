@@ -171,9 +171,9 @@ var defaultHTTP = &http.Client{
 	CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 }
 
-// NewHTTPClient returns an HTTP client that trusts the system roots plus the PEM bundle in caFile (if set).
+// NewHTTPClient returns an HTTP client that trusts the system roots plus the PEM bundles in caFile and caPEM (if set).
 // insecureSkipVerify turns certificate checks off and is for development only.
-func NewHTTPClient(caFile string, insecureSkipVerify bool) (*http.Client, error) {
+func NewHTTPClient(caFile, caPEM string, insecureSkipVerify bool) (*http.Client, error) {
 	roots, err := x509.SystemCertPool()
 	if err != nil {
 		roots = x509.NewCertPool()
@@ -186,6 +186,9 @@ func NewHTTPClient(caFile string, insecureSkipVerify bool) (*http.Client, error)
 		if !roots.AppendCertsFromPEM(data) {
 			return nil, fmt.Errorf("CA file %s has no PEM certificates", caFile)
 		}
+	}
+	if caPEM != "" && !roots.AppendCertsFromPEM([]byte(caPEM)) {
+		return nil, errors.New("NETBOX_CA_CERT has no PEM certificates")
 	}
 	hc := *defaultHTTP
 	hc.Transport = &http.Transport{

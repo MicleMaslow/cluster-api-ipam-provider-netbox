@@ -196,7 +196,7 @@ func main() {
 	if netboxInsecureSkipVerify {
 		setupLog.Info("WARNING: NetBox TLS certificate verification is disabled, for development only")
 	}
-	httpClient, err := netbox.NewHTTPClient(netboxCAFile, netboxInsecureSkipVerify)
+	httpClient, err := netbox.NewHTTPClient(netboxCAFile, os.Getenv("NETBOX_CA_CERT"), netboxInsecureSkipVerify)
 	if err != nil {
 		setupLog.Error(err, "create NetBox HTTP client")
 		os.Exit(1)

@@ -39,7 +39,7 @@ When NetBox or the settings are such that the provider cannot work, it logs the 
 |---|---|
 | `NETBOX_URL is required`; `exactly one of NETBOX_TOKEN and NETBOX_TOKEN_FILE is required` | the Secret `capi-ipam-netbox-credentials` or the environment lacks it, or has both token variables |
 | `token file ... is empty`; `read token file` | `NETBOX_TOKEN_FILE` points at a file that is missing or empty ([Install](../getting-started/install.md#token-from-a-file)) |
-| `read CA file`; `has no PEM certificates` | `--netbox-ca-file` names a missing file or one without a PEM certificate. After a patch that replaced the volumes, the CA volume is gone ([Install](../getting-started/install.md#token-from-a-file)) |
+| `read CA file`; `has no PEM certificates` | `--netbox-ca-file` names a missing file or one without a PEM certificate, or `NETBOX_CA_CERT` holds none. After a patch that replaced the volumes, the CA volume is gone ([Install](../getting-started/install.md#token-from-a-file)) |
 | `unknown flag` | an own patch of the Deployment passes an argument the provider does not have ([Configuration](configuration.md)) |
 | `NetBox settings: ... name must match` | a field name NetBox does not accept (a dot or `__`, for example) ([Configuration](configuration.md)) |
 | `NetBox settings: instance name ...` | `NETBOX_INSTANCE` is not a DNS label of at most 63 characters ([The instance name](../getting-started/netbox-access.md#the-instance-name)) |

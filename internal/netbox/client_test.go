@@ -315,8 +315,9 @@ func TestNewHTTPClient(t *testing.T) {
 	srv.Config.ErrorLog = log.New(io.Discard, "", 0)
 	srv.StartTLS()
 	t.Cleanup(srv.Close)
+	caPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: srv.Certificate().Raw})
 	caFile := filepath.Join(t.TempDir(), "ca.pem")
-	if err := os.WriteFile(caFile, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: srv.Certificate().Raw}), 0o600); err != nil {
+	if err := os.WriteFile(caFile, caPEM, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	junk := filepath.Join(t.TempDir(), "junk.pem")
@@ -326,18 +327,21 @@ func TestNewHTTPClient(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
 		ca       string
+		caPEM    string
 		insecure bool
 		newErr   bool
 		listErr  bool
 	}{
 		{name: "system roots only", listErr: true},
 		{name: "custom CA", ca: caFile},
+		{name: "CA from the environment", caPEM: string(caPEM)},
+		{name: "CA environment without certificates", caPEM: "not a certificate", newErr: true},
 		{name: "insecure", insecure: true},
 		{name: "missing CA file", ca: filepath.Join(t.TempDir(), "none.pem"), newErr: true},
 		{name: "CA file without certificates", ca: junk, newErr: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			hc, err := NewHTTPClient(tc.ca, tc.insecure)
+			hc, err := NewHTTPClient(tc.ca, tc.caPEM, tc.insecure)
 			if (err != nil) != tc.newErr {
 				t.Fatalf("NewHTTPClient: %v", err)
 			}
