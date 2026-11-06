@@ -3,7 +3,8 @@ kind: Kustomization
 namespace: capi-ipam-netbox-system
 namePrefix: capi-ipam-netbox-
 labels:
-- pairs:
+- includeSelectors: true
+  pairs:
     cluster.x-k8s.io/provider: ipam-netbox
 resources:
 - ../crd
