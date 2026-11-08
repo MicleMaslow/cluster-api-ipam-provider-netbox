@@ -13,7 +13,7 @@
 # limitations under the License.
 
 # Build the manager binary. The build runs on the native platform and cross-compiles for the target.
-FROM --platform=${BUILDPLATFORM} golang:1.27.2@sha256:5bc7f572bbaa98885a3a1fd9c0aa76b59e3e14e8628bfc316bbfd0c701e4818c AS builder
+FROM --platform=${BUILDPLATFORM} golang:1.27.2@sha256:820153096fda4de6ac1b7194d12e416b7dd8f4e9a33d17e0345b111b945162d8 AS builder
 WORKDIR /workspace
 
 ARG TARGETOS
@@ -38,7 +38,7 @@ RUN --mount=type=cache,id=go-build,target=/root/.cache/go-build \
     -o manager .
 
 # Production image.
-FROM gcr.io/distroless/static:nonroot@sha256:e2e927ec666bae08560abb3c55d0659eceabb657f56b6782ab500a9fc7f555e3
+FROM gcr.io/distroless/static:nonroot@sha256:25ac8f0c3b2334a9eb05452266bd4697864a8c8ef0ef71e5e6480d7f92868329
 LABEL org.opencontainers.image.source=https://github.com/MicleMaslow/cluster-api-ipam-provider-netbox
 WORKDIR /
 COPY --from=builder /workspace/manager .
