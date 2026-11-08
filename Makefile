@@ -161,13 +161,15 @@ verify-doc-links: ## Verify relative links and anchors in README.md and docs
 
 ##@ Test
 
-ENVTEST_ENV = KUBEBUILDER_ASSETS="$$($(SETUP_ENVTEST) use $(ENVTEST_K8S_VERSION) -p path)" CAPI_CRDS="$$(go mod download sigs.k8s.io/cluster-api && go list -m -f '{{.Dir}}' sigs.k8s.io/cluster-api)/core/config/crd/bases" \
+# Fails the recipe line when setup-envtest cannot provide the binaries, instead of starting envtest without them.
+ENVTEST_ASSETS = assets="$$($(SETUP_ENVTEST) use $(ENVTEST_K8S_VERSION) -p path)" &&
+ENVTEST_ENV = KUBEBUILDER_ASSETS="$$assets" CAPI_CRDS="$$(go mod download sigs.k8s.io/cluster-api && go list -m -f '{{.Dir}}' sigs.k8s.io/cluster-api)/core/config/crd/bases" \
 	INCLUSTER_CRDS="$$(go mod download sigs.k8s.io/cluster-api-ipam-provider-in-cluster && go list -m -f '{{.Dir}}' sigs.k8s.io/cluster-api-ipam-provider-in-cluster)/config/crd/bases"
 
 .PHONY: test
 test: $(SETUP_ENVTEST) ## Run unit tests, CRD validation and the control-plane VIP command test (no NetBox needed)
 	hack/test-control-plane-vip.sh
-	$(ENVTEST_ENV) go test ./...
+	$(ENVTEST_ASSETS) $(ENVTEST_ENV) go test ./...
 
 # The key mode of the controller tests: empty (keys without an instance) or instance (the instance ci).
 # Set after hack/dev/.env is sourced: a value there is ignored.
@@ -175,7 +177,7 @@ NETBOX_TEST_MODE ?=
 
 .PHONY: test-integration
 test-integration: $(SETUP_ENVTEST) ## Run all tests, controllers against the dev NetBox (needs make netbox-up); NETBOX_TEST_MODE=instance for keys with an instance
-	$(DEV_ENV) && NETBOX_TEST_MODE=$(NETBOX_TEST_MODE) $(ENVTEST_ENV) go test -count=1 -timeout 20m ./...
+	$(DEV_ENV) && $(ENVTEST_ASSETS) NETBOX_TEST_MODE=$(NETBOX_TEST_MODE) $(ENVTEST_ENV) go test -count=1 -timeout 20m ./...
 
 ##@ Build
 
