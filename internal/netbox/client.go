@@ -214,6 +214,14 @@ func AvailableIPs(rangeID int64) string {
 	return IPRanges + strconv.FormatInt(rangeID, 10) + "/available-ips/"
 }
 
+// Available returns what an available-* path lists without paging: the free child prefixes of a prefix, or the free
+// addresses of an IP range.
+func (c *Client) Available(ctx context.Context, path string) ([]Object, error) {
+	var out []Object
+	_, err := c.do(ctx, http.MethodGet, path, nil, "", nil, &out)
+	return out, err
+}
+
 // List returns all objects at path matching q. It pages by id (ordering=id, id__gt=<last id>), so objects
 // created or deleted meanwhile cannot shift a page; the next link only tells whether there is more of it.
 func (c *Client) List(ctx context.Context, path string, q url.Values) ([]Object, error) {

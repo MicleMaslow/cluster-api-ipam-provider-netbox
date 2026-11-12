@@ -51,6 +51,9 @@ type Options struct {
 	// NetBoxResyncPeriod is how often a network is checked against NetBox while nothing of it changes; 0 is on
 	// every reconcile.
 	NetBoxResyncPeriod time.Duration
+
+	// ParentCapacityPeriod is how often the parent prefix metrics are refreshed from NetBox; 0 turns them off.
+	ParentCapacityPeriod time.Duration
 }
 
 // +kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;patch
@@ -93,6 +96,13 @@ func Setup(ctx context.Context, mgr ctrl.Manager, o Options) error {
 		Client: c, WatchFilterValue: o.WatchFilterValue,
 	}).SetupWithManager(ctx, mgr, controller.Options{MaxConcurrentReconciles: o.PoolConcurrency, RateLimiter: rateLimiter()}); err != nil {
 		return err
+	}
+	if o.ParentCapacityPeriod > 0 {
+		if err := mgr.Add(&parentCapacity{
+			Reader: mgr.GetClient(), NetBox: o.NetBox.ReadOnly(), WatchFilterValue: o.WatchFilterValue, Period: o.ParentCapacityPeriod,
+		}); err != nil {
+			return err
+		}
 	}
 	return newClaimReconciler(c, mgr.GetScheme(), o.WatchFilterValue,
 		&ProviderAdapter{Client: c, NetBox: o.NetBox, Keys: keys, Recorder: o.Recorder, Concurrency: o.ClaimConcurrency},

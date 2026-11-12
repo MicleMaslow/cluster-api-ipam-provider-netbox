@@ -38,6 +38,7 @@ The provider runs as `capi-ipam-netbox-controller-manager` in `capi-ipam-netbox-
 | `--netbox-insecure-skip-verify` | false | skip verification of the NetBox certificate; development only |
 | `--netbox-qps`, `--netbox-burst` | 10, 20 | limits of the client to the NetBox API, for the whole provider: a request waits for its turn (`netbox_ipam_request_wait_seconds`). `0` qps is no limit |
 | `--netbox-resync-period` | `10m` | how often a `NetBoxNetwork` is checked against NetBox while nothing of it changes, less up to a fifth per network so that they spread out; `0`: on every reconcile ([Load on NetBox](#load-on-netbox)) |
+| `--parent-capacity-period` | `5m` | how often the leader reads the free space of the parent prefixes of the networks from NetBox into the `netbox_ipam_parent_*` metrics ([Observability](observability.md#capacity-of-the-parent-prefixes)); `0` turns them off |
 
 Rules the provider checks at start; a violation is logged and ends the start with exit code 1:
 
@@ -85,6 +86,7 @@ Rules the provider checks at start; a violation is logged and ends the start wit
   ```
 
 - The check times are kept in memory: after a restart or a change of leader every network is checked once, as fast as `--netbox-qps` lets it.
+- The parent metrics cost two reads per parent prefix per `--parent-capacity-period`, on the leader only.
 - `--netbox-qps` and `--netbox-burst` bound what one provider sends whatever happens, but for the one section at a time that holds the write lock: it writes past the limit, so as not to run out of time behind the readers. The providers of several management clusters on one NetBox add up.
 
 ## Optional dependency: in-cluster IPAM

@@ -16,6 +16,9 @@ The metrics are served by the diagnostics endpoint (`--diagnostics-address`, `:8
 | `netbox_ipam_request_duration_seconds` | `method`, `path` | duration of those requests |
 | `netbox_ipam_request_wait_seconds` | | time a request waited for the rate limit of the provider (`--netbox-qps`, `--netbox-burst`) before it was sent |
 | `netbox_ipam_write_lock_wait_seconds` | | time a section that writes to NetBox waited for the write lock; reconciles that only read NetBox never wait |
+| `netbox_ipam_parent_size_addresses` | `parent` | addresses of a parent prefix of the networks ([Capacity of the parent prefixes](#capacity-of-the-parent-prefixes)) |
+| `netbox_ipam_parent_free_addresses` | `parent` | addresses of it that no child prefix in NetBox covers |
+| `netbox_ipam_parent_free_prefixes` | `parent`, `length` | prefixes of `length` NetBox can still carve out of it; `length` is that of every network in it, `spec.prefixLength` or the adopted prefix |
 
 Queries to start with:
 
@@ -28,6 +31,18 @@ rate(netbox_ipam_write_lock_wait_seconds_sum[5m]) / rate(netbox_ipam_write_lock_
 A 403 on a path is a missing permission (`Forbidden` on the object), `error` a network failure, and a rising lock wait means many networks and pools write at once ([Configuration](configuration.md) has the concurrency flags).
 
 The same endpoint serves pprof and `PUT /debug/flags/v` (the log level as the body), unless `--insecure-diagnostics` is set.
+
+### Capacity of the parent prefixes
+
+Every `--parent-capacity-period` (`5m`) the leader looks up each `spec.parentPrefix` of the networks in the global VRF of NetBox and reads its `available-prefixes`. A parent that is missing, or that NetBox fails on, has no series until the next read, and the error is in the log. Free means not covered by a child prefix: addresses that NetBox holds outside every child prefix count as free.
+
+```promql
+netbox_ipam_parent_free_prefixes                                                        # how many more networks fit
+1 - netbox_ipam_parent_free_addresses / netbox_ipam_parent_size_addresses                # how full the parent is
+netbox_ipam_parent_free_prefixes < 2                                                    # alert: the parent is almost full
+```
+
+A Grafana dashboard with these: [grafana-parent-capacity.json](grafana-parent-capacity.json). Set `Management cluster label` to the label that tells your management clusters apart in the data source, such as an external label of their Prometheus.
 
 ## Events
 

@@ -1,0 +1,241 @@
+{
+  "title": "NetBox IPAM: parent prefix capacity",
+  "uid": "netbox-ipam-parent-capacity",
+  "description": "Free space of the parent prefixes of the NetBoxNetworks, from the netbox_ipam_parent_* metrics of cluster-api-ipam-provider-netbox.",
+  "tags": [
+    "cluster-api",
+    "netbox",
+    "ipam"
+  ],
+  "schemaVersion": 39,
+  "refresh": "5m",
+  "time": {
+    "from": "now-30d",
+    "to": "now"
+  },
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "label": "Data source",
+        "type": "datasource",
+        "query": "prometheus"
+      },
+      {
+        "name": "mgmt_label",
+        "label": "Management cluster label",
+        "type": "textbox",
+        "query": "cluster",
+        "description": "The label that tells the management clusters apart, e.g. an external label of their Prometheus"
+      },
+      {
+        "name": "mgmt",
+        "label": "Management cluster",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "query": {
+          "query": "label_values(netbox_ipam_parent_size_addresses, ${mgmt_label})",
+          "refId": "mgmt"
+        },
+        "includeAll": true,
+        "multi": true,
+        "refresh": 2,
+        "sort": 1
+      }
+    ]
+  },
+  "panels": [
+    {
+      "type": "table",
+      "title": "Parent prefixes",
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 24,
+        "h": 12
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Free prefixes: how many more networks of the length fit. Used: share of the parent covered by child prefixes in NetBox.",
+      "targets": [
+        {
+          "refId": "free",
+          "instant": true,
+          "format": "table",
+          "expr": "max by (${mgmt_label}, parent, length) (netbox_ipam_parent_free_prefixes{${mgmt_label}=~\"$mgmt\"})"
+        },
+        {
+          "refId": "used",
+          "instant": true,
+          "format": "table",
+          "expr": "100 * (1 - max by (${mgmt_label}, parent) (netbox_ipam_parent_free_addresses{${mgmt_label}=~\"$mgmt\"}) / max by (${mgmt_label}, parent) (netbox_ipam_parent_size_addresses{${mgmt_label}=~\"$mgmt\"}))"
+        },
+        {
+          "refId": "size",
+          "instant": true,
+          "format": "table",
+          "expr": "max by (${mgmt_label}, parent) (netbox_ipam_parent_size_addresses{${mgmt_label}=~\"$mgmt\"})"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "merge",
+          "options": {}
+        },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true
+            },
+            "renameByName": {
+              "Value #free": "Free prefixes",
+              "Value #used": "Used, %",
+              "Value #size": "Addresses",
+              "length": "Length"
+            }
+          }
+        },
+        {
+          "id": "sortBy",
+          "options": {
+            "sort": [
+              {
+                "field": "Free prefixes"
+              }
+            ]
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "auto"
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Free prefixes"
+            },
+            "properties": [
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-background"
+                }
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "red",
+                      "value": null
+                    },
+                    {
+                      "color": "orange",
+                      "value": 2
+                    },
+                    {
+                      "color": "green",
+                      "value": 5
+                    }
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Used, %"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "percent"
+              },
+              {
+                "id": "decimals",
+                "value": 0
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "gauge",
+                  "mode": "basic"
+                }
+              },
+              {
+                "id": "min",
+                "value": 0
+              },
+              {
+                "id": "max",
+                "value": 100
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": null
+                    },
+                    {
+                      "color": "orange",
+                      "value": 80
+                    },
+                    {
+                      "color": "red",
+                      "value": 95
+                    }
+                  ]
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Free prefixes",
+      "gridPos": {
+        "x": 0,
+        "y": 12,
+        "w": 24,
+        "h": 10
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max by (${mgmt_label}, parent, length) (netbox_ipam_parent_free_prefixes{${mgmt_label}=~\"$mgmt\"})",
+          "legendFormat": "{{${mgmt_label}}} {{parent}} /{{length}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "min": 0,
+          "decimals": 0,
+          "custom": {
+            "lineInterpolation": "stepAfter"
+          }
+        }
+      }
+    }
+  ]
+}

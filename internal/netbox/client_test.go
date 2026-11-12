@@ -78,6 +78,20 @@ func TestListSendsTokenAndQuery(t *testing.T) {
 	}
 }
 
+func TestAvailableDecodesList(t *testing.T) {
+	c, rec := newServer(t, 200, `[{"family":4,"prefix":"10.0.0.64/26","vrf":null},{"family":4,"prefix":"10.0.1.0/24","vrf":null}]`)
+	got, err := c.ReadOnly().Available(ctx, AvailablePrefixes(5))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.method != "GET" || rec.path != "/api/ipam/prefixes/5/available-prefixes/" || rec.query != "" {
+		t.Errorf("request %+v", rec)
+	}
+	if len(got) != 2 || got[0].Prefix != "10.0.0.64/26" || got[1].Prefix != "10.0.1.0/24" {
+		t.Errorf("decoded %+v", got)
+	}
+}
+
 func TestGetReturnsETagAndPatchSendsIfMatch(t *testing.T) {
 	c, rec := newServer(t, 200, `{"id":1}`)
 	_, etag, err := c.Get(ctx, Prefixes, 1)

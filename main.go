@@ -110,6 +110,8 @@ func initFlags(fs *pflag.FlagSet) {
 		"Maximum number of requests that should be allowed in one burst from the provider to the NetBox API.")
 	fs.DurationVar(&controllerOpts.NetBoxResyncPeriod, "netbox-resync-period", 10*time.Minute,
 		"How often a NetBoxNetwork is checked against NetBox while nothing of it changes (e.g. 15m).")
+	fs.DurationVar(&controllerOpts.ParentCapacityPeriod, "parent-capacity-period", 5*time.Minute,
+		"How often the free space of the parent prefixes of the networks is read from NetBox into the netbox_ipam_parent_* metrics; 0 turns them off.")
 
 	fs.IntVar(&controllerOpts.NetworkConcurrency, "netboxnetwork-concurrency", controllers.DefaultConcurrency,
 		"Number of NetBoxNetworks to process simultaneously.")
