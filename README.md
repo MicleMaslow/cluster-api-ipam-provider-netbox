@@ -25,6 +25,7 @@ How it works is in the [documentation](docs/README.md), from the [overview](docs
 
 | Provider | Cluster API | NetBox | In-cluster IPAM (`allocator: InCluster`) |
 |---|---|---|---|
+| v0.3.x | v1.13, v1.14 (contract v1beta2) | ≥ 4.6 (tested with 4.6.7, 4.7.2) | v1.1 |
 | v0.2.x | v1.13, v1.14 (contract v1beta2) | ≥ 4.6 (tested with 4.6.7, 4.7.2) | v1.1 |
 | v0.1.x | v1.14 (contract v1beta2) | ≥ 4.6 (tested with 4.6.7, 4.7.2) | — |
 
